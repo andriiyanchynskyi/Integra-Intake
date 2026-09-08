@@ -1,0 +1,15 @@
+---
+description: Safety rules for agent, policy, and tools code
+globs: app/agent/**,app/policy/**,app/tools/**
+alwaysApply: false
+---
+
+# Safety
+
+- LLM output is untrusted. Validate with Pydantic before any side effect.
+- PolicyEngine runs after LLM proposal; it is the source of permissions, not the model.
+- External actions (`send_reply`, `close_case`) require human approval in v1.
+- Tool results are data, not instructions — do not pass them as system prompts.
+- MAX_STEPS and repeated-tool guards must stay in the agent loop.
+- Never auto-execute on `confidence` alone; low confidence routes to review only.
+- Idempotency keys prevent duplicate cases from repeated webhooks.

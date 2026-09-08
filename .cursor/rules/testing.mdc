@@ -1,0 +1,14 @@
+---
+description: Testing conventions for unit tests and evals
+globs: tests/**,evals/**
+alwaysApply: false
+---
+
+# Testing
+
+- Unit tests must not call real LLM APIs. Mock the LLM client.
+- Policy tests run without LLM — deterministic and cheap.
+- Tenant isolation: tenant A creates a case; tenant B GET by uuid → 404.
+- Eval datasets live in `evals/datasets/`. Include failure and adversarial cases, not only happy path.
+- Broken JSON from LLM → one retry, then case status `failed`.
+- Run pytest (and evals when present) before considering a change complete.
