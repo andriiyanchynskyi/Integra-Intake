@@ -46,6 +46,34 @@ curl http://localhost:8000/health
 alembic upgrade head
 ```
 
+### 6. Seed the local demo tenant
+
+```bash
+python scripts/seed_demo.py
+```
+
+The command creates the `demo` tenant when it does not exist and intentionally
+rotates its API key on every run. It prints the new raw key to standard output
+once. Copy it into a shell variable or password manager immediately; do not
+write it to a file, commit it, or expect it to be shown again. The database
+stores its SHA-256 digest and display-safe prefix.
+
+For the request below, set the key only in your current shell session:
+
+```bash
+export INTEGRA_DEMO_API_KEY='<printed-key>'
+# PowerShell: $env:INTEGRA_DEMO_API_KEY = '<printed-key>'
+```
+
+Use the printed value as the `X-API-Key` header when creating a case:
+
+```bash
+curl -X POST http://localhost:8000/v1/cases \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $INTEGRA_DEMO_API_KEY" \
+  -d '{"channel":"email","subject":"Password reset","body":"Please reset my account password."}'
+```
+
 ### Full stack (API + DB in Docker)
 
 ```bash
@@ -58,6 +86,8 @@ docker compose up --build
 |---|---|
 | `GET /health` | Liveness probe |
 | `GET /docs` | OpenAPI (Swagger UI) |
+| `POST /v1/cases` | Create a case for the tenant authenticated by `X-API-Key`. |
+| `GET /v1/cases/{case_id}` | Read a case visible to the tenant authenticated by `X-API-Key`. |
 
 ## Configuration
 

@@ -6,4 +6,6 @@ __pycache__/
 dist/
 *.log
 ROADMAP.md
+docs/
 integra_intake.egg-info/
+.superpowers/

@@ -2,4 +2,4 @@ from sqlalchemy.orm import DeclarativeBase
 
 
 class Base(DeclarativeBase):
-    pass
+    """Shared ORM metadata used by application models and Alembic."""
