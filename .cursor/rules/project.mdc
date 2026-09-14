@@ -1,0 +1,26 @@
+---
+description: IntegraIntake project conventions and workflow
+alwaysApply: true
+---
+
+# IntegraIntake
+
+## Stack
+
+Python 3.12+, FastAPI, PostgreSQL, SQLAlchemy 2 (async), Alembic, Pydantic v2, Docker Compose, pytest, structlog. Custom agent loop — no LangChain.
+
+## Workflow
+
+1. Read current files and understand the scope before changing code.
+2. Write a plan (files, changes, tests, risks). Wait for user approval.
+3. Implement on a feature branch (`feat/...`, `fix/...`).
+4. One commit = one idea. Format: `feat|fix|test|docs|chore(scope): message`.
+5. Run tests and verify commands for the change.
+6. Keep diffs focused — max ~5 files changed per session when possible.
+
+## Rules
+
+- Engine stays tenant-agnostic; domain behavior lives in YAML under `examples/` (e.g. `freight-broker.yaml`, `repair-service.yaml`).
+- LLM proposes; deterministic code (PolicyEngine) decides. Never trust YAML or message body for permissions.
+- `tenant_id` comes only from API key/JWT, never from request body.
+- No MCP, RAG, or multi-agent until the core intake loop and policy layer are in place.

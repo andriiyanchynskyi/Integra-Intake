@@ -1,0 +1,173 @@
+import hashlib
+import logging
+from collections.abc import AsyncGenerator, Mapping
+from dataclasses import dataclass
+from uuid import UUID, uuid4
+
+import pytest
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+from sqlalchemy.dialects import postgresql
+
+from app.auth import (
+    API_KEY_FORMAT,
+    API_KEY_PREFIX,
+    API_KEY_TOKEN_PATTERN,
+    SAFE_PREFIX_LENGTH,
+    generate_api_key,
+    get_current_tenant,
+    hash_api_key,
+)
+from app.db.models import Tenant
+from app.db.session import get_db_session
+
+
+@dataclass
+class ScalarResult:
+    value: Tenant | None
+
+    def scalar_one_or_none(self) -> Tenant | None:
+        return self.value
+
+
+@dataclass
+class StoredApiKey:
+    key_hash: str
+    tenant_id: UUID
+    is_active: bool
+    tenant: Tenant
+
+
+class StatementAwareSession:
+    """Unit-level database boundary that accepts only the Task 2 lookup contract."""
+
+    def __init__(self, records: Mapping[str, StoredApiKey]) -> None:
+        self.records = records
+
+    async def execute(self, statement: object) -> ScalarResult:
+        compiled = statement.compile(dialect=postgresql.dialect())
+        query = str(compiled)
+        assert "FROM tenants JOIN api_keys ON api_keys.tenant_id = tenants.id" in query
+        assert "api_keys.key_hash = %(key_hash_1)s" in query
+        assert "api_keys.is_active IS true" in query
+
+        key_hash = compiled.params["key_hash_1"]
+        record = self.records.get(key_hash)
+        if record is None or not record.is_active or record.tenant.id != record.tenant_id:
+            return ScalarResult(None)
+        return ScalarResult(record.tenant)
+
+
+@pytest.fixture
+def seeded_credentials() -> tuple[Tenant, StoredApiKey, str]:
+    raw_key, _, key_hash = generate_api_key()
+    tenant = Tenant(id=uuid4(), slug="acme", name="Acme", status="active")
+    record = StoredApiKey(
+        key_hash=key_hash,
+        tenant_id=tenant.id,
+        is_active=True,
+        tenant=tenant,
+    )
+    return tenant, record, raw_key
+
+
+@pytest.fixture
+def client_factory():
+    def build(records: Mapping[str, StoredApiKey]) -> TestClient:
+        app = FastAPI()
+
+        @app.get("/tenant")
+        async def current_tenant(current: Tenant = Depends(get_current_tenant)) -> dict[str, str]:
+            return {"tenant_id": str(current.id)}
+
+        async def override_session() -> AsyncGenerator[StatementAwareSession, None]:
+            yield StatementAwareSession(records)
+
+        app.dependency_overrides[get_db_session] = override_session
+        return TestClient(app)
+
+    return build
+
+
+def test_hash_api_key_is_deterministic_sha256_digest() -> None:
+    raw_key = "ik_" + "A" * 43
+
+    assert hash_api_key(raw_key) == hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+def test_generate_api_key_returns_provisioning_credential_and_non_secret_metadata() -> None:
+    raw_key, safe_prefix, key_hash = generate_api_key()
+
+    assert API_KEY_FORMAT == "ik_<43 URL-safe characters from secrets.token_urlsafe(32)>"
+    assert raw_key.startswith(API_KEY_PREFIX)
+    assert API_KEY_TOKEN_PATTERN.fullmatch(raw_key)
+    assert safe_prefix == raw_key[:SAFE_PREFIX_LENGTH]
+    assert key_hash == hash_api_key(raw_key)
+    assert raw_key not in safe_prefix
+    assert raw_key not in key_hash
+
+
+@pytest.mark.parametrize("header_value", [None, "", "wrong-prefix", "ik_"])
+def test_missing_or_malformed_api_key_returns_401(client_factory, header_value: str | None) -> None:
+    """Rejecting incomplete credentials prevents anonymous tenant access."""
+    headers = {} if header_value is None else {"X-API-Key": header_value}
+
+    response = client_factory({}).get("/tenant", headers=headers)
+
+    assert response.status_code == 401
+
+
+def test_unknown_api_key_returns_401(client_factory, seeded_credentials) -> None:
+    """A different well-formed key cannot match the stored digest."""
+    _, record, _ = seeded_credentials
+    unknown_key, _, _ = generate_api_key()
+
+    response = client_factory({record.key_hash: record}).get(
+        "/tenant", headers={"X-API-Key": unknown_key}
+    )
+
+    assert response.status_code == 401
+
+
+def test_inactive_api_key_returns_401(client_factory, seeded_credentials) -> None:
+    """A record matching the digest must still be rejected when inactive."""
+    _, record, raw_key = seeded_credentials
+    record.is_active = False
+
+    response = client_factory({record.key_hash: record}).get(
+        "/tenant", headers={"X-API-Key": raw_key}
+    )
+
+    assert response.status_code == 401
+
+
+def test_active_api_key_resolves_the_tenant_joined_to_its_digest(client_factory, seeded_credentials) -> None:
+    """The accepted digest resolves only the tenant related by the query join."""
+    tenant, record, raw_key = seeded_credentials
+
+    response = client_factory({record.key_hash: record}).get(
+        "/tenant", headers={"X-API-Key": raw_key}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"tenant_id": str(tenant.id)}
+
+
+def test_authentication_responses_and_logs_do_not_disclose_raw_key(
+    caplog, client_factory, seeded_credentials
+) -> None:
+    """The provisioning credential never crosses the authentication response/log boundary."""
+    tenant, record, raw_key = seeded_credentials
+    caplog.set_level(logging.DEBUG)
+
+    success = client_factory({record.key_hash: record}).get(
+        "/tenant", headers={"X-API-Key": raw_key}
+    )
+    failure = client_factory({}).get("/tenant", headers={"X-API-Key": raw_key})
+
+    assert success.status_code == 200
+    assert failure.status_code == 401
+    assert raw_key not in success.text
+    assert raw_key not in failure.text
+    assert raw_key not in caplog.text
+    assert str(tenant.id) in success.text
