@@ -1,0 +1,30 @@
+slug: language-school
+display_name: Language school
+intake_types:
+  - name: course_inquiry
+    description: A question about available language courses.
+    required_fields: [student_name, contact, language]
+  - name: placement_request
+    description: A request to arrange a language placement assessment.
+    required_fields: [student_name, contact, language, level]
+fields:
+  student_name: {type: short_text, label: Student name}
+  contact: {type: email, label: Student email}
+  language:
+    type: single_select
+    label: Target language
+    options: [english, ukrainian, german, polish]
+  level:
+    type: single_select
+    label: Current level
+    options: [beginner, intermediate, advanced]
+  preferred_schedule: {type: short_text, label: Preferred schedule}
+  goals: {type: long_text, label: Learning goals}
+action_policy:
+  create_case: {allowed: true, requires_approval: false}
+  send_reply: {allowed: true, requires_approval: true}
+  close_case: {allowed: true, requires_approval: true}
+  flag_for_review: {allowed: true, requires_approval: false}
+routing:
+  outcome_names: [urgent, awaiting_input, pending_approval, ready, rejected]
+  always_approval_actions: [send_reply, close_case]

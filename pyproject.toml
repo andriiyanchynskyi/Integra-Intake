@@ -10,6 +10,7 @@ dependencies = [
     "asyncpg>=0.30",
     "alembic>=1.14",
     "pydantic-settings>=2.6",
+    "PyYAML>=6.0",
     "httpx>=0.28",
     "structlog>=24.4",
 ]

@@ -1,0 +1,27 @@
+slug: repair-service
+display_name: Repair service
+intake_types:
+  - name: service_request
+    description: A request to diagnose or repair an asset.
+    required_fields: [customer_name, contact, issue, asset_type]
+  - name: warranty_claim
+    description: A request to assess a warranty claim.
+    required_fields: [customer_name, contact, issue, serial_number]
+fields:
+  customer_name: {type: short_text, label: Customer name}
+  contact: {type: email, label: Customer email}
+  issue: {type: long_text, label: Issue description}
+  asset_type:
+    type: single_select
+    label: Asset type
+    options: [appliance, vehicle, equipment]
+  preferred_time: {type: date_time, label: Preferred appointment}
+  serial_number: {type: short_text, label: Serial number}
+action_policy:
+  create_case: {allowed: true, requires_approval: false}
+  send_reply: {allowed: true, requires_approval: true}
+  close_case: {allowed: true, requires_approval: true}
+  flag_for_review: {allowed: true, requires_approval: false}
+routing:
+  outcome_names: [urgent, awaiting_input, pending_approval, ready, rejected]
+  always_approval_actions: [send_reply, close_case]

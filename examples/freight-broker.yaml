@@ -1,0 +1,37 @@
+slug: freight-broker
+display_name: Freight broker
+intake_types:
+  - name: load_request
+    description: A request to quote or arrange a freight load.
+    required_fields: [origin, destination, equipment, pickup_window, commodity, contact]
+  - name: rate_confirmation
+    description: A carrier rate confirmation document or message.
+    required_fields: [origin, destination, quoted_rate, valid_until]
+  - name: invoice_query
+    description: A question about a freight invoice.
+    required_fields: [invoice_number, contact]
+  - name: other
+    description: An inbound message that does not match a known freight intake type.
+    required_fields: []
+fields:
+  origin: {type: address, label: Origin}
+  destination: {type: address, label: Destination}
+  equipment:
+    type: single_select
+    label: Equipment
+    options: [dry_van, reefer, flatbed]
+  pickup_window: {type: date_time, label: Pickup window}
+  commodity: {type: short_text, label: Commodity}
+  rate_hint: {type: number, label: Rate hint}
+  contact: {type: email, label: Contact email}
+  quoted_rate: {type: number, label: Quoted rate}
+  valid_until: {type: date_time, label: Quote valid until}
+  invoice_number: {type: short_text, label: Invoice number}
+action_policy:
+  create_case: {allowed: true, requires_approval: false}
+  send_reply: {allowed: true, requires_approval: true}
+  close_case: {allowed: true, requires_approval: true}
+  flag_for_review: {allowed: true, requires_approval: false}
+routing:
+  outcome_names: [urgent, awaiting_input, pending_approval, ready, rejected]
+  always_approval_actions: [send_reply, close_case]
