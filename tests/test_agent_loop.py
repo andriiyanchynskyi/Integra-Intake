@@ -1,0 +1,451 @@
+from __future__ import annotations
+
+import json
+import math
+from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
+
+import pytest
+
+from app.agent import (
+    AgentLoop,
+    AgentMessage,
+    AgentProposal,
+    MAX_STEPS,
+    MessageRole,
+    RunStatus,
+    StopReason,
+    ToolCall,
+    ToolData,
+)
+
+
+class FakeLLM:
+    """Synchronous proposal source that records each transcript it receives."""
+
+    def __init__(self, proposals: Iterable[AgentProposal]) -> None:
+        self.proposals = list(proposals)
+        self.requests: list[tuple[AgentMessage, ...]] = []
+
+    def complete(self, messages: Sequence[AgentMessage]) -> AgentProposal:
+        self.requests.append(deepcopy(tuple(messages)))
+        if not self.proposals:
+            raise AssertionError("the loop requested more proposals than expected")
+        return self.proposals.pop(0)
+
+
+class FakeToolExecutor:
+    """Synchronous tool double that records calls and returns configured data."""
+
+    def __init__(self, results: Mapping[str, ToolData] | None = None) -> None:
+        self.results = dict(results or {})
+        self.calls: list[ToolCall] = []
+
+    def execute(self, tool_call: ToolCall) -> ToolData:
+        self.calls.append(tool_call)
+        return self.results.get(tool_call.name)
+
+
+def _mutate_nested_payload(value: object, errors: list[TypeError]) -> None:
+    if isinstance(value, dict):
+        try:
+            value["mutated_by_llm"] = True
+        except TypeError as error:
+            errors.append(error)
+        for nested in list(value.values()):
+            _mutate_nested_payload(nested, errors)
+    elif isinstance(value, list):
+        try:
+            value.append("mutated_by_llm")
+        except TypeError as error:
+            errors.append(error)
+
+
+def _bypass_mutate_nested_payload(value: object) -> None:
+    if isinstance(value, dict):
+        dict.__setitem__(value, "mutated_by_llm", True)
+        for nested in list(value.values()):
+            _bypass_mutate_nested_payload(nested)
+    elif isinstance(value, list):
+        list.append(value, "mutated_by_llm")
+
+
+class MutatingFakeLLM(FakeLLM):
+    """LLM double that tries to alter every nested value in its input."""
+
+    def __init__(self, proposals: Iterable[AgentProposal]) -> None:
+        super().__init__(proposals)
+        self.mutation_errors: list[TypeError] = []
+
+    def complete(self, messages: Sequence[AgentMessage]) -> AgentProposal:
+        proposal = super().complete(messages)
+        for message in messages:
+            _mutate_nested_payload(message.content, self.mutation_errors)
+            _mutate_nested_payload(message.tool_result, self.mutation_errors)
+            if message.tool_call is not None:
+                _mutate_nested_payload(
+                    message.tool_call.arguments, self.mutation_errors
+                )
+        return proposal
+
+
+class CallerMutatingToolExecutor(FakeToolExecutor):
+    """Tool double that mutates caller-owned payloads while executing."""
+
+    def __init__(self, tool_arguments: dict[str, ToolData]) -> None:
+        super().__init__({"snapshot_tool": "executed"})
+        self.tool_arguments = tool_arguments
+
+    def execute(self, tool_call: ToolCall) -> ToolData:
+        result = super().execute(tool_call)
+        argument_nested = self.tool_arguments["query"]
+        if isinstance(argument_nested, dict):
+            argument_tags = argument_nested["tags"]
+            if isinstance(argument_tags, list):
+                argument_tags.append("mutated_by_caller")
+        return result
+
+
+class BypassMutatingFakeLLM(FakeLLM):
+    """LLM double that bypasses frozen-container overrides on its input."""
+
+    def complete(self, messages: Sequence[AgentMessage]) -> AgentProposal:
+        proposal = super().complete(messages)
+        for message in messages:
+            _bypass_mutate_nested_payload(message.tool_result)
+            if message.tool_call is not None:
+                _bypass_mutate_nested_payload(message.tool_call.arguments)
+        return proposal
+
+
+def test_tool_call_then_final_completes_with_ordered_transcript() -> None:
+    initial = AgentMessage(role=MessageRole.USER, content="Find the customer")
+    tool_call = ToolCall(name="find_customer", arguments={"email": "ada@example.com"})
+    llm = FakeLLM(
+        [
+            AgentProposal(tool_call=tool_call),
+            AgentProposal(final_response="Customer found"),
+        ]
+    )
+    tools = FakeToolExecutor({"find_customer": {"customer_id": "cust-1"}})
+
+    result = AgentLoop(llm, tools).run([initial])
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.reason is StopReason.FINAL
+    assert result.steps == 2
+    assert result.final_response == "Customer found"
+    assert tools.calls == [tool_call]
+    assert result.messages == (
+        initial,
+        AgentMessage(
+            role=MessageRole.ASSISTANT,
+            tool_call=tool_call,
+        ),
+        AgentMessage(
+            role=MessageRole.TOOL,
+            tool_call=tool_call,
+            tool_result={"customer_id": "cust-1"},
+        ),
+        AgentMessage(
+            role=MessageRole.ASSISTANT,
+            content="Customer found",
+        ),
+    )
+    assert llm.requests == [
+        (initial,),
+        (
+            initial,
+            AgentMessage(role=MessageRole.ASSISTANT, tool_call=tool_call),
+            AgentMessage(
+                role=MessageRole.TOOL,
+                tool_call=tool_call,
+                tool_result={"customer_id": "cust-1"},
+            ),
+        ),
+    ]
+
+
+def test_none_tool_result_is_preserved_before_final_response() -> None:
+    tool_call = ToolCall(name="lookup_optional_note")
+    llm = FakeLLM(
+        [
+            AgentProposal(tool_call=tool_call),
+            AgentProposal(final_response="No note exists"),
+        ]
+    )
+    tools = FakeToolExecutor({"lookup_optional_note": None})
+
+    result = AgentLoop(llm, tools).run([])
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.reason is StopReason.FINAL
+    assert result.steps == 2
+    assert tools.calls == [tool_call]
+    tool_messages = [
+        message for message in result.messages if message.role is MessageRole.TOOL
+    ]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].tool_call == tool_call
+    assert tool_messages[0].tool_result is None
+    next_request_tool_messages = [
+        message for message in llm.requests[1] if message.role is MessageRole.TOOL
+    ]
+    assert len(next_request_tool_messages) == 1
+    assert next_request_tool_messages[0].tool_call == tool_call
+    assert next_request_tool_messages[0].tool_result is None
+
+
+def test_loop_isolates_initial_messages_from_mutating_llm() -> None:
+    initial_payload = {"nested": {"items": ["caller"]}}
+    initial = AgentMessage(role=MessageRole.USER, tool_result=initial_payload)
+    llm = MutatingFakeLLM([AgentProposal(final_response="Finished")])
+
+    result = AgentLoop(llm, FakeToolExecutor()).run([initial])
+
+    expected_payload = {"nested": {"items": ["caller"]}}
+    assert initial_payload == expected_payload
+    assert llm.mutation_errors
+    assert all(isinstance(error, TypeError) for error in llm.mutation_errors)
+    assert result.messages == (
+        AgentMessage(role=MessageRole.USER, tool_result=expected_payload),
+        AgentMessage(role=MessageRole.ASSISTANT, content="Finished"),
+    )
+
+
+def test_loop_snapshots_tool_call_arguments_from_tool_executor() -> None:
+    tool_arguments = {"query": {"tags": ["original"]}}
+    tool_call = ToolCall(name="snapshot_tool", arguments=tool_arguments)
+    llm = FakeLLM(
+        [
+            AgentProposal(tool_call=tool_call),
+            AgentProposal(final_response="Finished"),
+        ]
+    )
+    tools = CallerMutatingToolExecutor(tool_arguments)
+
+    result = AgentLoop(llm, tools).run([])
+
+    expected_arguments = {"query": {"tags": ["original"]}}
+    assert tool_arguments == {
+        "query": {"tags": ["original", "mutated_by_caller"]}
+    }
+    assert result.messages[0].tool_call is not None
+    assert result.messages[0].tool_call.arguments == expected_arguments
+    assert result.messages[1].tool_call is not None
+    assert result.messages[1].tool_call.arguments == expected_arguments
+    assert tools.calls[0].arguments == expected_arguments
+
+
+def test_nested_agent_data_is_immutable_and_json_serializable() -> None:
+    expected_arguments = {
+        "filters": {"regions": ["EU", "US"]},
+        "limit": 5,
+    }
+    expected_result = {
+        "matches": [{"customer_id": "cust-1", "active": True}],
+        "next_cursor": None,
+    }
+    tool_call = ToolCall(name="search_customers", arguments=expected_arguments)
+    tool_message = AgentMessage(
+        role=MessageRole.TOOL,
+        tool_call=tool_call,
+        tool_result=expected_result,
+    )
+
+    assert tool_call.arguments == expected_arguments
+    assert tool_message.tool_result == expected_result
+    assert json.loads(json.dumps(tool_call.arguments)) == expected_arguments
+    assert json.loads(json.dumps(tool_message.tool_result)) == expected_result
+
+    with pytest.raises(TypeError, match="agent data is immutable"):
+        tool_call.arguments["filters"]["regions"].append("CA")
+    with pytest.raises(TypeError, match="agent data is immutable"):
+        tool_message.tool_result["matches"][0]["active"] = False
+
+    assert tool_call.arguments == expected_arguments
+    assert tool_message.tool_result == expected_result
+
+
+def test_loop_snapshots_tool_result_from_mutating_llm() -> None:
+    tool_call = ToolCall(name="snapshot_tool")
+    tool_result = {"nested": {"items": ["from_tool"]}}
+    llm = MutatingFakeLLM(
+        [
+            AgentProposal(tool_call=tool_call),
+            AgentProposal(final_response="Finished"),
+        ]
+    )
+    tools = FakeToolExecutor({"snapshot_tool": tool_result})
+
+    result = AgentLoop(llm, tools).run([])
+
+    expected_result = {"nested": {"items": ["from_tool"]}}
+    assert tool_result == expected_result
+    assert llm.mutation_errors
+    assert all(isinstance(error, TypeError) for error in llm.mutation_errors)
+    tool_messages = [
+        message for message in result.messages if message.role is MessageRole.TOOL
+    ]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].tool_result == expected_result
+    next_request_tool_messages = [
+        message for message in llm.requests[1] if message.role is MessageRole.TOOL
+    ]
+    assert len(next_request_tool_messages) == 1
+    assert next_request_tool_messages[0].tool_result == expected_result
+
+
+def test_llm_boundary_snapshot_survives_base_container_mutation() -> None:
+    initial_payload = {"nested": {"items": ["caller"]}}
+    tool_arguments = {"query": {"tags": ["original"]}}
+    tool_result = {"nested": {"items": ["from_tool"]}}
+    tool_call = ToolCall(name="snapshot_tool", arguments=tool_arguments)
+    initial = AgentMessage(role=MessageRole.USER, tool_result=initial_payload)
+    llm = BypassMutatingFakeLLM(
+        [
+            AgentProposal(tool_call=tool_call),
+            AgentProposal(final_response="Finished"),
+        ]
+    )
+    tools = FakeToolExecutor({"snapshot_tool": tool_result})
+
+    result = AgentLoop(llm, tools).run([initial])
+
+    assert initial_payload == {"nested": {"items": ["caller"]}}
+    assert tool_arguments == {"query": {"tags": ["original"]}}
+    assert tool_result == {"nested": {"items": ["from_tool"]}}
+    assert result.messages[0].tool_result == {
+        "nested": {"items": ["caller"]}
+    }
+    assert result.messages[1].tool_call is not None
+    assert result.messages[1].tool_call.arguments == {
+        "query": {"tags": ["original"]}
+    }
+    assert result.messages[2].tool_result == {
+        "nested": {"items": ["from_tool"]}
+    }
+    assert llm.requests[1][0].tool_result == {
+        "nested": {"items": ["caller"]}
+    }
+    assert llm.requests[1][1].tool_call is not None
+    assert llm.requests[1][1].tool_call.arguments == {
+        "query": {"tags": ["original"]}
+    }
+    assert llm.requests[1][2].tool_result == {
+        "nested": {"items": ["from_tool"]}
+    }
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_non_finite_tool_data_is_rejected(value: float) -> None:
+    with pytest.raises(TypeError, match="finite JSON"):
+        ToolCall(name="invalid_number", arguments={"value": value})
+    with pytest.raises(TypeError, match="finite JSON"):
+        AgentMessage(role=MessageRole.TOOL, tool_result={"value": value})
+
+
+@pytest.mark.parametrize("max_steps", [0, -1, 0.5, True])
+def test_non_positive_max_steps_is_rejected(max_steps: int | float | bool) -> None:
+    with pytest.raises(ValueError, match="max_steps must be positive integer"):
+        AgentLoop(FakeLLM([]), FakeToolExecutor(), max_steps=max_steps)
+
+
+@pytest.mark.parametrize("payload_kind", ["dict", "list"])
+def test_self_referential_tool_data_is_rejected(payload_kind: str) -> None:
+    if payload_kind == "dict":
+        cyclic_dict: dict[str, object] = {}
+        cyclic_dict["self"] = cyclic_dict
+        payload: object = cyclic_dict
+    else:
+        cyclic_list: list[object] = []
+        cyclic_list.append(cyclic_list)
+        payload = cyclic_list
+
+    with pytest.raises(TypeError, match="cannot contain cycles"):
+        ToolCall(name="cyclic_payload", arguments={"payload": payload})
+    with pytest.raises(TypeError, match="cannot contain cycles"):
+        AgentMessage(role=MessageRole.TOOL, tool_result=payload)
+
+
+def test_third_consecutive_request_for_same_tool_breaks_before_execution() -> None:
+    tool_call = ToolCall(name="unstable_tool")
+    llm = FakeLLM([AgentProposal(tool_call=tool_call) for _ in range(3)])
+    tools = FakeToolExecutor({"unstable_tool": "ok"})
+
+    result = AgentLoop(llm, tools).run([])
+
+    assert result.status is RunStatus.FAILED
+    assert result.reason is StopReason.REPEATED_TOOL
+    assert result.steps == 3
+    assert tools.calls == [tool_call, tool_call]
+    assert [message.role for message in result.messages] == [
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL,
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL,
+        MessageRole.ASSISTANT,
+    ]
+
+
+def test_nonconsecutive_repeated_tool_requests_are_allowed() -> None:
+    tool_a = ToolCall(name="tool_a")
+    tool_b = ToolCall(name="tool_b")
+    llm = FakeLLM(
+        [
+            AgentProposal(tool_call=tool_a),
+            AgentProposal(tool_call=tool_b),
+            AgentProposal(tool_call=tool_a),
+            AgentProposal(final_response="Finished"),
+        ]
+    )
+    tools = FakeToolExecutor({"tool_a": "a", "tool_b": "b"})
+
+    result = AgentLoop(llm, tools).run([])
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.reason is StopReason.FINAL
+    assert result.steps == 4
+    assert tools.calls == [tool_a, tool_b, tool_a]
+
+
+def test_eight_nonfinal_proposals_stop_at_max_steps() -> None:
+    calls = [ToolCall(name=f"tool_{index}") for index in range(MAX_STEPS)]
+    llm = FakeLLM([AgentProposal(tool_call=call) for call in calls])
+    tools = FakeToolExecutor()
+
+    result = AgentLoop(llm, tools).run([])
+
+    assert result.status is RunStatus.FAILED
+    assert result.reason is StopReason.MAX_STEPS
+    assert result.steps == MAX_STEPS
+    assert tools.calls == calls
+
+
+def test_max_steps_argument_cannot_raise_the_hard_ceiling() -> None:
+    calls = [ToolCall(name=f"tool_{index}") for index in range(MAX_STEPS + 1)]
+    llm = FakeLLM([AgentProposal(tool_call=call) for call in calls])
+    tools = FakeToolExecutor()
+
+    result = AgentLoop(llm, tools, max_steps=MAX_STEPS + 1).run([])
+
+    assert result.status is RunStatus.FAILED
+    assert result.reason is StopReason.MAX_STEPS
+    assert result.steps == MAX_STEPS
+    assert tools.calls == calls[:MAX_STEPS]
+
+
+def test_empty_proposal_fails_without_executing_a_tool() -> None:
+    llm = FakeLLM([AgentProposal()])
+    tools = FakeToolExecutor()
+
+    result = AgentLoop(llm, tools).run([])
+
+    assert result.status is RunStatus.FAILED
+    assert result.reason is StopReason.INVALID_PROPOSAL
+    assert result.steps == 1
+    assert result.final_response is None
+    assert tools.calls == []
+    assert result.messages == (
+        AgentMessage(role=MessageRole.ASSISTANT),
+    )
