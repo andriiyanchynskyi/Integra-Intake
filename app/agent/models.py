@@ -8,6 +8,9 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class _FrozenDict(dict[str, object]):
@@ -159,16 +162,105 @@ class ToolCall:
         object.__setattr__(self, "arguments", frozen_arguments)
 
 
-@dataclass(frozen=True, slots=True)
-class AgentProposal:
-    final_response: str | None = None
-    tool_call: ToolCall | None = None
+class ProposalPriority(str, Enum):
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+    URGENT = "urgent"
+
+
+class _StrictProposalModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+type ProposalScalar = None | bool | int | float | str
+type ProposalValueData = ProposalScalar | list[ProposalScalar]
+
+
+class ProposalValue(_StrictProposalModel):
+    name: Annotated[str, Field(min_length=1)]
+    value: ProposalValueData
+
+    @field_validator("value")
+    @classmethod
+    def freeze_value(cls, value: ProposalValueData) -> ProposalValueData:
+        if isinstance(value, float) and not math.isfinite(value):
+            raise TypeError("proposal values must use finite JSON numbers")
+        if isinstance(value, list):
+            frozen = _freeze_data(value)
+            if not isinstance(frozen, _FrozenList):
+                raise TypeError("proposal value lists must be JSON-compatible")
+            return frozen
+        return value
+
+
+class ProposalToolCall(_StrictProposalModel):
+    name: Annotated[str, Field(min_length=1)]
+    arguments: list[ProposalValue]
+
+    @field_validator("arguments")
+    @classmethod
+    def require_unique_arguments(cls, value: list[ProposalValue]) -> _FrozenList:
+        names = [item.name for item in value]
+        if len(names) != len(set(names)):
+            raise ValueError("tool argument names must be unique")
+        return _FrozenList(value)
+
+    def as_tool_call(self) -> ToolCall:
+        return ToolCall(
+            name=self.name,
+            arguments={item.name: item.value for item in self.arguments},
+        )
+
+
+class AgentProposal(_StrictProposalModel):
+    intake_type: Annotated[str, Field(min_length=1)] | None
+    fields: list[ProposalValue]
+    missing_required_fields: list[Annotated[str, Field(min_length=1)]]
+    priority: ProposalPriority
+    contains_injection_or_override_attempt: bool
+    rationale_short: Annotated[str, Field(min_length=1, max_length=1000)]
+    tool_calls: list[ProposalToolCall] = Field(max_length=1)
+    confidence: Annotated[float, Field(ge=0.0, le=1.0)]
+
+    @field_validator("fields")
+    @classmethod
+    def require_unique_fields(cls, value: list[ProposalValue]) -> _FrozenList:
+        names = [item.name for item in value]
+        if len(names) != len(set(names)):
+            raise ValueError("field names must be unique")
+        return _FrozenList(value)
+
+    @field_validator("missing_required_fields")
+    @classmethod
+    def freeze_missing_required_fields(
+        cls, value: list[str]
+    ) -> _FrozenList:
+        if len(value) != len(set(value)):
+            raise ValueError("missing_required_fields must be unique")
+        return _FrozenList(value)
+
+    @field_validator("tool_calls")
+    @classmethod
+    def freeze_tool_calls(cls, value: list[ProposalToolCall]) -> _FrozenList:
+        return _FrozenList(value)
+
+    @property
+    def tool_call(self) -> ToolCall | None:
+        if not self.tool_calls:
+            return None
+        return self.tool_calls[0].as_tool_call()
+
+    @property
+    def is_terminal(self) -> bool:
+        return not self.tool_calls
 
 
 @dataclass(frozen=True, slots=True)
 class AgentMessage:
     role: MessageRole
     content: str | None = None
+    proposal: AgentProposal | None = None
     tool_call: ToolCall | None = None
     tool_result: ToolData = None
 
@@ -183,3 +275,4 @@ class AgentRunResult:
     messages: tuple[AgentMessage, ...]
     steps: int
     final_response: str | None
+    proposal: AgentProposal | None = None

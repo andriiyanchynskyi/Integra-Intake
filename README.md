@@ -96,4 +96,5 @@ docker compose up --build
 | `DATABASE_URL` | `postgresql+asyncpg://integra:integra@localhost:5432/integra` | Postgres connection |
 | `LLM_API_KEY` | — | LLM provider API key |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base |
+| `OPENAI_MODEL` | `gpt-5.4-mini-2026-03-17` | Structured-output model ID |
 | `APP_ENV` | `development` | Runtime environment label |

@@ -4,6 +4,7 @@ import json
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
+from dataclasses import dataclass
 
 import pytest
 
@@ -13,11 +14,54 @@ from app.agent import (
     AgentProposal,
     MAX_STEPS,
     MessageRole,
+    ProposalPriority,
+    ProposalToolCall,
     RunStatus,
     StopReason,
     ToolCall,
     ToolData,
 )
+
+
+def _proposal(
+    *,
+    rationale: str = "Working on the request",
+    tool_call: ToolCall | None = None,
+    intake_type: str | None = "general",
+    fields: Mapping[str, object] | None = None,
+    missing_required_fields: Iterable[str] = (),
+    priority: ProposalPriority = ProposalPriority.NORMAL,
+    contains_injection_or_override_attempt: bool = False,
+    confidence: float = 0.9,
+) -> AgentProposal:
+    """Build a complete structured proposal for loop tests."""
+
+    tool_calls = []
+    if tool_call is not None:
+        tool_calls.append(
+            ProposalToolCall(
+                name=tool_call.name,
+                arguments=[
+                    {"name": name, "value": value}
+                    for name, value in tool_call.arguments.items()
+                ],
+            )
+        )
+    return AgentProposal(
+        intake_type=intake_type,
+        fields=[
+            {"name": name, "value": value}
+            for name, value in (fields or {}).items()
+        ],
+        missing_required_fields=list(missing_required_fields),
+        priority=priority,
+        contains_injection_or_override_attempt=(
+            contains_injection_or_override_attempt
+        ),
+        rationale_short=rationale,
+        tool_calls=tool_calls,
+        confidence=confidence,
+    )
 
 
 class FakeLLM:
@@ -99,10 +143,8 @@ class CallerMutatingToolExecutor(FakeToolExecutor):
     def execute(self, tool_call: ToolCall) -> ToolData:
         result = super().execute(tool_call)
         argument_nested = self.tool_arguments["query"]
-        if isinstance(argument_nested, dict):
-            argument_tags = argument_nested["tags"]
-            if isinstance(argument_tags, list):
-                argument_tags.append("mutated_by_caller")
+        if isinstance(argument_nested, list):
+            argument_nested.append("mutated_by_caller")
         return result
 
 
@@ -121,10 +163,12 @@ class BypassMutatingFakeLLM(FakeLLM):
 def test_tool_call_then_final_completes_with_ordered_transcript() -> None:
     initial = AgentMessage(role=MessageRole.USER, content="Find the customer")
     tool_call = ToolCall(name="find_customer", arguments={"email": "ada@example.com"})
+    tool_proposal = _proposal(rationale="Searching for the customer", tool_call=tool_call)
+    final_proposal = _proposal(rationale="Customer found")
     llm = FakeLLM(
         [
-            AgentProposal(tool_call=tool_call),
-            AgentProposal(final_response="Customer found"),
+            tool_proposal,
+            final_proposal,
         ]
     )
     tools = FakeToolExecutor({"find_customer": {"customer_id": "cust-1"}})
@@ -135,11 +179,14 @@ def test_tool_call_then_final_completes_with_ordered_transcript() -> None:
     assert result.reason is StopReason.FINAL
     assert result.steps == 2
     assert result.final_response == "Customer found"
+    assert result.proposal == final_proposal
     assert tools.calls == [tool_call]
     assert result.messages == (
         initial,
         AgentMessage(
             role=MessageRole.ASSISTANT,
+            content="Searching for the customer",
+            proposal=tool_proposal,
             tool_call=tool_call,
         ),
         AgentMessage(
@@ -150,13 +197,19 @@ def test_tool_call_then_final_completes_with_ordered_transcript() -> None:
         AgentMessage(
             role=MessageRole.ASSISTANT,
             content="Customer found",
+            proposal=final_proposal,
         ),
     )
     assert llm.requests == [
         (initial,),
         (
             initial,
-            AgentMessage(role=MessageRole.ASSISTANT, tool_call=tool_call),
+            AgentMessage(
+                role=MessageRole.ASSISTANT,
+                content="Searching for the customer",
+                proposal=tool_proposal,
+                tool_call=tool_call,
+            ),
             AgentMessage(
                 role=MessageRole.TOOL,
                 tool_call=tool_call,
@@ -166,12 +219,41 @@ def test_tool_call_then_final_completes_with_ordered_transcript() -> None:
     ]
 
 
+@pytest.mark.parametrize("confidence", [0.1, 0.99])
+def test_confidence_does_not_change_completion_or_tool_authorization(
+    confidence: float,
+) -> None:
+    tool_call = ToolCall(name="lookup_customer", arguments={"id": "cust-1"})
+    tool_proposal = _proposal(
+        rationale="Looking up the customer",
+        tool_call=tool_call,
+        confidence=confidence,
+    )
+    final_proposal = _proposal(
+        rationale="Customer found",
+        confidence=confidence,
+    )
+    tools = FakeToolExecutor({"lookup_customer": {"customer_id": "cust-1"}})
+    llm = FakeLLM([tool_proposal, final_proposal])
+
+    result = AgentLoop(llm, tools).run([])
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.reason is StopReason.FINAL
+    assert result.steps == 2
+    assert result.final_response == "Customer found"
+    assert result.proposal == final_proposal
+    assert tools.calls == [tool_call]
+
+
 def test_none_tool_result_is_preserved_before_final_response() -> None:
     tool_call = ToolCall(name="lookup_optional_note")
+    tool_proposal = _proposal(rationale="Looking up the optional note", tool_call=tool_call)
+    final_proposal = _proposal(rationale="No note exists")
     llm = FakeLLM(
         [
-            AgentProposal(tool_call=tool_call),
-            AgentProposal(final_response="No note exists"),
+            tool_proposal,
+            final_proposal,
         ]
     )
     tools = FakeToolExecutor({"lookup_optional_note": None})
@@ -199,7 +281,8 @@ def test_none_tool_result_is_preserved_before_final_response() -> None:
 def test_loop_isolates_initial_messages_from_mutating_llm() -> None:
     initial_payload = {"nested": {"items": ["caller"]}}
     initial = AgentMessage(role=MessageRole.USER, tool_result=initial_payload)
-    llm = MutatingFakeLLM([AgentProposal(final_response="Finished")])
+    final_proposal = _proposal(rationale="Finished")
+    llm = MutatingFakeLLM([final_proposal])
 
     result = AgentLoop(llm, FakeToolExecutor()).run([initial])
 
@@ -209,27 +292,31 @@ def test_loop_isolates_initial_messages_from_mutating_llm() -> None:
     assert all(isinstance(error, TypeError) for error in llm.mutation_errors)
     assert result.messages == (
         AgentMessage(role=MessageRole.USER, tool_result=expected_payload),
-        AgentMessage(role=MessageRole.ASSISTANT, content="Finished"),
+        AgentMessage(
+            role=MessageRole.ASSISTANT,
+            content="Finished",
+            proposal=final_proposal,
+        ),
     )
 
 
 def test_loop_snapshots_tool_call_arguments_from_tool_executor() -> None:
-    tool_arguments = {"query": {"tags": ["original"]}}
+    tool_arguments = {"query": ["original"]}
     tool_call = ToolCall(name="snapshot_tool", arguments=tool_arguments)
+    tool_proposal = _proposal(rationale="Running snapshot tool", tool_call=tool_call)
+    final_proposal = _proposal(rationale="Finished")
     llm = FakeLLM(
         [
-            AgentProposal(tool_call=tool_call),
-            AgentProposal(final_response="Finished"),
+            tool_proposal,
+            final_proposal,
         ]
     )
     tools = CallerMutatingToolExecutor(tool_arguments)
 
     result = AgentLoop(llm, tools).run([])
 
-    expected_arguments = {"query": {"tags": ["original"]}}
-    assert tool_arguments == {
-        "query": {"tags": ["original", "mutated_by_caller"]}
-    }
+    expected_arguments = {"query": ["original"]}
+    assert tool_arguments == {"query": ["original", "mutated_by_caller"]}
     assert result.messages[0].tool_call is not None
     assert result.messages[0].tool_call.arguments == expected_arguments
     assert result.messages[1].tool_call is not None
@@ -270,10 +357,12 @@ def test_nested_agent_data_is_immutable_and_json_serializable() -> None:
 def test_loop_snapshots_tool_result_from_mutating_llm() -> None:
     tool_call = ToolCall(name="snapshot_tool")
     tool_result = {"nested": {"items": ["from_tool"]}}
+    tool_proposal = _proposal(rationale="Running snapshot tool", tool_call=tool_call)
+    final_proposal = _proposal(rationale="Finished")
     llm = MutatingFakeLLM(
         [
-            AgentProposal(tool_call=tool_call),
-            AgentProposal(final_response="Finished"),
+            tool_proposal,
+            final_proposal,
         ]
     )
     tools = FakeToolExecutor({"snapshot_tool": tool_result})
@@ -298,14 +387,16 @@ def test_loop_snapshots_tool_result_from_mutating_llm() -> None:
 
 def test_llm_boundary_snapshot_survives_base_container_mutation() -> None:
     initial_payload = {"nested": {"items": ["caller"]}}
-    tool_arguments = {"query": {"tags": ["original"]}}
+    tool_arguments = {"query": ["original"]}
     tool_result = {"nested": {"items": ["from_tool"]}}
     tool_call = ToolCall(name="snapshot_tool", arguments=tool_arguments)
     initial = AgentMessage(role=MessageRole.USER, tool_result=initial_payload)
+    tool_proposal = _proposal(rationale="Running snapshot tool", tool_call=tool_call)
+    final_proposal = _proposal(rationale="Finished")
     llm = BypassMutatingFakeLLM(
         [
-            AgentProposal(tool_call=tool_call),
-            AgentProposal(final_response="Finished"),
+            tool_proposal,
+            final_proposal,
         ]
     )
     tools = FakeToolExecutor({"snapshot_tool": tool_result})
@@ -313,15 +404,13 @@ def test_llm_boundary_snapshot_survives_base_container_mutation() -> None:
     result = AgentLoop(llm, tools).run([initial])
 
     assert initial_payload == {"nested": {"items": ["caller"]}}
-    assert tool_arguments == {"query": {"tags": ["original"]}}
+    assert tool_arguments == {"query": ["original"]}
     assert tool_result == {"nested": {"items": ["from_tool"]}}
     assert result.messages[0].tool_result == {
         "nested": {"items": ["caller"]}
     }
     assert result.messages[1].tool_call is not None
-    assert result.messages[1].tool_call.arguments == {
-        "query": {"tags": ["original"]}
-    }
+    assert result.messages[1].tool_call.arguments == {"query": ["original"]}
     assert result.messages[2].tool_result == {
         "nested": {"items": ["from_tool"]}
     }
@@ -329,9 +418,7 @@ def test_llm_boundary_snapshot_survives_base_container_mutation() -> None:
         "nested": {"items": ["caller"]}
     }
     assert llm.requests[1][1].tool_call is not None
-    assert llm.requests[1][1].tool_call.arguments == {
-        "query": {"tags": ["original"]}
-    }
+    assert llm.requests[1][1].tool_call.arguments == {"query": ["original"]}
     assert llm.requests[1][2].tool_result == {
         "nested": {"items": ["from_tool"]}
     }
@@ -370,7 +457,12 @@ def test_self_referential_tool_data_is_rejected(payload_kind: str) -> None:
 
 def test_third_consecutive_request_for_same_tool_breaks_before_execution() -> None:
     tool_call = ToolCall(name="unstable_tool")
-    llm = FakeLLM([AgentProposal(tool_call=tool_call) for _ in range(3)])
+    llm = FakeLLM(
+        [
+            _proposal(rationale=f"Attempt {index}", tool_call=tool_call)
+            for index in range(3)
+        ]
+    )
     tools = FakeToolExecutor({"unstable_tool": "ok"})
 
     result = AgentLoop(llm, tools).run([])
@@ -393,10 +485,10 @@ def test_nonconsecutive_repeated_tool_requests_are_allowed() -> None:
     tool_b = ToolCall(name="tool_b")
     llm = FakeLLM(
         [
-            AgentProposal(tool_call=tool_a),
-            AgentProposal(tool_call=tool_b),
-            AgentProposal(tool_call=tool_a),
-            AgentProposal(final_response="Finished"),
+            _proposal(rationale="Running tool A", tool_call=tool_a),
+            _proposal(rationale="Running tool B", tool_call=tool_b),
+            _proposal(rationale="Running tool A again", tool_call=tool_a),
+            _proposal(rationale="Finished"),
         ]
     )
     tools = FakeToolExecutor({"tool_a": "a", "tool_b": "b"})
@@ -411,7 +503,9 @@ def test_nonconsecutive_repeated_tool_requests_are_allowed() -> None:
 
 def test_eight_nonfinal_proposals_stop_at_max_steps() -> None:
     calls = [ToolCall(name=f"tool_{index}") for index in range(MAX_STEPS)]
-    llm = FakeLLM([AgentProposal(tool_call=call) for call in calls])
+    llm = FakeLLM(
+        [_proposal(rationale=f"Running {call.name}", tool_call=call) for call in calls]
+    )
     tools = FakeToolExecutor()
 
     result = AgentLoop(llm, tools).run([])
@@ -424,7 +518,9 @@ def test_eight_nonfinal_proposals_stop_at_max_steps() -> None:
 
 def test_max_steps_argument_cannot_raise_the_hard_ceiling() -> None:
     calls = [ToolCall(name=f"tool_{index}") for index in range(MAX_STEPS + 1)]
-    llm = FakeLLM([AgentProposal(tool_call=call) for call in calls])
+    llm = FakeLLM(
+        [_proposal(rationale=f"Running {call.name}", tool_call=call) for call in calls]
+    )
     tools = FakeToolExecutor()
 
     result = AgentLoop(llm, tools, max_steps=MAX_STEPS + 1).run([])
@@ -435,8 +531,17 @@ def test_max_steps_argument_cannot_raise_the_hard_ceiling() -> None:
     assert tools.calls == calls[:MAX_STEPS]
 
 
+@dataclass(frozen=True)
+class InvalidProposal:
+    """Malformed provider double used to exercise the loop's defensive branch."""
+
+    is_terminal = False
+    tool_call = None
+    rationale_short = "Invalid structured proposal"
+
+
 def test_empty_proposal_fails_without_executing_a_tool() -> None:
-    llm = FakeLLM([AgentProposal()])
+    llm = FakeLLM([InvalidProposal()])
     tools = FakeToolExecutor()
 
     result = AgentLoop(llm, tools).run([])
@@ -447,5 +552,9 @@ def test_empty_proposal_fails_without_executing_a_tool() -> None:
     assert result.final_response is None
     assert tools.calls == []
     assert result.messages == (
-        AgentMessage(role=MessageRole.ASSISTANT),
+        AgentMessage(
+            role=MessageRole.ASSISTANT,
+            content="Invalid structured proposal",
+            proposal=InvalidProposal(),
+        ),
     )

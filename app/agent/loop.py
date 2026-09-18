@@ -61,18 +61,20 @@ class AgentLoop:
             messages.append(
                 AgentMessage(
                     role=MessageRole.ASSISTANT,
-                    content=proposal.final_response,
+                    content=proposal.rationale_short,
+                    proposal=deepcopy(proposal),
                     tool_call=tool_call,
                 )
             )
 
-            if proposal.final_response is not None:
+            if proposal.is_terminal:
                 return AgentRunResult(
                     status=RunStatus.COMPLETED,
                     reason=StopReason.FINAL,
                     messages=tuple(deepcopy(messages)),
                     steps=steps,
-                    final_response=proposal.final_response,
+                    final_response=proposal.rationale_short,
+                    proposal=deepcopy(proposal),
                 )
 
             if tool_call is None:
