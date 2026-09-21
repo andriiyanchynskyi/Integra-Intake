@@ -19,6 +19,7 @@ from app.agent.models import (
     ProposalValue,
     ToolData,
     ToolCall,
+    ToolExecutionResult,
 )
 
 __all__ = [
@@ -37,5 +38,6 @@ __all__ = [
     "StopReason",
     "ToolData",
     "ToolCall",
+    "ToolExecutionResult",
     "ToolExecutor",
 ]

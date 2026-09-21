@@ -13,6 +13,7 @@ from app.agent.models import (
     StopReason,
     ToolData,
     ToolCall,
+    ToolExecutionResult,
 )
 
 
@@ -27,7 +28,9 @@ class LLMClient(Protocol):
 class ToolExecutor(Protocol):
     """Execute a call and return JSON-compatible, deepcopyable data."""
 
-    def execute(self, tool_call: ToolCall) -> ToolData: ...
+    def execute(
+        self, proposal: AgentProposal, tool_call: ToolCall
+    ) -> ToolExecutionResult: ...
 
 
 class AgentLoop:
@@ -101,14 +104,26 @@ class AgentLoop:
                     final_response=None,
                 )
 
-            result = self.tools.execute(deepcopy(tool_call))
+            execution = self.tools.execute(
+                deepcopy(proposal), deepcopy(tool_call)
+            )
             messages.append(
                 AgentMessage(
                     role=MessageRole.TOOL,
                     tool_call=tool_call,
-                    tool_result=deepcopy(result),
+                    tool_result=deepcopy(execution.data),
                 )
             )
+
+            if not execution.continue_run:
+                return AgentRunResult(
+                    status=RunStatus.COMPLETED,
+                    reason=StopReason.EXECUTOR_STOPPED,
+                    messages=tuple(deepcopy(messages)),
+                    steps=steps,
+                    final_response=execution.final_response,
+                    proposal=deepcopy(proposal),
+                )
 
         return AgentRunResult(
             status=RunStatus.FAILED,

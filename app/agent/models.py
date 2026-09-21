@@ -136,6 +136,7 @@ class MessageRole(str, Enum):
     USER = "user"
     ASSISTANT = "assistant"
     TOOL = "tool"
+    SYSTEM = "system"
 
 
 class RunStatus(str, Enum):
@@ -148,6 +149,7 @@ class StopReason(str, Enum):
     INVALID_PROPOSAL = "invalid_proposal"
     REPEATED_TOOL = "repeated_tool"
     MAX_STEPS = "max_steps"
+    EXECUTOR_STOPPED = "executor_stopped"
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +162,20 @@ class ToolCall:
         if not isinstance(frozen_arguments, _FrozenDict):
             raise TypeError("tool arguments must be a mapping")
         object.__setattr__(self, "arguments", frozen_arguments)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecutionResult:
+    """Generic executor data and continuation control for the agent loop."""
+
+    data: ToolData = None
+    continue_run: bool = True
+    final_response: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "data", _freeze_data(self.data))
+        if self.continue_run and self.final_response is not None:
+            raise ValueError("continuing execution cannot set final_response")
 
 
 class ProposalPriority(str, Enum):

@@ -20,6 +20,7 @@ from app.agent import (
     StopReason,
     ToolCall,
     ToolData,
+    ToolExecutionResult,
 )
 
 
@@ -85,9 +86,11 @@ class FakeToolExecutor:
         self.results = dict(results or {})
         self.calls: list[ToolCall] = []
 
-    def execute(self, tool_call: ToolCall) -> ToolData:
+    def execute(
+        self, proposal: AgentProposal, tool_call: ToolCall
+    ) -> ToolExecutionResult:
         self.calls.append(tool_call)
-        return self.results.get(tool_call.name)
+        return ToolExecutionResult(data=self.results.get(tool_call.name))
 
 
 def _mutate_nested_payload(value: object, errors: list[TypeError]) -> None:
@@ -140,12 +143,28 @@ class CallerMutatingToolExecutor(FakeToolExecutor):
         super().__init__({"snapshot_tool": "executed"})
         self.tool_arguments = tool_arguments
 
-    def execute(self, tool_call: ToolCall) -> ToolData:
-        result = super().execute(tool_call)
+    def execute(
+        self, proposal: AgentProposal, tool_call: ToolCall
+    ) -> ToolExecutionResult:
+        result = super().execute(proposal, tool_call)
         argument_nested = self.tool_arguments["query"]
         if isinstance(argument_nested, list):
             argument_nested.append("mutated_by_caller")
         return result
+
+
+class StoppingFakeToolExecutor(FakeToolExecutor):
+    """Tool double that returns a terminal execution outcome."""
+
+    def __init__(self, result: ToolExecutionResult) -> None:
+        super().__init__()
+        self.result = result
+
+    def execute(
+        self, proposal: AgentProposal, tool_call: ToolCall
+    ) -> ToolExecutionResult:
+        self.calls.append(tool_call)
+        return self.result
 
 
 class BypassMutatingFakeLLM(FakeLLM):
@@ -276,6 +295,40 @@ def test_none_tool_result_is_preserved_before_final_response() -> None:
     assert len(next_request_tool_messages) == 1
     assert next_request_tool_messages[0].tool_call == tool_call
     assert next_request_tool_messages[0].tool_result is None
+
+
+def test_executor_stopped_result_appends_data_once_and_preserves_response() -> None:
+    tool_call = ToolCall(name="create_reply_draft")
+    tool_proposal = _proposal(
+        rationale="Drafting a reply",
+        tool_call=tool_call,
+    )
+    tools = StoppingFakeToolExecutor(
+        ToolExecutionResult(
+            data={"draft_id": "draft-1"},
+            continue_run=False,
+            final_response="Reply draft is ready for review",
+        )
+    )
+
+    result = AgentLoop(FakeLLM([tool_proposal]), tools).run([])
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.reason is StopReason.EXECUTOR_STOPPED
+    assert result.steps == 1
+    assert result.final_response == "Reply draft is ready for review"
+    assert result.proposal == tool_proposal
+    assert tools.calls == [tool_call]
+    assert [message.role for message in result.messages] == [
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL,
+    ]
+    tool_messages = [
+        message for message in result.messages if message.role is MessageRole.TOOL
+    ]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].tool_call == tool_call
+    assert tool_messages[0].tool_result == {"draft_id": "draft-1"}
 
 
 def test_loop_isolates_initial_messages_from_mutating_llm() -> None:

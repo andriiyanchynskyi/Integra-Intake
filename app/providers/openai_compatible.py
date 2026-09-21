@@ -69,6 +69,12 @@ def _provider_messages(messages: Sequence[AgentMessage]) -> list[dict[str, objec
                 "assistant tool call must be followed by its tool message"
             )
 
+        if message.role is MessageRole.SYSTEM:
+            provider_messages.append(
+                {"role": "system", "content": message.content or ""}
+            )
+            continue
+
         if message.role is MessageRole.USER:
             content: object = message.content
             if content is None and message.tool_result is not None:

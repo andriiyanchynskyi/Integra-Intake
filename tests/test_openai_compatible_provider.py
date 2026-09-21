@@ -147,6 +147,38 @@ def test_valid_structured_proposal_uses_openai_compatible_contract() -> None:
     assert proposal.confidence == 0.87
 
 
+def test_leading_system_message_serializes_as_provider_system_message() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json=_provider_response(json.dumps(VALID_PROPOSAL)),
+        )
+
+    messages = [
+        AgentMessage(
+            role=MessageRole.SYSTEM,
+            content="Use the freight intake skill v1.",
+        ),
+        AgentMessage(role=MessageRole.USER, content="Route this shipment"),
+    ]
+
+    with _client(httpx.MockTransport(handler)) as http_client:
+        OpenAICompatibleLLMClient(
+            base_url="https://provider.example/v1/",
+            api_key="dummy-secret",
+            model="test-model",
+            client=http_client,
+        ).complete(messages)
+
+    assert requests[0]["messages"][:2] == [
+        {"role": "system", "content": "Use the freight intake skill v1."},
+        {"role": "user", "content": "Route this shipment"},
+    ]
+
+
 def test_assistant_transcript_uses_rationale_and_native_tool_call() -> None:
     requests: list[dict[str, object]] = []
     proposal = AgentProposal.model_validate_json(json.dumps(VALID_PROPOSAL))

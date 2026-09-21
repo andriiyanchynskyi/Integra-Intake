@@ -11,6 +11,8 @@ class RoutingAssessment:
     present_fields: frozenset[str]
     contains_safety_or_legal_risk: bool
     requested_action: str
+    requires_complete_fields: bool = True
+    registered_actions: frozenset[str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,12 +49,23 @@ class TenantRouter:
             )
 
         missing = tuple(sorted(set(intake.required_fields) - assessment.present_fields))
-        if missing:
+        if assessment.requires_complete_fields and missing:
             return RoutingOutcome(
                 status=RoutingStatus.AWAITING_INPUT,
                 decision=RoutingDecision.DENY,
                 missing_required_fields=missing,
                 reason="missing_required_fields",
+            )
+
+        if (
+            assessment.registered_actions is not None
+            and assessment.requested_action not in assessment.registered_actions
+        ):
+            return RoutingOutcome(
+                status=RoutingStatus.REJECTED,
+                decision=RoutingDecision.DENY,
+                missing_required_fields=(),
+                reason="action_not_configured",
             )
 
         rule = self.config.action_policy.get(assessment.requested_action)

@@ -247,6 +247,33 @@ def test_example_tenant_profiles_load(filename: str, expected_slug: str) -> None
     assert config.slug == expected_slug
 
 
+@pytest.mark.parametrize(
+    "filename",
+    ["freight-broker.yaml", "repair-service.yaml", "language-school.yaml"],
+)
+def test_example_profiles_declare_phase6_runnable_actions_and_send_approval(
+    filename: str,
+) -> None:
+    config = load_tenant_config(PROJECT_ROOT / "examples" / filename)
+    runnable_actions = {
+        "find_customer",
+        "create_case",
+        "update_case_fields",
+        "create_reply_draft",
+        "flag_for_review",
+    }
+
+    assert runnable_actions <= set(config.action_policy)
+    for action in runnable_actions:
+        rule = config.action_policy[action]
+        assert rule.allowed is True
+        assert rule.requires_approval is False
+
+    assert "send_reply" in config.routing.always_approval_actions
+    assert config.action_policy["send_reply"].allowed is True
+    assert config.action_policy["send_reply"].requires_approval is True
+
+
 def test_freight_profile_preserves_the_required_intake_catalog() -> None:
     config = load_tenant_config(PROJECT_ROOT / "examples" / "freight-broker.yaml")
     intake_types = {intake.name: intake for intake in config.intake_types}
@@ -365,6 +392,31 @@ def test_router_requires_approval_for_send_reply(freight_router: TenantRouter) -
     assert outcome.reason == "approval_required"
 
 
+def test_router_allows_configured_find_customer_when_required_fields_are_optional(
+    valid_profile: dict[str, object],
+) -> None:
+    valid_profile["action_policy"]["find_customer"] = {  # type: ignore[index]
+        "allowed": True,
+        "requires_approval": False,
+    }
+    router = TenantRouter(TenantConfig.model_validate(valid_profile))
+
+    outcome = router.route(
+        RoutingAssessment(
+            intake_type="request",
+            present_fields=frozenset(),
+            contains_safety_or_legal_risk=False,
+            requested_action="find_customer",
+            requires_complete_fields=False,
+        )
+    )
+
+    assert outcome.status is RoutingStatus.READY
+    assert outcome.decision is RoutingDecision.ALLOW
+    assert outcome.missing_required_fields == ()
+    assert outcome.reason == "action_allowed"
+
+
 @pytest.mark.parametrize("approval_source", ["rule", "routing_catalog"])
 def test_router_honors_each_approval_mechanism(
     valid_profile: dict[str, object], approval_source: str
@@ -395,6 +447,27 @@ def test_router_rejects_an_unknown_action(freight_router: TenantRouter) -> None:
 
     assert outcome.status is RoutingStatus.REJECTED
     assert outcome.decision is RoutingDecision.DENY
+    assert outcome.reason == "action_not_configured"
+
+
+def test_router_rejects_a_configured_action_missing_from_registered_actions(
+    valid_profile: dict[str, object],
+) -> None:
+    router = TenantRouter(TenantConfig.model_validate(valid_profile))
+
+    outcome = router.route(
+        RoutingAssessment(
+            intake_type="request",
+            present_fields=frozenset({"summary"}),
+            contains_safety_or_legal_risk=False,
+            requested_action="send_reply",
+            registered_actions=frozenset({"create_case"}),
+        )
+    )
+
+    assert outcome.status is RoutingStatus.REJECTED
+    assert outcome.decision is RoutingDecision.DENY
+    assert outcome.missing_required_fields == ()
     assert outcome.reason == "action_not_configured"
 
 

@@ -19,6 +19,9 @@ fields:
   serial_number: {type: short_text, label: Serial number}
 action_policy:
   create_case: {allowed: true, requires_approval: false}
+  find_customer: {allowed: true, requires_approval: false}
+  update_case_fields: {allowed: true, requires_approval: false}
+  create_reply_draft: {allowed: true, requires_approval: false}
   send_reply: {allowed: true, requires_approval: true}
   close_case: {allowed: true, requires_approval: true}
   flag_for_review: {allowed: true, requires_approval: false}
