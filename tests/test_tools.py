@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from copy import deepcopy
+import inspect
 from typing import Any
 from uuid import UUID
 
@@ -25,6 +26,7 @@ from app.tools import (
     CustomerLookupResult,
     InMemoryTenantToolPort,
     PolicyGatedToolExecutor,
+    TenantToolPort,
     ToolDefinition,
 )
 from app.tools.models import ReviewFlag
@@ -32,6 +34,40 @@ from app.tools.models import ReviewFlag
 
 TENANT_A = UUID("00000000-0000-0000-0000-000000000001")
 TENANT_B = UUID("00000000-0000-0000-0000-000000000002")
+
+
+def test_tenant_tool_port_contract_remains_synchronous_and_tenant_scoped() -> None:
+    """The async database adapter must stay behind the unchanged Phase-6 port."""
+    expected_parameters = {
+        "find_customer": ("self", "tenant_id", "email", "external_id"),
+        "create_case": ("self", "tenant_id", "source", "customer_id", "fields"),
+        "update_case_fields": ("self", "tenant_id", "case_id", "fields"),
+        "case_exists": ("self", "tenant_id", "case_id"),
+    }
+
+    for method_name, parameter_names in expected_parameters.items():
+        method = getattr(TenantToolPort, method_name)
+        signature = inspect.signature(method)
+        assert tuple(signature.parameters) == parameter_names
+        assert not inspect.iscoroutinefunction(method)
+        assert signature.parameters["tenant_id"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+
+    assert inspect.signature(TenantToolPort.find_customer).parameters[
+        "email"
+    ].kind is inspect.Parameter.KEYWORD_ONLY
+    assert inspect.signature(TenantToolPort.find_customer).parameters[
+        "external_id"
+    ].kind is inspect.Parameter.KEYWORD_ONLY
+    assert inspect.signature(TenantToolPort.create_case).parameters[
+        "customer_id"
+    ].kind is inspect.Parameter.KEYWORD_ONLY
+    assert inspect.signature(TenantToolPort.create_case).parameters[
+        "fields"
+    ].kind is inspect.Parameter.KEYWORD_ONLY
+    assert inspect.signature(TenantToolPort.update_case_fields).parameters[
+        "fields"
+    ].kind is inspect.Parameter.KEYWORD_ONLY
+    assert not inspect.iscoroutinefunction(PolicyGatedToolExecutor.execute)
 
 
 @pytest.fixture

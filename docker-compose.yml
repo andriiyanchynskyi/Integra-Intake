@@ -26,5 +26,15 @@ services:
       db:
         condition: service_healthy
 
+  worker:
+    build: .
+    command: ["python", "-m", "app.workers"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://integra:integra@db:5432/integra
+      APP_ENV: docker
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   pgdata:

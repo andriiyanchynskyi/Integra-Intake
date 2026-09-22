@@ -18,7 +18,7 @@ from app.db.models import ApiKey, Tenant
 from app.db.session import async_session_factory
 
 
-DEMO_TENANT_SLUG = "demo"
+DEMO_TENANT_SLUG = "freight-broker"
 
 
 async def seed_demo_tenant(session: AsyncSession, slug: str = DEMO_TENANT_SLUG) -> str:

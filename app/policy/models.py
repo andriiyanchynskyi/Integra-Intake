@@ -46,6 +46,7 @@ class TrustedToolRuntimeContext:
     source: TrustedSource | None = None
     case_id: UUID | None = None
     risk_signals: RiskSignals = field(default_factory=RiskSignals)
+    job_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)

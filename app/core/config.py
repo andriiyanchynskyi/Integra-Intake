@@ -1,4 +1,4 @@
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-5.4-mini-2026-03-17"
     app_env: str = "development"
+    tenant_profiles_directory: str = "examples"
+    worker_poll_interval_seconds: float = Field(default=0.5, gt=0)
+    worker_lease_seconds: int = Field(default=60, ge=1)
+    worker_concurrency: int = Field(default=1, ge=1)
+    worker_max_retries: int = Field(default=4, ge=0)
 
 
 settings = Settings()

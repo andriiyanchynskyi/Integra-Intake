@@ -1,5 +1,6 @@
 """Live PostgreSQL coverage for Phase 2 authentication, cases, and seeding."""
 
+from collections.abc import Sequence
 from uuid import UUID, uuid4
 
 import pytest
@@ -8,19 +9,27 @@ from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.agent import AgentMessage, AgentProposal, ProposalPriority
 from app.auth import generate_api_key, get_current_tenant
-from app.db.models import ApiKey, CaseEvent, IntakeCase, Tenant
+from app.core.config import Settings
+from app.db.models import AgentJob, ApiKey, Approval, CaseEvent, IdempotencyRecord, IntakeCase, Tenant
 from app.domain.schemas import CreateCaseRequest
 from app.domain.service import CaseService
+from app.runtime.factory import AgentRuntimeFactory
+from app.tools.postgres import PostgresTenantToolPort
+from app.workers.agent_worker import AgentWorker
 from scripts.seed_demo import seed_demo_tenant
 
 
 async def create_tenant_with_key(
-    session_factory: async_sessionmaker[AsyncSession], name: str
+    session_factory: async_sessionmaker[AsyncSession],
+    name: str,
+    *,
+    slug: str | None = None,
 ) -> tuple[Tenant, str]:
     raw_key, prefix, key_hash = generate_api_key()
     tenant = Tenant(
-        slug=f"{name.lower()}-{uuid4().hex}",
+        slug=slug or f"{name.lower()}-{uuid4().hex}",
         name=name,
         status="active",
     )
@@ -161,3 +170,162 @@ async def test_postgres_seed_rotates_a_digest_only_key_against_migrated_schema(
     assert active_key.prefix == second_raw_key[:11]
     assert active_key.key_hash != second_raw_key
     assert first_raw_key != second_raw_key
+
+
+class _CreateCaseLLM:
+    """Deterministic provider double for the worker-to-PostgreSQL vertical path."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self._proposals = [
+            AgentProposal.model_validate(
+                {
+                    "intake_type": "load_request",
+                    "fields": [
+                        {"name": "origin", "value": "Kyiv"},
+                        {"name": "destination", "value": "Lviv"},
+                        {"name": "equipment", "value": "dry_van"},
+                        {"name": "pickup_window", "value": "2026-10-01T09:00:00Z"},
+                        {"name": "commodity", "value": "Machine parts"},
+                        {"name": "contact", "value": "shipper@example.com"},
+                    ],
+                    "missing_required_fields": [],
+                    "priority": ProposalPriority.NORMAL,
+                    "contains_injection_or_override_attempt": False,
+                    "rationale_short": "Create the intake case.",
+                    "tool_calls": [{"name": "create_case", "arguments": []}],
+                    "confidence": 0.95,
+                }
+            ),
+            AgentProposal.model_validate(
+                {
+                    "intake_type": "load_request",
+                    "fields": [],
+                    "missing_required_fields": [],
+                    "priority": ProposalPriority.NORMAL,
+                    "contains_injection_or_override_attempt": False,
+                    "rationale_short": "Case created.",
+                    "tool_calls": [],
+                    "confidence": 0.95,
+                }
+            ),
+        ]
+
+    def complete(self, messages: Sequence[AgentMessage]) -> AgentProposal:
+        self.calls += 1
+        return self._proposals.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_postgres_phase7_intake_worker_is_idempotent_and_tenant_scoped(
+    postgres_client,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The accepted job reaches one real case transaction outside FastAPI."""
+    owner, owner_key = await create_tenant_with_key(
+        postgres_session_factory,
+        "Freight Broker",
+        slug="freight-broker",
+    )
+    other, other_key = await create_tenant_with_key(
+        postgres_session_factory,
+        "Other Tenant",
+    )
+    source_body = "Please quote a dry van from Kyiv to Lviv."
+    headers = {"X-API-Key": owner_key, "Idempotency-Key": "phase7-vertical-1"}
+    payload = {
+        "channel": "email",
+        "subject": "Dry van quote",
+        "body": source_body,
+    }
+
+    accepted = await postgres_client.post("/v1/intake", headers=headers, json=payload)
+    assert accepted.status_code == 202
+    job_id = UUID(accepted.json()["job_id"])
+    assert accepted.json()["status"] == "queued"
+
+    llm_instances: list[_CreateCaseLLM] = []
+
+    def llm_factory(_client: object) -> _CreateCaseLLM:
+        llm = _CreateCaseLLM()
+        llm_instances.append(llm)
+        return llm
+
+    runtime_factory = AgentRuntimeFactory(
+        postgres_session_factory,
+        llm_factory=llm_factory,
+    )
+    worker = AgentWorker(
+        postgres_session_factory,
+        runtime_factory=runtime_factory,
+        settings=Settings(
+            worker_poll_interval_seconds=0.001,
+            worker_lease_seconds=60,
+            worker_concurrency=1,
+            worker_max_retries=4,
+        ),
+    )
+
+    assert await worker.serve_once() is True
+    assert len(llm_instances) == 1
+    assert llm_instances[0].calls == 2
+
+    repeated = await postgres_client.post("/v1/intake", headers=headers, json=payload)
+    assert repeated.status_code == 202
+    assert UUID(repeated.json()["job_id"]) == job_id
+    assert await worker.serve_once() is False
+
+    async with postgres_session_factory() as session:
+        job = await session.get(AgentJob, job_id)
+        idempotency = await session.scalar(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.tenant_id == owner.id,
+                IdempotencyRecord.key == "phase7-vertical-1",
+            )
+        )
+        cases = (
+            await session.scalars(
+                select(IntakeCase).where(IntakeCase.tenant_id == owner.id)
+            )
+        ).all()
+        events = (
+            await session.scalars(
+                select(CaseEvent).where(
+                    CaseEvent.tenant_id == owner.id,
+                    CaseEvent.event_type == "created",
+                )
+            )
+        ).all()
+        approval_count = await session.scalar(
+            select(func.count()).select_from(Approval).where(Approval.tenant_id == owner.id)
+        )
+
+    assert job is not None
+    assert job.status == "succeeded"
+    assert job.result is not None
+    assert source_body not in repr(job.result)
+    assert idempotency is not None
+    assert idempotency.job_id == job_id
+    assert idempotency.case_id == cases[0].id
+    assert len(cases) == 1
+    assert len(events) == 1
+    assert events[0].case_id == cases[0].id
+    assert approval_count == 0
+
+    case_id = cases[0].id
+    real_port = PostgresTenantToolPort(postgres_session_factory, job_id=job_id)
+    assert await real_port.case_exists(owner.id, case_id) is True
+    assert await real_port.case_exists(other.id, case_id) is False
+    assert (
+        await real_port.update_case_fields(
+            other.id,
+            case_id,
+            fields={"origin": "attacker-controlled"},
+        )
+        is None
+    )
+
+    hidden = await postgres_client.get(
+        f"/v1/cases/{case_id}", headers={"X-API-Key": other_key}
+    )
+    assert hidden.status_code == 404

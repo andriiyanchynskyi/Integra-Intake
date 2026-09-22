@@ -189,6 +189,20 @@ async def test_seed_creates_demo_tenant_rotates_digest_only_key_and_authenticate
     assert response.json()["created_at"]
 
 
+async def test_seed_accepts_an_explicit_profile_slug_without_changing_rotation_contract() -> None:
+    """Local provisioning can target a checked-in tenant profile explicitly."""
+    database = SeedDatabase()
+
+    raw_key = await seed_demo_tenant(database.session(), "repair-service")
+
+    assert len(database.tenants) == 1
+    assert database.tenants[0].slug == "repair-service"
+    assert database.api_keys[0].is_active is True
+    assert database.api_keys[0].key_hash == hash_api_key(raw_key)
+    assert database.api_keys[0].prefix == raw_key[:11]
+    assert raw_key not in database.api_keys[0].key_hash
+
+
 async def test_seed_cli_prints_the_raw_key_once_after_the_transaction_commits(monkeypatch) -> None:
     """Printing before commit would expose a credential that the database rejected."""
     database = SeedDatabase()

@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import ForeignKeyConstraint, UniqueConstraint, text
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
@@ -20,15 +21,22 @@ PHASE_TWO_TABLES = {
     "idempotency_records",
     "approvals",
 }
-TENANT_SCOPED_TABLES = PHASE_TWO_TABLES - {"tenants"}
+PHASE_SEVEN_TABLES = PHASE_TWO_TABLES | {"agent_jobs"}
+TENANT_SCOPED_TABLES = PHASE_SEVEN_TABLES - {"tenants"}
 JSONB_COLUMNS = {
     "customers": {"attributes"},
     "intake_cases": {"raw_payload", "extracted_fields"},
     "case_events": {"payload"},
     "idempotency_records": {"response"},
     "approvals": {"decision"},
+    "agent_jobs": {
+        "source_snapshot",
+        "tenant_config_snapshot",
+        "risk_signals",
+        "result",
+    },
 }
-TIMESTAMPED_TABLES = PHASE_TWO_TABLES - {"case_events"}
+TIMESTAMPED_TABLES = PHASE_SEVEN_TABLES - {"case_events"}
 
 
 def test_orm_metadata_declares_tenant_isolation_contract() -> None:
@@ -60,7 +68,53 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
 
     idempotency_records = Base.metadata.tables["idempotency_records"]
     assert idempotency_records.c.request_hash.nullable is False
-    assert idempotency_records.c.case_id.nullable is False
+    assert idempotency_records.c.case_id.nullable is True
+    assert idempotency_records.c.job_id.nullable is True
+
+    agent_jobs = Base.metadata.tables["agent_jobs"]
+    assert isinstance(agent_jobs.c.id.type, PG_UUID)
+    assert isinstance(agent_jobs.c.tenant_id.type, PG_UUID)
+    assert agent_jobs.c.tenant_id.nullable is False
+    assert agent_jobs.c.status.nullable is False
+    assert str(agent_jobs.c.status.server_default.arg) == "queued"
+    assert agent_jobs.c.attempt_count.nullable is False
+    assert str(agent_jobs.c.attempt_count.server_default.arg) == "0"
+    assert agent_jobs.c.tenant_config_sha256.nullable is False
+    for name in (
+        "source_snapshot",
+        "tenant_config_snapshot",
+        "risk_signals",
+    ):
+        assert isinstance(agent_jobs.c[name].type, JSONB)
+        assert agent_jobs.c[name].nullable is False
+    assert agent_jobs.c.result.nullable is True
+    assert isinstance(agent_jobs.c.result.type, JSONB)
+    assert agent_jobs.c.available_at.nullable is False
+    for name in (
+        "lease_expires_at",
+        "started_at",
+        "finished_at",
+        "side_effect_committed_at",
+        "error_code",
+    ):
+        assert agent_jobs.c[name].nullable is True
+    assert agent_jobs.c.created_at.nullable is False
+    assert agent_jobs.c.updated_at.nullable is False
+
+    assert any(
+        isinstance(constraint, UniqueConstraint)
+        and constraint.name == "uq_agent_jobs_tenant_id_id"
+        and tuple(column.name for column in constraint.columns) == ("tenant_id", "id")
+        for constraint in agent_jobs.constraints
+    )
+    assert {
+        index.name: tuple(column.name for column in index.columns)
+        for index in agent_jobs.indexes
+    } == {
+        "ix_agent_jobs_tenant_id_id": ("tenant_id", "id"),
+        "ix_agent_jobs_status_available_at": ("status", "available_at"),
+        "ix_agent_jobs_running_lease": ("status", "lease_expires_at"),
+    }
 
     approvals = Base.metadata.tables["approvals"]
     assert approvals.c.action.nullable is False
@@ -76,6 +130,7 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
         ("intake_cases", "customers", ("tenant_id", "customer_id")),
         ("case_events", "intake_cases", ("tenant_id", "case_id")),
         ("idempotency_records", "intake_cases", ("tenant_id", "case_id")),
+        ("idempotency_records", "agent_jobs", ("tenant_id", "job_id")),
         ("approvals", "intake_cases", ("tenant_id", "case_id")),
     ):
         assert any(
@@ -94,14 +149,15 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
             "WHERE table_schema = 'public' "
             "AND table_name IN "
             "('tenants', 'api_keys', 'customers', 'intake_cases', 'case_events', "
-            "'idempotency_records', 'approvals')"
+            "'idempotency_records', 'approvals', 'agent_jobs')"
         )
     )
-    assert set(tables.scalars()) == PHASE_TWO_TABLES
+    assert set(tables.scalars()) == PHASE_SEVEN_TABLES
 
     columns = await connection.execute(
         text(
-            "SELECT table_name, column_name, data_type, udt_name, column_default, is_nullable "
+            "SELECT table_name, column_name, data_type, udt_name, column_default, "
+            "character_maximum_length, is_nullable "
             "FROM information_schema.columns "
             "WHERE table_schema = 'public'"
         )
@@ -110,7 +166,7 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
         (row.table_name, row.column_name): row
         for row in columns
     }
-    for table_name in PHASE_TWO_TABLES:
+    for table_name in PHASE_SEVEN_TABLES:
         assert column_map[(table_name, "id")].udt_name == "uuid"
     for table_name in TENANT_SCOPED_TABLES:
         assert column_map[(table_name, "tenant_id")].udt_name == "uuid"
@@ -131,7 +187,30 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
     assert column_map[("case_events", "actor")].is_nullable == "YES"
     assert column_map[("idempotency_records", "request_hash")].is_nullable == "NO"
     assert column_map[("idempotency_records", "case_id")].udt_name == "uuid"
+    assert column_map[("idempotency_records", "case_id")].is_nullable == "YES"
+    assert column_map[("idempotency_records", "job_id")].udt_name == "uuid"
+    assert column_map[("idempotency_records", "job_id")].is_nullable == "YES"
     assert column_map[("approvals", "action")].is_nullable == "NO"
+    assert column_map[("agent_jobs", "tenant_config_sha256")].character_maximum_length == 64
+    assert column_map[("agent_jobs", "source_snapshot")].is_nullable == "NO"
+    assert column_map[("agent_jobs", "tenant_config_snapshot")].is_nullable == "NO"
+    assert column_map[("agent_jobs", "risk_signals")].is_nullable == "NO"
+    assert column_map[("agent_jobs", "result")].is_nullable == "YES"
+    assert column_map[("agent_jobs", "status")].is_nullable == "NO"
+    assert column_map[("agent_jobs", "attempt_count")].is_nullable == "NO"
+    assert "queued" in column_map[("agent_jobs", "status")].column_default
+    assert "0" in column_map[("agent_jobs", "attempt_count")].column_default
+    for name in (
+        "available_at",
+        "lease_expires_at",
+        "started_at",
+        "finished_at",
+        "side_effect_committed_at",
+        "error_code",
+        "created_at",
+        "updated_at",
+    ):
+        assert ("agent_jobs", name) in column_map
 
     primary_keys = await connection.execute(
         text(
@@ -144,7 +223,7 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
         )
     )
     primary_key_columns = {(row.table_name, row.column_name) for row in primary_keys}
-    assert {(table_name, "id") for table_name in PHASE_TWO_TABLES}.issubset(
+    assert {(table_name, "id") for table_name in PHASE_SEVEN_TABLES}.issubset(
         primary_key_columns
     )
 
@@ -171,6 +250,7 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
         ("intake_cases", "customers", "tenant_id, customer_id"),
         ("case_events", "intake_cases", "tenant_id, case_id"),
         ("idempotency_records", "intake_cases", "tenant_id, case_id"),
+        ("idempotency_records", "agent_jobs", "tenant_id, job_id"),
         ("approvals", "intake_cases", "tenant_id, case_id"),
     ):
         assert any(
@@ -215,6 +295,18 @@ async def assert_tenant_boundaries(connection: AsyncConnection) -> None:
             "body": "Body B",
         },
     )
+    agent_job_a, agent_job_b = uuid4(), uuid4()
+    await connection.execute(
+        text(
+            "INSERT INTO agent_jobs "
+            "(id, tenant_id, source_snapshot, tenant_config_snapshot, tenant_config_sha256) "
+            "VALUES (:id, :tenant_id, '{}'::jsonb, '{}'::jsonb, :sha256)"
+        ),
+        [
+            {"id": agent_job_a, "tenant_id": tenant_a, "sha256": "a" * 64},
+            {"id": agent_job_b, "tenant_id": tenant_b, "sha256": "b" * 64},
+        ],
+    )
     await assert_integrity_error(
         connection,
         "INSERT INTO intake_cases (id, tenant_id, customer_id) VALUES (:id, :tenant_id, :customer_id)",
@@ -240,6 +332,31 @@ async def assert_tenant_boundaries(connection: AsyncConnection) -> None:
             "key": "cross-tenant-key",
             "request_hash": "a" * 64,
             "case_id": case_b,
+        },
+    )
+    await assert_integrity_error(
+        connection,
+        "INSERT INTO idempotency_records (id, tenant_id, key, request_hash, job_id) "
+        "VALUES (:id, :tenant_id, :key, :request_hash, :job_id)",
+        {
+            "id": uuid4(),
+            "tenant_id": tenant_a,
+            "key": "cross-tenant-job-key",
+            "request_hash": "d" * 64,
+            "job_id": agent_job_b,
+        },
+    )
+    await connection.execute(
+        text(
+            "INSERT INTO idempotency_records (id, tenant_id, key, request_hash, job_id) "
+            "VALUES (:id, :tenant_id, :key, :request_hash, :job_id)"
+        ),
+        {
+            "id": uuid4(),
+            "tenant_id": tenant_b,
+            "key": "job-only-key",
+            "request_hash": "e" * 64,
+            "job_id": agent_job_b,
         },
     )
     record_id = uuid4()
@@ -273,6 +390,6 @@ async def assert_tenant_boundaries(connection: AsyncConnection) -> None:
 async def test_phase_two_migration_creates_tenant_domain_schema(
     postgres_connection: AsyncConnection,
 ) -> None:
-    """Alembic creates the tenant-domain schema and rejects cross-tenant references."""
+    """Alembic creates the worker schema and rejects cross-tenant references."""
     await query_schema_contract(postgres_connection)
     await assert_tenant_boundaries(postgres_connection)
