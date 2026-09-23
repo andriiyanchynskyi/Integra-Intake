@@ -13,6 +13,7 @@ class RoutingAssessment:
     requested_action: str
     requires_complete_fields: bool = True
     registered_actions: frozenset[str] | None = None
+    is_critical: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +88,7 @@ class TenantRouter:
         if (
             assessment.requested_action in self.config.routing.always_approval_actions
             or rule.requires_approval
+            or assessment.is_critical
         ):
             return RoutingOutcome(
                 status=RoutingStatus.PENDING_APPROVAL,

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Annotated, Self
+from datetime import datetime
+from typing import Annotated, Literal, Self
 from uuid import UUID
 
 from pydantic import (
@@ -101,6 +102,27 @@ class ReplyDraft(StrictToolModel):
 class ReviewFlag(StrictToolModel):
     reason: StrictStr = Field(min_length=1, max_length=1000)
     persisted: bool = False
+
+
+class PendingAction(StrictToolModel):
+    """Closed, validated command frozen for a human approval decision."""
+
+    version: Literal[1] = 1
+    name: Literal[
+        "find_customer",
+        "create_case",
+        "update_case_fields",
+        "create_reply_draft",
+        "flag_for_review",
+    ]
+    # Values are JSON-compatible dumps of already validated tool/proposal data.
+    arguments: dict[str, object]
+    known_fields: dict[str, object]
+
+
+class ApprovalRequested(StrictToolModel):
+    id: UUID
+    expires_at: datetime
 
 
 ToolHandler = Callable[

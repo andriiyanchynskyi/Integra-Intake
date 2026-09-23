@@ -183,6 +183,7 @@ class ProposalPriority(str, Enum):
     NORMAL = "normal"
     HIGH = "high"
     URGENT = "urgent"
+    CRITICAL = "critical"
 
 
 class _StrictProposalModel(BaseModel):

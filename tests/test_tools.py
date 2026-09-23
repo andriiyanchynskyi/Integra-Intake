@@ -4,6 +4,7 @@ from collections.abc import Iterable, Sequence
 from copy import deepcopy
 import inspect
 from typing import Any
+from datetime import datetime, timezone
 from uuid import UUID
 
 import pytest
@@ -23,8 +24,10 @@ from app.agent import (
 from app.policy import RiskSignals, TrustedSource, TrustedToolRuntimeContext
 from app.tenants.config import ActionRule, TenantConfig
 from app.tools import (
+    ApprovalRequested,
     CustomerLookupResult,
     InMemoryTenantToolPort,
+    PendingAction,
     PolicyGatedToolExecutor,
     TenantToolPort,
     ToolDefinition,
@@ -179,6 +182,7 @@ class SpyPort(InMemoryTenantToolPort):
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[str] = []
+        self.approval_requests: list[tuple[UUID, PendingAction, str]] = []
 
     def create_case(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         self.calls.append("create_case")
@@ -189,6 +193,19 @@ class SpyPort(InMemoryTenantToolPort):
     ):  # type: ignore[no-untyped-def]
         self.calls.append("update_case_fields")
         return super().update_case_fields(*args, **kwargs)
+
+    def request_approval(
+        self,
+        tenant_id: UUID,
+        *,
+        action: PendingAction,
+        policy_reason: str,
+    ) -> ApprovalRequested:
+        self.approval_requests.append((tenant_id, action, policy_reason))
+        return ApprovalRequested(
+            id=UUID("00000000-0000-0000-0000-000000000008"),
+            expires_at=datetime(2026, 9, 24, tzinfo=timezone.utc),
+        )
 
 
 class ExplodingFindCustomerPort(InMemoryTenantToolPort):
@@ -588,8 +605,102 @@ def test_risk_review_stops_before_handler(
 
     assert result.data["decision"] == "needs_approval"
     assert result.data["reason"] == "safety_or_legal_risk"
+    assert result.data["approval_id"] == "00000000-0000-0000-0000-000000000008"
     assert result.continue_run is False
-    assert result.final_response == "safety_or_legal_risk"
+    assert result.final_response == "approval_requested"
+    assert port.calls == []
+    assert port.cases == {}
+    assert len(port.approval_requests) == 1
+
+
+def test_yaml_approval_for_registered_create_case_persists_closed_pending_action(
+    tenant_config: TenantConfig,
+) -> None:
+    """A policy-held registered action is frozen for approval and never runs its handler."""
+    config_data = tenant_config.model_dump()
+    config_data["action_policy"]["create_case"] = {
+        "allowed": True,
+        "requires_approval": True,
+    }
+    config = TenantConfig.model_validate(config_data)
+    port = SpyPort()
+    executor, _ = build_executor(config, port)
+    proposal = make_proposal(
+        fields=(
+            ("summary", "declared summary"),
+            ("contact", "customer@example.com"),
+            ("not_a_profile_field", "must not persist"),
+        )
+    )
+
+    result = executor.execute(proposal, ToolCall(name="create_case", arguments={}))
+
+    assert result.data == {
+        "decision": "needs_approval",
+        "status": "pending_approval",
+        "reason": "approval_required",
+        "missing_required_fields": [],
+        "approval_id": "00000000-0000-0000-0000-000000000008",
+    }
+    assert result.continue_run is False
+    assert result.final_response == "approval_requested"
+    assert port.calls == []
+    assert port.cases == {}
+    assert len(port.approval_requests) == 1
+    tenant_id, pending, policy_reason = port.approval_requests[0]
+    assert tenant_id == TENANT_A
+    assert policy_reason == "approval_required"
+    assert pending.name == "create_case"
+    assert set(pending.arguments) <= {"customer_id"}
+    assert pending.known_fields == {
+        "summary": "declared summary",
+        "contact": "customer@example.com",
+    }
+
+
+def test_critical_registered_create_case_requires_approval_without_running_handler(
+    tenant_config: TenantConfig,
+) -> None:
+    """A critical proposal reaches the approval port after normal validation gates."""
+    port = SpyPort()
+    executor, _ = build_executor(tenant_config, port)
+    proposal = make_proposal().model_copy(update={"priority": ProposalPriority.CRITICAL})
+
+    result = executor.execute(proposal, ToolCall(name="create_case", arguments={}))
+
+    assert result.data is not None
+    assert result.data["decision"] == "needs_approval"
+    assert result.data["status"] == "pending_approval"
+    assert result.data["reason"] == "approval_required"
+    assert result.data["approval_id"] == "00000000-0000-0000-0000-000000000008"
+    assert result.continue_run is False
+    assert port.calls == []
+    assert port.cases == {}
+    assert len(port.approval_requests) == 1
+
+
+def test_invalid_create_case_arguments_do_not_create_an_approval(
+    tenant_config: TenantConfig,
+) -> None:
+    """Approval persistence happens only after the registered tool arguments validate."""
+    config_data = tenant_config.model_dump()
+    config_data["action_policy"]["create_case"] = {
+        "allowed": True,
+        "requires_approval": True,
+    }
+    config = TenantConfig.model_validate(config_data)
+    port = SpyPort()
+    executor, _ = build_executor(config, port)
+
+    result = executor.execute(
+        make_proposal(),
+        ToolCall(name="create_case", arguments={"body": "untrusted"}),
+    )
+
+    assert result.data == {"outcome": "tool_arguments_invalid"}
+    assert result.continue_run is False
+    assert result.final_response == "tool_arguments_invalid"
+    assert port.approval_requests == []
     assert port.calls == []
     assert port.cases == {}
 

@@ -4,20 +4,33 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agent import ToolData
-from app.db.models import AgentJob, IdempotencyRecord
-from app.policy import TrustedSource
-from app.runtime.gateway import WorkerAsyncGateway
-from app.tools.models import CreatedCase, CustomerSummary, UpdatedCase
-from app.tools.ports import CustomerNotFoundError, TenantToolPort
+from app.core.config import Settings, settings
+from app.db.models import AgentJob, Approval, IdempotencyRecord
+from app.domain.approval_repository import ApprovalRepository
 from app.domain.repositories import CaseRepository
 from app.domain.service import CaseService
+from app.policy import TrustedSource
+from app.runtime.gateway import WorkerAsyncGateway
+from app.tools.models import (
+    ApprovalRequested,
+    CreateCaseArgs,
+    CreateReplyDraftArgs,
+    CreatedCase,
+    FlagForReviewArgs,
+    CustomerSummary,
+    FindCustomerArgs,
+    PendingAction,
+    UpdateCaseFieldsArgs,
+    UpdatedCase,
+)
+from app.tools.ports import CustomerNotFoundError, TenantToolPort
 
 
 class PostgresTenantToolPort:
@@ -29,10 +42,12 @@ class PostgresTenantToolPort:
         *,
         job_id: UUID,
         attempt_count: int | None = None,
+        runtime_settings: Settings | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._job_id = job_id
         self._attempt_count = attempt_count
+        self._settings = runtime_settings or settings
 
     async def find_customer(
         self,
@@ -61,6 +76,24 @@ class PostgresTenantToolPort:
         async with self._session_factory() as session:
             case = await CaseRepository(session).get_for_tenant(case_id, tenant_id)
             return case is not None
+
+    async def request_approval(
+        self,
+        tenant_id: UUID,
+        *,
+        action: PendingAction,
+        policy_reason: str,
+    ) -> ApprovalRequested:
+        async with self._session_factory() as session:
+            return await ApprovalRepository(session).create_for_running_job(
+                tenant_id,
+                self._job_id,
+                attempt_count=self._attempt_count or 0,
+                action=action,
+                policy_reason=policy_reason,
+                expires_in=timedelta(seconds=self._settings.approval_timeout_seconds),
+                now=datetime.now(timezone.utc),
+            )
 
     async def create_case(
         self,
@@ -236,5 +269,199 @@ class SyncTenantToolPort(TenantToolPort):
             self._async_port.case_exists(tenant_id, case_id)
         )
 
+    def request_approval(
+        self,
+        tenant_id: UUID,
+        *,
+        action: PendingAction,
+        policy_reason: str,
+    ) -> ApprovalRequested:
+        return self._gateway.call(
+            self._async_port.request_approval(
+                tenant_id,
+                action=action,
+                policy_reason=policy_reason,
+            )
+        )
 
-__all__ = ["PostgresTenantToolPort", "SyncTenantToolPort"]
+
+class PostgresApprovalActionExecutor:
+    """Execute one frozen approval command in the caller's transaction."""
+
+    async def execute(
+        self,
+        session: AsyncSession,
+        approval: Approval,
+        action: PendingAction,
+        *,
+        now: datetime,
+    ) -> dict[str, object]:
+        if approval.job_id is None or approval.tenant_config_sha256 is None:
+            raise RuntimeError("approval trusted context is unavailable")
+        job_statement = (
+            select(AgentJob)
+            .where(
+                AgentJob.id == approval.job_id,
+                AgentJob.tenant_id == approval.tenant_id,
+            )
+            .with_for_update()
+        )
+        job = (await session.execute(job_statement)).scalar_one_or_none()
+        if (
+            job is None
+            or job.status != "awaiting_approval"
+            or job.tenant_config_sha256 != approval.tenant_config_sha256
+            or approval.action != action.name
+        ):
+            raise RuntimeError("approval trusted job is unavailable")
+
+        if action.name == "create_case":
+            result = await self._create_case(session, approval, job, action)
+            case_id = result.get("case_id")
+            if not isinstance(case_id, str):
+                raise RuntimeError("approved case result is invalid")
+            approval.case_id = UUID(case_id)
+            job.side_effect_committed_at = now
+            return result
+        if action.name == "update_case_fields":
+            result = await self._update_case_fields(session, approval, job, action)
+            job.side_effect_committed_at = now
+            return result
+        if action.name == "find_customer":
+            values = FindCustomerArgs.model_validate(action.arguments)
+            customer = await CaseRepository(session).find_customer_for_tenant(
+                approval.tenant_id,
+                email=values.email,
+                external_id=values.external_id,
+            )
+            return {
+                "found": customer is not None,
+                "customer_id": str(customer.id) if customer is not None else None,
+            }
+        if action.name == "create_reply_draft":
+            values = CreateReplyDraftArgs.model_validate(action.arguments)
+            if values.case_id is not None:
+                case = await CaseRepository(session).get_for_tenant(
+                    values.case_id, approval.tenant_id
+                )
+                if case is None:
+                    raise RuntimeError("approved case is unavailable")
+                approval.case_id = case.id
+            return {"outcome": "draft_generated", "persisted": False}
+        if action.name == "flag_for_review":
+            FlagForReviewArgs.model_validate(action.arguments)
+            return {"outcome": "review_flagged", "persisted": False}
+        raise RuntimeError("approval action is not registered")
+
+    async def _create_case(
+        self,
+        session: AsyncSession,
+        approval: Approval,
+        job: AgentJob,
+        action: PendingAction,
+    ) -> dict[str, object]:
+        idempotency_statement = (
+            select(IdempotencyRecord)
+            .where(
+                IdempotencyRecord.tenant_id == approval.tenant_id,
+                IdempotencyRecord.job_id == job.id,
+            )
+            .with_for_update()
+        )
+        idempotency = (
+            await session.execute(idempotency_statement)
+        ).scalar_one_or_none()
+        if idempotency is None:
+            raise RuntimeError("approval job idempotency record is unavailable")
+        repository = CaseRepository(session)
+        if idempotency.case_id is not None:
+            existing = await repository.get_for_tenant(
+                idempotency.case_id, approval.tenant_id
+            )
+            if existing is None:
+                raise RuntimeError("approved case is unavailable")
+            return {
+                "case_id": str(existing.id),
+                "status": existing.status,
+                "accepted_fields": sorted(existing.extracted_fields),
+            }
+
+        values = CreateCaseArgs.model_validate(action.arguments)
+        if values.customer_id is not None:
+            customer = await repository.get_customer_for_tenant(
+                values.customer_id, approval.tenant_id
+            )
+            if customer is None:
+                raise RuntimeError("approved customer is unavailable")
+        source = self._source_from_job(job.source_snapshot)
+        case = await CaseService(session).create_agent_case(
+            approval.tenant_id,
+            source,
+            customer_id=values.customer_id,
+            fields=deepcopy(dict(action.known_fields)),
+        )
+        await session.flush()
+        CaseService(session).append_event(
+            approval.tenant_id,
+            case.id,
+            event_type="created",
+            payload={},
+        )
+        idempotency.case_id = case.id
+        return {
+            "case_id": str(case.id),
+            "status": case.status,
+            "accepted_fields": sorted(action.known_fields),
+        }
+
+    async def _update_case_fields(
+        self,
+        session: AsyncSession,
+        approval: Approval,
+        job: AgentJob,
+        action: PendingAction,
+    ) -> dict[str, object]:
+        del job
+        values = UpdateCaseFieldsArgs.model_validate(action.arguments)
+        repository = CaseRepository(session)
+        case = await repository.get_for_tenant_for_update(
+            values.case_id, approval.tenant_id
+        )
+        if case is None:
+            raise RuntimeError("approved case is unavailable")
+        approval.case_id = case.id
+        merged = deepcopy(dict(case.extracted_fields or {}))
+        merged.update(deepcopy(dict(action.known_fields)))
+        case.extracted_fields = merged
+        CaseService(session).append_event(
+            approval.tenant_id,
+            case.id,
+            event_type="fields_updated",
+            payload={"updated_fields": sorted(action.known_fields)},
+        )
+        return {
+            "case_id": str(case.id),
+            "updated_fields": sorted(action.known_fields),
+        }
+
+    @staticmethod
+    def _source_from_job(value: object) -> TrustedSource:
+        if not isinstance(value, Mapping):
+            raise RuntimeError("approved source snapshot is invalid")
+        required = ("channel", "subject", "body")
+        if set(value) != set(required) or not all(
+            isinstance(value[name], str) for name in required
+        ):
+            raise RuntimeError("approved source snapshot is invalid")
+        return TrustedSource(
+            channel=value["channel"],
+            subject=value["subject"],
+            body=value["body"],
+        )
+
+
+__all__ = [
+    "PostgresApprovalActionExecutor",
+    "PostgresTenantToolPort",
+    "SyncTenantToolPort",
+]

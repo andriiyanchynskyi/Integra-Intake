@@ -1,5 +1,6 @@
 """Pure deterministic policy evaluation after an LLM proposal."""
 
+from app.agent.models import ProposalPriority
 from app.policy.models import (
     PolicyInput,
     PolicyOutcome,
@@ -28,6 +29,7 @@ class PolicyEngine:
             requested_action=value.requested_action,
             requires_complete_fields=value.requires_complete_fields,
             registered_actions=value.registered_actions,
+            is_critical=value.proposal.priority is ProposalPriority.CRITICAL,
         )
         routed = TenantRouter(value.runtime.tenant_config).route(assessment)
         return PolicyOutcome(

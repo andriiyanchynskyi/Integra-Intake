@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     worker_lease_seconds: int = Field(default=60, ge=1)
     worker_concurrency: int = Field(default=1, ge=1)
     worker_max_retries: int = Field(default=4, ge=0)
+    approval_timeout_seconds: int = Field(default=86_400, ge=1)
 
 
 settings = Settings()

@@ -14,7 +14,7 @@ from app.db.models import ApiKey, CaseEvent, IntakeCase, Tenant
 from app.db.session import get_db_session
 from app.main import app
 import scripts.seed_demo as seed_demo
-from scripts.seed_demo import DEMO_TENANT_SLUG, seed_demo_tenant
+from scripts.seed_demo import DEMO_TENANT_SLUG, seed_demo_tenant, seed_operator_key
 
 
 @dataclass
@@ -117,11 +117,14 @@ class SeedSession:
 
         if "FROM api_keys" in query:
             tenant_id = compiled.params["tenant_id_1"]
+            principal_type = compiled.params.get("principal_type_1")
             return ListResult(
                 [
                     key
                     for key in self.database.api_keys
-                    if key.tenant_id == tenant_id and key.is_active
+                    if key.tenant_id == tenant_id
+                    and key.is_active
+                    and (principal_type is None or key.principal_type == principal_type)
                 ]
             )
 
@@ -201,6 +204,36 @@ async def test_seed_accepts_an_explicit_profile_slug_without_changing_rotation_c
     assert database.api_keys[0].key_hash == hash_api_key(raw_key)
     assert database.api_keys[0].prefix == raw_key[:11]
     assert raw_key not in database.api_keys[0].key_hash
+
+
+async def test_seed_operator_key_sets_actor_capability_rotates_only_operator_keys_and_hides_raw_values() -> None:
+    """Operator provisioning is tenant-scoped and never persists either raw credential."""
+    database = SeedDatabase()
+
+    service_raw_key = await seed_demo_tenant(database.session())
+    first_operator_raw_key = await seed_operator_key(database.session(), "ops-alice")
+    second_operator_raw_key = await seed_operator_key(database.session(), "ops-bob")
+
+    assert len(database.tenants) == 1
+    assert len(database.api_keys) == 3
+    service_key, first_operator_key, second_operator_key = database.api_keys
+    assert service_key.is_active is True
+    assert first_operator_key.is_active is False
+    assert second_operator_key.is_active is True
+    assert first_operator_key.principal_type == "operator"
+    assert second_operator_key.principal_type == "operator"
+    assert first_operator_key.capability == "approval_decider"
+    assert second_operator_key.capability == "approval_decider"
+    assert first_operator_key.actor_ref == "ops-alice"
+    assert second_operator_key.actor_ref == "ops-bob"
+
+    for raw_key, stored_key in (
+        (service_raw_key, service_key),
+        (first_operator_raw_key, first_operator_key),
+        (second_operator_raw_key, second_operator_key),
+    ):
+        assert stored_key.key_hash == hash_api_key(raw_key)
+        assert raw_key not in stored_key.key_hash
 
 
 async def test_seed_cli_prints_the_raw_key_once_after_the_transaction_commits(monkeypatch) -> None:

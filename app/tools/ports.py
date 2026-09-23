@@ -9,7 +9,13 @@ from uuid import UUID
 
 from app.agent import ToolData
 from app.policy import TrustedSource
-from app.tools.models import CreatedCase, CustomerSummary, UpdatedCase
+from app.tools.models import (
+    ApprovalRequested,
+    CreatedCase,
+    CustomerSummary,
+    PendingAction,
+    UpdatedCase,
+)
 
 
 class CustomerNotFoundError(LookupError):
@@ -43,6 +49,14 @@ class TenantToolPort(Protocol):
     ) -> UpdatedCase | None: ...
 
     def case_exists(self, tenant_id: UUID, case_id: UUID) -> bool: ...
+
+    def request_approval(
+        self,
+        tenant_id: UUID,
+        *,
+        action: PendingAction,
+        policy_reason: str,
+    ) -> ApprovalRequested: ...
 
 
 @dataclass

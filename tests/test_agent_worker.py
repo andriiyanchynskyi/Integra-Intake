@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -48,6 +49,22 @@ class _SessionFactory:
         return self.session
 
 
+_WORKER_CALLS: list[str] = []
+
+
+class _FakeApprovalRepository:
+    instances: list["_FakeApprovalRepository"] = []
+
+    def __init__(self, session: object) -> None:
+        self.calls: list[tuple[str, object]] = []
+        _FakeApprovalRepository.instances.append(self)
+
+    async def expire_due(self, **kwargs: object) -> int:
+        self.calls.append(("expire_due", kwargs))
+        _WORKER_CALLS.append("expire_due")
+        return 0
+
+
 class _FakeRepository:
     instances: list["_FakeRepository"] = []
     next_claimed: ClaimedJob | None = None
@@ -61,24 +78,32 @@ class _FakeRepository:
 
     async def recover_expired_leases(self, **kwargs: object) -> int:
         self.calls.append(("recover_expired_leases", kwargs))
+        _WORKER_CALLS.append("recover_expired_leases")
         self.now = kwargs["now"]  # type: ignore[assignment]
         return 0
 
     async def claim_next(self, **kwargs: object) -> ClaimedJob | None:
         self.calls.append(("claim_next", kwargs))
+        _WORKER_CALLS.append("claim_next")
         result, self.claimed = self.claimed, None
         return result
 
     async def mark_succeeded(self, *args: object, **kwargs: object) -> None:
+        if self.claimed is not None and self.claimed.status != "running":
+            return
         self.calls.append(("mark_succeeded", (args, kwargs)))
 
     async def mark_failed(self, *args: object, **kwargs: object) -> None:
+        if self.claimed is not None and self.claimed.status != "running":
+            return
         self.calls.append(("mark_failed", (args, kwargs)))
 
     async def schedule_retry(self, *args: object, **kwargs: object) -> None:
         self.calls.append(("schedule_retry", (args, kwargs)))
 
     async def mark_failed_uncertain(self, *args: object, **kwargs: object) -> None:
+        if self.claimed is not None and self.claimed.status != "running":
+            return
         self.calls.append(("mark_failed_uncertain", (args, kwargs)))
 
 
@@ -136,7 +161,12 @@ def _settings() -> Settings:
 def _install_repository(monkeypatch: pytest.MonkeyPatch) -> None:
     _FakeRepository.instances.clear()
     _FakeRepository.next_claimed = None
+    _FakeApprovalRepository.instances.clear()
+    _WORKER_CALLS.clear()
     monkeypatch.setattr("app.workers.agent_worker.JobRepository", _FakeRepository)
+    monkeypatch.setattr(
+        "app.workers.agent_worker.ApprovalRepository", _FakeApprovalRepository
+    )
 
 
 @pytest.mark.asyncio
@@ -186,6 +216,58 @@ async def test_serve_once_runs_loop_through_injected_to_thread_seam(
         "steps": 2,
         "final_response": "done",
     }
+
+
+@pytest.mark.asyncio
+async def test_serve_once_expires_due_approvals_before_claiming_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    worker = AgentWorker(
+        _SessionFactory(),
+        runtime_factory=_RuntimeFactory(
+            _Runtime(
+                _result(
+                    status=RunStatus.COMPLETED,
+                    reason=StopReason.FINAL,
+                    final_response="done",
+                )
+            )
+        ),
+        settings=_settings(),
+    )
+
+    assert await worker.serve_once() is False
+    assert _WORKER_CALLS == ["expire_due", "recover_expired_leases", "claim_next"]
+    approval_repository = _FakeApprovalRepository.instances[-1]
+    assert approval_repository.calls[0][0] == "expire_due"
+    assert approval_repository.calls[0][1]["now"] == _FakeRepository.instances[-1].now
+
+
+@pytest.mark.asyncio
+async def test_persist_result_keeps_awaiting_approval_job_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    claimed = replace(_claimed(), status="awaiting_approval")
+    _FakeRepository.next_claimed = claimed
+    worker = AgentWorker(_SessionFactory(), settings=_settings())
+
+    async def no_side_effect(_: ClaimedJob) -> bool:
+        return False
+
+    monkeypatch.setattr(worker, "_has_side_effect", no_side_effect)
+    await worker._persist_result(
+        claimed,
+        _result(
+            status=RunStatus.COMPLETED,
+            reason=StopReason.FINAL,
+            final_response="approval requested",
+        ),
+    )
+
+    repository = _FakeRepository.instances[-1]
+    assert [name for name, _ in repository.calls] == []
 
 
 @pytest.mark.asyncio

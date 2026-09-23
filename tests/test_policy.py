@@ -62,6 +62,7 @@ def make_proposal(
     field_values: tuple[tuple[str, object], ...] | None = None,
     missing_required_fields: list[str] | None = None,
     injection: bool = False,
+    priority: ProposalPriority = ProposalPriority.NORMAL,
     confidence: float = 0.5,
 ) -> AgentProposal:
     proposal_fields = (
@@ -81,7 +82,7 @@ def make_proposal(
                 if missing_required_fields is None
                 else missing_required_fields
             ),
-            "priority": ProposalPriority.NORMAL,
+            "priority": priority,
             "contains_injection_or_override_attempt": injection,
             "rationale_short": "Structured proposal for policy evaluation.",
             "tool_calls": [],
@@ -317,6 +318,59 @@ def test_requires_approval_action_is_pending_approval(
         status=RoutingStatus.PENDING_APPROVAL,
         decision=RoutingDecision.NEEDS_APPROVAL,
         reason="approval_required",
+    )
+
+
+def test_critical_priority_requires_approval_for_registered_create_case(
+    tenant_config: TenantConfig,
+) -> None:
+    outcome = evaluate(
+        tenant_config,
+        make_proposal(priority=ProposalPriority.CRITICAL),
+        action="create_case",
+    )
+
+    assert_outcome(
+        outcome,
+        status=RoutingStatus.PENDING_APPROVAL,
+        decision=RoutingDecision.NEEDS_APPROVAL,
+        reason="approval_required",
+    )
+
+
+def test_incomplete_critical_create_case_remains_denied(
+    tenant_config: TenantConfig,
+) -> None:
+    outcome = evaluate(
+        tenant_config,
+        make_proposal(field_names=(), priority=ProposalPriority.CRITICAL),
+        action="create_case",
+    )
+
+    assert_outcome(
+        outcome,
+        status=RoutingStatus.AWAITING_INPUT,
+        decision=RoutingDecision.DENY,
+        reason="missing_required_fields",
+        missing=("summary",),
+    )
+
+
+def test_trusted_risk_remains_urgent_for_critical_proposal(
+    tenant_config: TenantConfig,
+) -> None:
+    outcome = evaluate(
+        tenant_config,
+        make_proposal(priority=ProposalPriority.CRITICAL),
+        action="create_case",
+        safety_or_legal_risk=True,
+    )
+
+    assert_outcome(
+        outcome,
+        status=RoutingStatus.URGENT,
+        decision=RoutingDecision.NEEDS_APPROVAL,
+        reason="safety_or_legal_risk",
     )
 
 

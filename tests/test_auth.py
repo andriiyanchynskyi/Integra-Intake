@@ -1,7 +1,7 @@
 import hashlib
 import logging
 from collections.abc import AsyncGenerator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import UUID, uuid4
 
 import pytest
@@ -13,8 +13,10 @@ from app.auth import (
     API_KEY_FORMAT,
     API_KEY_PREFIX,
     API_KEY_TOKEN_PATTERN,
+    AuthenticatedOperator,
     SAFE_PREFIX_LENGTH,
     generate_api_key,
+    get_current_operator,
     get_current_tenant,
     hash_api_key,
 )
@@ -36,6 +38,10 @@ class StoredApiKey:
     tenant_id: UUID
     is_active: bool
     tenant: Tenant
+    id: UUID = field(default_factory=uuid4)
+    principal_type: str = "service"
+    capability: str = "none"
+    actor_ref: str | None = None
 
 
 class StatementAwareSession:
@@ -47,6 +53,28 @@ class StatementAwareSession:
     async def execute(self, statement: object) -> ScalarResult:
         compiled = statement.compile(dialect=postgresql.dialect())
         query = str(compiled)
+        if "FROM api_keys JOIN tenants ON api_keys.tenant_id = tenants.id" in query:
+            assert "api_keys.key_hash = %(key_hash_1)s" in query
+            assert "api_keys.is_active IS true" in query
+            assert "api_keys.principal_type = %(principal_type_1)s" in query
+            assert "api_keys.capability = %(capability_1)s" in query
+            assert "api_keys.actor_ref IS NOT NULL" in query
+            assert "tenants.status = %(status_1)s" in query
+
+            key_hash = compiled.params["key_hash_1"]
+            record = self.records.get(key_hash)
+            if (
+                record is None
+                or not record.is_active
+                or record.tenant.id != record.tenant_id
+                or record.tenant.status != "active"
+                or record.principal_type != "operator"
+                or record.capability != "approval_decider"
+                or not record.actor_ref
+            ):
+                return ScalarResult(None)
+            return ScalarResult(record)
+
         assert "FROM tenants JOIN api_keys ON api_keys.tenant_id = tenants.id" in query
         assert "api_keys.key_hash = %(key_hash_1)s" in query
         assert "api_keys.is_active IS true" in query
@@ -79,6 +107,16 @@ def client_factory():
         @app.get("/tenant")
         async def current_tenant(current: Tenant = Depends(get_current_tenant)) -> dict[str, str]:
             return {"tenant_id": str(current.id)}
+
+        @app.get("/operator")
+        async def current_operator(
+            current: AuthenticatedOperator = Depends(get_current_operator),
+        ) -> dict[str, str]:
+            return {
+                "tenant_id": str(current.tenant_id),
+                "actor_ref": current.actor_ref,
+                "credential_id": str(current.credential_id),
+            }
 
         async def override_session() -> AsyncGenerator[StatementAwareSession, None]:
             yield StatementAwareSession(records)
@@ -151,6 +189,71 @@ def test_active_api_key_resolves_the_tenant_joined_to_its_digest(client_factory,
 
     assert response.status_code == 200
     assert response.json() == {"tenant_id": str(tenant.id)}
+
+
+def test_active_operator_key_resolves_tenant_actor_and_credential_context(
+    client_factory, seeded_credentials
+) -> None:
+    """Approval authentication returns only the tenant-scoped non-secret actor context."""
+    tenant, record, raw_key = seeded_credentials
+    record.principal_type = "operator"
+    record.capability = "approval_decider"
+    record.actor_ref = "ops-alice"
+
+    response = client_factory({record.key_hash: record}).get(
+        "/operator", headers={"X-API-Key": raw_key}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "tenant_id": str(tenant.id),
+        "actor_ref": "ops-alice",
+        "credential_id": str(record.id),
+    }
+
+
+def test_service_api_key_cannot_authenticate_as_an_operator(
+    client_factory, seeded_credentials
+) -> None:
+    """Existing service credentials remain valid for tenant APIs but cannot decide approvals."""
+    _, record, raw_key = seeded_credentials
+
+    tenant_response = client_factory({record.key_hash: record}).get(
+        "/tenant", headers={"X-API-Key": raw_key}
+    )
+    operator_response = client_factory({record.key_hash: record}).get(
+        "/operator", headers={"X-API-Key": raw_key}
+    )
+
+    assert tenant_response.status_code == 200
+    assert operator_response.status_code == 401
+
+
+def test_inactive_operator_key_is_rejected(client_factory, seeded_credentials) -> None:
+    """An operator credential must remain active at decision time."""
+    _, record, raw_key = seeded_credentials
+    record.principal_type = "operator"
+    record.capability = "approval_decider"
+    record.actor_ref = "ops-alice"
+    record.is_active = False
+
+    response = client_factory({record.key_hash: record}).get(
+        "/operator", headers={"X-API-Key": raw_key}
+    )
+
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize("header_value", [None, "", "wrong-prefix", "ik_"])
+def test_missing_or_malformed_operator_api_key_returns_401(
+    client_factory, header_value: str | None
+) -> None:
+    """Malformed operator credentials are rejected before any tenant lookup."""
+    headers = {} if header_value is None else {"X-API-Key": header_value}
+
+    response = client_factory({}).get("/operator", headers=headers)
+
+    assert response.status_code == 401
 
 
 def test_authentication_responses_and_logs_do_not_disclose_raw_key(

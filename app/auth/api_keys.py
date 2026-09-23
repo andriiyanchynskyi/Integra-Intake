@@ -10,7 +10,9 @@ Tenant, and must never log or include the raw credential in an HTTP response.
 import hashlib
 import re
 import secrets
+from dataclasses import dataclass
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy import select
@@ -28,6 +30,15 @@ API_KEY_TOKEN_PATTERN = re.compile(
     rf"{re.escape(API_KEY_PREFIX)}[A-Za-z0-9_-]{{{API_KEY_TOKEN_LENGTH}}}\Z"
 )
 SAFE_PREFIX_LENGTH = 11
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedOperator:
+    """Tenant-scoped, non-secret operator identity for approval decisions."""
+
+    tenant_id: UUID
+    actor_ref: str
+    credential_id: UUID
 
 
 def hash_api_key(raw_key: str) -> str:
@@ -61,3 +72,40 @@ async def get_current_tenant(
             detail="Invalid API key",
         )
     return tenant
+
+
+async def get_current_operator(
+    x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+    session: AsyncSession = Depends(get_db_session),
+) -> AuthenticatedOperator:
+    """Authenticate only active operator credentials allowed to decide approvals."""
+
+    if x_api_key is None or not API_KEY_TOKEN_PATTERN.fullmatch(x_api_key):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid operator API key",
+        )
+
+    statement = (
+        select(ApiKey)
+        .join(Tenant, ApiKey.tenant_id == Tenant.id)
+        .where(
+            ApiKey.key_hash == hash_api_key(x_api_key),
+            ApiKey.is_active.is_(True),
+            ApiKey.principal_type == "operator",
+            ApiKey.capability == "approval_decider",
+            ApiKey.actor_ref.is_not(None),
+            Tenant.status == "active",
+        )
+    )
+    credential = (await session.execute(statement)).scalar_one_or_none()
+    if credential is None or not credential.actor_ref:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid operator API key",
+        )
+    return AuthenticatedOperator(
+        tenant_id=credential.tenant_id,
+        actor_ref=credential.actor_ref,
+        credential_id=credential.id,
+    )

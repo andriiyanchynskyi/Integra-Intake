@@ -3,6 +3,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
@@ -47,6 +48,13 @@ class ApiKey(TimestampedModel, Base):
     prefix: Mapped[str] = mapped_column(String(11), nullable=False)
     key_hash: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    principal_type: Mapped[str] = mapped_column(
+        String(30), nullable=False, server_default="service"
+    )
+    capability: Mapped[str] = mapped_column(
+        String(50), nullable=False, server_default="none"
+    )
+    actor_ref: Mapped[str | None] = mapped_column(String(255))
 
 
 class Customer(TimestampedModel, Base):
@@ -180,17 +188,71 @@ class IdempotencyRecord(TimestampedModel, Base):
 class Approval(TimestampedModel, Base):
     __tablename__ = "approvals"
     __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_approvals_tenant_id_id"),
+        UniqueConstraint("job_id", name="uq_approvals_job_id"),
         ForeignKeyConstraint(
             ["tenant_id", "case_id"],
             ["intake_cases.tenant_id", "intake_cases.id"],
             name="fk_approvals_tenant_case",
         ),
+        ForeignKeyConstraint(
+            ["tenant_id", "job_id"],
+            ["agent_jobs.tenant_id", "agent_jobs.id"],
+            name="fk_approvals_tenant_job",
+        ),
+        CheckConstraint(
+            "job_id IS NULL OR (pending_action IS NOT NULL "
+            "AND tenant_config_sha256 IS NOT NULL AND expires_at IS NOT NULL)",
+            name="ck_approvals_phase8_payload_complete",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected', 'expired')",
+            name="ck_approvals_status",
+        ),
         Index("ix_approvals_tenant_id_id", "tenant_id", "id"),
+        Index(
+            "ix_approvals_pending_expires_at",
+            "tenant_id",
+            "status",
+            "expires_at",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
     tenant_id: Mapped[UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
-    case_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    case_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    job_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
     action: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[str] = mapped_column(String(50), nullable=False, server_default="pending")
     decision: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    policy_reason: Mapped[str | None] = mapped_column(String(100))
+    pending_action: Mapped[dict | None] = mapped_column(JSONB)
+    tenant_config_sha256: Mapped[str | None] = mapped_column(String(64))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decided_by_actor_ref: Mapped[str | None] = mapped_column(String(255))
+    decision_reason: Mapped[str | None] = mapped_column(Text)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    execution_result: Mapped[dict | None] = mapped_column(JSONB)
+
+
+class ApprovalEvent(Base):
+    __tablename__ = "approval_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "approval_id"],
+            ["approvals.tenant_id", "approvals.id"],
+            name="fk_approval_events_tenant_approval",
+        ),
+        Index("ix_approval_events_tenant_id_id", "tenant_id", "id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    approval_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    actor_ref: Mapped[str | None] = mapped_column(String(255))
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

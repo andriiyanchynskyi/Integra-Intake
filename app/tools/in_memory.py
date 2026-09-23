@@ -4,11 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from app.agent import ToolData
 from app.policy import TrustedSource
-from app.tools.models import CreatedCase, CustomerSummary, UpdatedCase
+from app.tools.models import (
+    ApprovalRequested,
+    CreatedCase,
+    CustomerSummary,
+    PendingAction,
+    UpdatedCase,
+)
 from app.tools.ports import CustomerNotFoundError, _CaseRecord, _CustomerRecord
 
 
@@ -18,6 +25,7 @@ class InMemoryTenantToolPort:
     def __init__(self) -> None:
         self.customers: dict[UUID, _CustomerRecord] = {}
         self.cases: dict[UUID, _CaseRecord] = {}
+        self.approval_requests: list[tuple[UUID, PendingAction, str]] = []
 
     def add_customer(
         self,
@@ -125,3 +133,17 @@ class InMemoryTenantToolPort:
     def case_exists(self, tenant_id: UUID, case_id: UUID) -> bool:
         record = self.cases.get(case_id)
         return record is not None and record.tenant_id == tenant_id
+
+    def request_approval(
+        self,
+        tenant_id: UUID,
+        *,
+        action: PendingAction,
+        policy_reason: str,
+    ) -> ApprovalRequested:
+        approval_id = uuid4()
+        self.approval_requests.append((tenant_id, action, policy_reason))
+        return ApprovalRequested(
+            id=approval_id,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+        )

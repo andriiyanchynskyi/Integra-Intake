@@ -89,6 +89,11 @@ class AgentRuntimeFactory:
             for parameter in constructor.parameters.values()
         ):
             port_kwargs["attempt_count"] = claimed_job.attempt_count
+        if "runtime_settings" in constructor.parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in constructor.parameters.values()
+        ):
+            port_kwargs["runtime_settings"] = self._settings
         async_port = PostgresTenantToolPort(self._session_factory, **port_kwargs)
         port = SyncTenantToolPort(gateway, async_port)
         executor = PolicyGatedToolExecutor(runtime=runtime, port=port)

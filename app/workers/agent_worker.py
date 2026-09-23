@@ -18,6 +18,7 @@ import httpx
 
 from app.agent.models import AgentRunResult, RunStatus
 from app.core.config import Settings, settings
+from app.domain.approval_repository import ApprovalRepository
 from app.domain.job_repository import ClaimedJob, JobRepository
 from app.runtime.factory import AgentRuntimeFactory
 from app.runtime.gateway import WorkerAsyncGateway
@@ -97,6 +98,7 @@ class AgentWorker:
 
         now = self._now()
         async with self._session_factory() as session:
+            await ApprovalRepository(session).expire_due(now=now)
             repository = JobRepository(session)
             await repository.recover_expired_leases(
                 now=now,

@@ -22,6 +22,7 @@ from app.tools.models import (
     CustomerSummary,
     FindCustomerArgs,
     FlagForReviewArgs,
+    PendingAction,
     ReplyDraft,
     ReviewFlag,
     ToolDefinition,
@@ -142,11 +143,15 @@ class PolicyGatedToolExecutor:
             )
         )
         if policy.decision is not RoutingDecision.ALLOW:
-            return ToolExecutionResult(
-                data=policy.as_tool_data(),
-                continue_run=False,
-                final_response=policy.reason,
-            )
+            if (
+                definition is None
+                or policy.decision is not RoutingDecision.NEEDS_APPROVAL
+            ):
+                return ToolExecutionResult(
+                    data=policy.as_tool_data(),
+                    continue_run=False,
+                    final_response=policy.reason,
+                )
         if definition is None:
             raise AssertionError("allowed action must have a registered tool")
         try:
@@ -158,6 +163,19 @@ class PolicyGatedToolExecutor:
                 data={"outcome": "tool_arguments_invalid"},
                 continue_run=False,
                 final_response="tool_arguments_invalid",
+            )
+        if policy.decision is RoutingDecision.NEEDS_APPROVAL:
+            requested = self._port.request_approval(
+                self._runtime.tenant_id,
+                action=self._pending_action(definition, arguments, proposal),
+                policy_reason=policy.reason,
+            )
+            data = policy.as_tool_data()
+            data["approval_id"] = str(requested.id)
+            return ToolExecutionResult(
+                data=data,
+                continue_run=False,
+                final_response="approval_requested",
             )
         try:
             result = definition.handler(arguments, proposal, self._runtime)
@@ -182,6 +200,18 @@ class PolicyGatedToolExecutor:
                 continue_run=False,
                 final_response="tool_execution_failed",
             )
+
+    def _pending_action(
+        self,
+        definition: ToolDefinition,
+        arguments: BaseModel,
+        proposal: AgentProposal,
+    ) -> PendingAction:
+        return PendingAction(
+            name=definition.name,
+            arguments=deepcopy(arguments.model_dump(mode="json")),
+            known_fields=deepcopy(_known_proposal_fields(proposal, self._runtime)),
+        )
 
     def _find_customer(
         self,
