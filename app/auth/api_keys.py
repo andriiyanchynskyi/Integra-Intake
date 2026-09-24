@@ -60,18 +60,25 @@ async def get_current_tenant(
             detail="Invalid API key",
         )
 
-    statement = (
-        select(Tenant)
-        .join(ApiKey, ApiKey.tenant_id == Tenant.id)
-        .where(ApiKey.key_hash == hash_api_key(x_api_key), ApiKey.is_active.is_(True))
-    )
-    tenant = (await session.execute(statement)).scalar_one_or_none()
+    tenant = await _resolve_active_tenant(x_api_key, session)
     if tenant is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
         )
     return tenant
+
+
+async def _resolve_active_tenant(
+    raw_key: str,
+    session: AsyncSession,
+) -> Tenant | None:
+    statement = (
+        select(Tenant)
+        .join(ApiKey, ApiKey.tenant_id == Tenant.id)
+        .where(ApiKey.key_hash == hash_api_key(raw_key), ApiKey.is_active.is_(True))
+    )
+    return (await session.execute(statement)).scalar_one_or_none()
 
 
 async def get_current_operator(

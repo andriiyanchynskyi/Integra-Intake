@@ -39,6 +39,7 @@ class TrustedSource:
     subject: str
     body: str
     document: NormalizedRateConfirmationDocument | None = None
+    sender: str | None = None
 
 
 def trusted_source_from_snapshot(value: object) -> TrustedSource:
@@ -50,9 +51,14 @@ def trusted_source_from_snapshot(value: object) -> TrustedSource:
     if keys not in (
         {"channel", "subject", "body"},
         {"channel", "subject", "body", "document"},
+        {"channel", "subject", "body", "sender"},
+        {"channel", "subject", "body", "document", "sender"},
     ):
         raise RuntimeError("source snapshot is invalid")
     if not all(isinstance(value[name], str) for name in ("channel", "subject", "body")):
+        raise RuntimeError("source snapshot is invalid")
+    sender = value.get("sender")
+    if sender is not None and not isinstance(sender, str):
         raise RuntimeError("source snapshot is invalid")
     document = None
     if "document" in value:
@@ -67,6 +73,7 @@ def trusted_source_from_snapshot(value: object) -> TrustedSource:
         subject=value["subject"],
         body=value["body"],
         document=document,
+        sender=sender,
     )
 
 

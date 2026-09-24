@@ -67,6 +67,8 @@ def canonical_intake_hash(source: TrustedSource) -> str:
         "channel": source.channel,
         "subject": source.subject,
     }
+    if source.sender is not None:
+        payload["sender"] = source.sender
     if source.document is not None:
         payload["document"] = source.document.model_dump(mode="json")
     encoded = json.dumps(

@@ -75,6 +75,8 @@ class JobRepository:
             "subject": source.subject,
             "body": source.body,
         }
+        if source.sender is not None:
+            snapshot["sender"] = source.sender
         if source.document is not None:
             snapshot["document"] = source.document.model_dump(mode="json")
         return snapshot

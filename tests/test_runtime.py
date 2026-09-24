@@ -274,6 +274,55 @@ def test_agent_runtime_factory_reconstructs_trusted_context_and_message_order(
         runtime.close()
 
 
+def test_agent_runtime_factory_user_envelope_includes_sender_only_as_source_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.runtime import factory as factory_module
+
+    class _FakeAsyncPort:
+        def __init__(self, session_factory: object, *, job_id: object) -> None:
+            del session_factory, job_id
+
+    monkeypatch.setattr(factory_module, "PostgresTenantToolPort", _FakeAsyncPort)
+
+    source_snapshot = {
+        "channel": "email_webhook",
+        "sender": "dispatcher@example.test",
+        "subject": "Load",
+        "body": "Need a truck",
+    }
+    job = _claimed_job(source_snapshot=source_snapshot)
+    job.provider_id = "provider-123"
+    job.document_digest = "document-digest-123"
+    owner_loop = asyncio.new_event_loop()
+    runtime = AgentRuntimeFactory(object(), llm_factory=_FakeLLM).build(
+        job,
+        WorkerAsyncGateway(owner_loop),
+    )
+
+    try:
+        user_envelope = json.loads(runtime.initial_messages[-1].content or "")
+
+        assert user_envelope == {
+            "body": "Need a truck",
+            "channel": "email_webhook",
+            "sender": "dispatcher@example.test",
+            "subject": "Load",
+        }
+        assert str(job.tenant_id) not in json.dumps(user_envelope)
+        assert "tenant_id" not in user_envelope
+        assert "document_digest" not in user_envelope
+        assert "risk_signals" not in user_envelope
+        assert "provider_id" not in user_envelope
+        prompt_text = "\n".join(message.content or "" for message in runtime.initial_messages)
+        assert "document-digest-123" not in prompt_text
+        assert "provider-123" not in prompt_text
+        assert "safety_or_legal_risk" not in prompt_text
+    finally:
+        runtime.close()
+        owner_loop.close()
+
+
 def test_agent_runtime_factory_builds_document_messages_and_skill_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

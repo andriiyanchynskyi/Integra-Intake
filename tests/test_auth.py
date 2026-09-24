@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import time
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from uuid import UUID, uuid4
@@ -16,9 +17,12 @@ from app.auth import (
     AuthenticatedOperator,
     SAFE_PREFIX_LENGTH,
     generate_api_key,
+    get_current_inbound_tenant,
     get_current_operator,
     get_current_tenant,
     hash_api_key,
+    sign_inbound_webhook,
+    verify_inbound_webhook_signature,
 )
 from app.db.models import Tenant
 from app.db.session import get_db_session
@@ -108,6 +112,12 @@ def client_factory():
         async def current_tenant(current: Tenant = Depends(get_current_tenant)) -> dict[str, str]:
             return {"tenant_id": str(current.id)}
 
+        @app.post("/inbound-tenant")
+        async def current_inbound_tenant(
+            current: Tenant = Depends(get_current_inbound_tenant),
+        ) -> dict[str, str]:
+            return {"tenant_id": str(current.id)}
+
         @app.get("/operator")
         async def current_operator(
             current: AuthenticatedOperator = Depends(get_current_operator),
@@ -127,10 +137,116 @@ def client_factory():
     return build
 
 
+def _signed_webhook_headers(raw_key: str, body: bytes) -> dict[str, str]:
+    timestamp = str(int(time.time()))
+    return {
+        "X-API-Key": raw_key,
+        "X-Inbound-Timestamp": timestamp,
+        "X-Inbound-Signature": sign_inbound_webhook(raw_key, int(timestamp), body),
+    }
+
+
 def test_hash_api_key_is_deterministic_sha256_digest() -> None:
     raw_key = "ik_" + "A" * 43
 
     assert hash_api_key(raw_key) == hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+def test_inbound_webhook_signature_accepts_the_signed_body_at_current_time() -> None:
+    raw_key = "ik_" + "A" * 43
+    body = b'{"provider_id":"message-1"}'
+    timestamp = 1_700_000_000
+    signature = sign_inbound_webhook(raw_key, timestamp, body)
+
+    assert verify_inbound_webhook_signature(
+        raw_key,
+        str(timestamp),
+        signature,
+        body,
+        now=timestamp,
+    )
+
+
+def test_inbound_webhook_signature_rejects_non_ascii_without_raising() -> None:
+    raw_key = "ik_" + "A" * 43
+
+    assert not verify_inbound_webhook_signature(
+        raw_key,
+        "1700000000",
+        "v1=é",
+        b"body",
+        now=1_700_000_000,
+    )
+
+
+@pytest.mark.parametrize(
+    ("timestamp_header", "signature_body", "body"),
+    [
+        ("1700000000", b'{"provider_id":"message-1"}', b'{"provider_id":"message-2"}'),
+        ("1700000001", b'{"provider_id":"message-1"}', b'{"provider_id":"message-1"}'),
+    ],
+)
+def test_inbound_webhook_signature_rejects_changed_body_or_timestamp(
+    timestamp_header: str,
+    signature_body: bytes,
+    body: bytes,
+) -> None:
+    raw_key = "ik_" + "A" * 43
+    original_timestamp = 1_700_000_000
+    signature = sign_inbound_webhook(raw_key, original_timestamp, signature_body)
+
+    assert not verify_inbound_webhook_signature(
+        raw_key,
+        timestamp_header,
+        signature,
+        body,
+        now=original_timestamp,
+    )
+
+
+@pytest.mark.parametrize(
+    ("timestamp_header", "signature"),
+    [
+        ("not-a-timestamp", "v1=invalid"),
+        ("1700000000", "not-a-signature"),
+        ("1700000000", None),
+    ],
+)
+def test_inbound_webhook_signature_rejects_malformed_headers(
+    timestamp_header: str,
+    signature: str | None,
+) -> None:
+    raw_key = "ik_" + "A" * 43
+
+    assert not verify_inbound_webhook_signature(
+        raw_key,
+        timestamp_header,
+        signature,
+        b"body",
+        now=1_700_000_000,
+    )
+
+
+@pytest.mark.parametrize(
+    "now",
+    [
+        1_700_000_000 + 300 + 1,
+        1_700_000_000 - 300 - 1,
+    ],
+)
+def test_inbound_webhook_signature_rejects_stale_and_future_timestamps(now: int) -> None:
+    raw_key = "ik_" + "A" * 43
+    body = b"body"
+    timestamp = 1_700_000_000
+    signature = sign_inbound_webhook(raw_key, timestamp, body)
+
+    assert not verify_inbound_webhook_signature(
+        raw_key,
+        str(timestamp),
+        signature,
+        body,
+        now=now,
+    )
 
 
 def test_generate_api_key_returns_provisioning_credential_and_non_secret_metadata() -> None:
@@ -189,6 +305,49 @@ def test_active_api_key_resolves_the_tenant_joined_to_its_digest(client_factory,
 
     assert response.status_code == 200
     assert response.json() == {"tenant_id": str(tenant.id)}
+
+
+def test_active_api_key_resolves_the_tenant_for_signed_inbound_webhook(
+    client_factory, seeded_credentials
+) -> None:
+    tenant, record, raw_key = seeded_credentials
+    body = b'{"provider_id":"message-1"}'
+
+    response = client_factory({record.key_hash: record}).post(
+        "/inbound-tenant",
+        content=body,
+        headers={
+            **_signed_webhook_headers(raw_key, body),
+            "content-type": "application/json",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"tenant_id": str(tenant.id)}
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-API-Key": "not-a-valid-api-key"},
+        {
+            "X-API-Key": "ik_" + "A" * 43,
+            "X-Inbound-Timestamp": str(int(time.time())),
+            "X-Inbound-Signature": "v1=invalid",
+        },
+    ],
+)
+def test_invalid_inbound_webhook_authentication_returns_generic_401(
+    client_factory, headers: dict[str, str]
+) -> None:
+    response = client_factory({}).post(
+        "/inbound-tenant",
+        content=b"{}",
+        headers=headers,
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid inbound webhook"}
 
 
 def test_active_operator_key_resolves_tenant_actor_and_credential_context(

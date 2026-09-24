@@ -229,6 +229,26 @@ def test_canonical_intake_hash_is_stable_and_content_sensitive() -> None:
     )
 
 
+def test_trusted_source_sender_is_optional_and_changes_only_new_hash() -> None:
+    legacy = TrustedSource(channel="email", subject="Load", body="Need a truck")
+    expected = json.dumps(
+        {"body": legacy.body, "channel": legacy.channel, "subject": legacy.subject},
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    with_sender = replace(legacy, sender="dispatcher@example.test")
+
+    assert legacy.sender is None
+    assert canonical_intake_hash(legacy) == hashlib.sha256(expected).hexdigest()
+    assert canonical_intake_hash(with_sender) != canonical_intake_hash(legacy)
+    assert canonical_intake_hash(replace(legacy, sender="other@example.test")) != (
+        canonical_intake_hash(with_sender)
+    )
+
+
 def test_canonical_intake_hash_includes_document_digest_and_outcome() -> None:
     source = TrustedSource(channel="email", subject="Rate", body="Document received")
     first_document = DocumentNormalizer().normalize(_document_input(text="Origin: Chicago"))
@@ -281,6 +301,33 @@ async def test_body_only_enqueue_keeps_the_legacy_exact_three_key_snapshot() -> 
 
 
 @pytest.mark.asyncio
+async def test_sender_enqueue_snapshot_contains_the_fixed_inbound_source_shape() -> None:
+    session = _IntakeSession()
+    service = IntakeEnqueueService(session, _ProfileResolver(_profile()))
+    command = EnqueueIntakeCommand(
+        tenant_id=uuid4(),
+        tenant_slug="freight-broker",
+        source=TrustedSource(
+            channel="email_webhook",
+            sender="dispatcher@example.test",
+            subject="Load",
+            body="Need a truck",
+        ),
+        idempotency_key="email_webhook:provider-123",
+    )
+
+    result = await service.enqueue(command)
+
+    assert result.created is True
+    assert session.jobs[0].source_snapshot == {
+        "channel": "email_webhook",
+        "sender": "dispatcher@example.test",
+        "subject": "Load",
+        "body": "Need a truck",
+    }
+
+
+@pytest.mark.asyncio
 async def test_enqueue_fresh_then_reuses_same_idempotency_record() -> None:
     session = _IntakeSession()
     resolver = _ProfileResolver(_profile())
@@ -296,6 +343,63 @@ async def test_enqueue_fresh_then_reuses_same_idempotency_record() -> None:
     assert len(session.jobs) == 1
     assert len(session.idempotency_records) == 1
     assert resolver.slugs == ["freight-broker", "freight-broker"]
+
+
+@pytest.mark.asyncio
+async def test_inbound_provider_id_reuses_per_tenant_and_conflicts_on_changed_source() -> None:
+    session = _IntakeSession()
+    service = IntakeEnqueueService(session, _ProfileResolver(_profile()))
+    tenant_id = uuid4()
+    provider_key = "email_webhook:provider-duplicate-1"
+    normalized = DocumentNormalizer().normalize(_document_input(text="Origin: Chicago"))
+    source = TrustedSource(
+        channel="email_webhook",
+        sender="dispatcher@example.test",
+        subject="Rate confirmation",
+        body="Please process the attachment.",
+        document=normalized,
+    )
+    command = EnqueueIntakeCommand(
+        tenant_id=tenant_id,
+        tenant_slug="freight-broker",
+        source=source,
+        idempotency_key=provider_key,
+    )
+
+    first = await service.enqueue(command)
+    duplicate = await service.enqueue(command)
+
+    assert first.created is True
+    assert duplicate.created is False
+    assert duplicate.job_id == first.job_id
+    assert len(session.jobs) == 1
+    assert len(session.idempotency_records) == 1
+    assert session.idempotency_records[0].key == provider_key
+
+    changed_sources = (
+        replace(source, body="A different message."),
+        replace(source, sender="other-dispatcher@example.test"),
+        replace(
+            source,
+            document=DocumentNormalizer().normalize(
+                _document_input(text="Origin: Detroit")
+            ),
+        ),
+    )
+    for changed_source in changed_sources:
+        with pytest.raises(IdempotencyConflict):
+            await service.enqueue(replace(command, source=changed_source))
+
+    other_tenant_id = uuid4()
+    other_tenant = await service.enqueue(replace(command, tenant_id=other_tenant_id))
+    assert other_tenant.created is True
+    assert other_tenant.job_id != first.job_id
+    assert len(session.jobs) == 2
+    assert len(session.idempotency_records) == 2
+    assert {record.tenant_id for record in session.idempotency_records} == {
+        tenant_id,
+        other_tenant_id,
+    }
 
 
 @pytest.mark.asyncio

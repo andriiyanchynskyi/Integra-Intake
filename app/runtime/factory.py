@@ -179,6 +179,8 @@ class AgentRuntimeFactory:
                 "message": source.body,
                 "subject": source.subject,
             }
+        if source.sender is not None:
+            source_data["sender"] = source.sender
         messages = [
             AgentMessage(
                 role=MessageRole.SYSTEM,
