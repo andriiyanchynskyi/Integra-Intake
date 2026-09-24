@@ -292,6 +292,32 @@ def test_freight_profile_preserves_the_required_intake_catalog() -> None:
         "commodity",
         "contact",
     }
+    assert set(intake_types["rate_confirmation"].required_fields) == {
+        "origin",
+        "destination",
+        "equipment",
+        "pickup_window",
+        "commodity",
+        "contact",
+        "quoted_rate",
+        "valid_until",
+    }
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_intake_types"),
+    [
+        ("repair-service.yaml", {"service_request", "warranty_claim"}),
+        ("language-school.yaml", {"course_inquiry", "placement_request"}),
+    ],
+)
+def test_non_freight_profiles_load_unchanged(
+    filename: str, expected_intake_types: set[str]
+) -> None:
+    config = load_tenant_config(PROJECT_ROOT / "examples" / filename)
+
+    assert {item.name for item in config.intake_types} == expected_intake_types
+    assert "rate_confirmation" not in {item.name for item in config.intake_types}
 
 
 @pytest.fixture

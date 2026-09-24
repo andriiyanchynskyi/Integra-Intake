@@ -6,7 +6,8 @@ intake_types:
     required_fields: [origin, destination, equipment, pickup_window, commodity, contact]
   - name: rate_confirmation
     description: A carrier rate confirmation document or message.
-    required_fields: [origin, destination, quoted_rate, valid_until]
+    required_fields:
+      [origin, destination, equipment, pickup_window, commodity, contact, quoted_rate, valid_until]
   - name: invoice_query
     description: A question about a freight invoice.
     required_fields: [invoice_number, contact]

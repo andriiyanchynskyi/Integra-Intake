@@ -11,6 +11,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth import AuthenticatedOperator
+from app.documents import DocumentMediaType, DocumentNormalizer, RateConfirmationDocumentInput
 from app.db.models import (
     AgentJob,
     Approval,
@@ -137,6 +138,75 @@ def _action() -> PendingAction:
         arguments={"customer_id": None},
         known_fields={"summary": "Create a case"},
     )
+
+
+def _document_snapshot(
+    *,
+    text: str | None = "Summary: Approved case",
+    content: bytes | None = None,
+    media_type: DocumentMediaType = DocumentMediaType.TEXT,
+) -> tuple[dict[str, object], object]:
+    payload: dict[str, object] = {
+        "channel": "email",
+        "subject": "Rate confirmation",
+        "body": "Rate confirmation document received.",
+        "media_type": media_type,
+    }
+    if text is not None:
+        payload["text"] = text
+    if content is not None:
+        payload["content"] = content
+    normalized = DocumentNormalizer().normalize(
+        RateConfirmationDocumentInput.model_validate(payload)
+    )
+    return normalized.model_dump(mode="json"), normalized
+
+
+def test_approval_source_reconstruction_preserves_safe_document_snapshot() -> None:
+    document_snapshot, normalized = _document_snapshot(
+        text="Summary: Approved case\nContact: customer@example.com"
+    )
+    job = _job()
+    job.source_snapshot = {
+        "channel": "email",
+        "subject": "Rate confirmation",
+        "body": "Rate confirmation document received.",
+        "document": document_snapshot,
+    }
+
+    source = PostgresApprovalActionExecutor._source_from_job(job.source_snapshot)
+
+    assert source.document == normalized
+    assert source.body == "Rate confirmation document received."
+    assert source.document is not None
+    assert source.document.text == normalized.text
+    assert "content" not in repr(source)
+    assert "PdfReadError" not in repr(source)
+
+
+def test_approval_source_reconstruction_preserves_safe_unreadable_error() -> None:
+    raw_content = b"malformed-approval-document-secret"
+    document_snapshot, normalized = _document_snapshot(
+        media_type=DocumentMediaType.PDF,
+        text=None,
+        content=raw_content,
+    )
+    job = _job()
+    job.source_snapshot = {
+        "channel": "email",
+        "subject": "Unreadable rate confirmation",
+        "body": "Rate confirmation document received.",
+        "document": document_snapshot,
+    }
+
+    source = PostgresApprovalActionExecutor._source_from_job(job.source_snapshot)
+
+    assert source.document == normalized
+    assert source.document is not None
+    assert source.document.text is None
+    assert source.document.extraction_error.value == "pdf_malformed"
+    assert raw_content not in repr(source).encode("utf-8")
+    assert "malformed-approval-document-secret" not in repr(source)
 
 
 @pytest.mark.asyncio

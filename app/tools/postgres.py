@@ -16,7 +16,7 @@ from app.db.models import AgentJob, Approval, IdempotencyRecord
 from app.domain.approval_repository import ApprovalRepository
 from app.domain.repositories import CaseRepository
 from app.domain.service import CaseService
-from app.policy import TrustedSource
+from app.policy import TrustedSource, trusted_source_from_snapshot
 from app.runtime.gateway import WorkerAsyncGateway
 from app.tools.models import (
     ApprovalRequested,
@@ -446,18 +446,10 @@ class PostgresApprovalActionExecutor:
 
     @staticmethod
     def _source_from_job(value: object) -> TrustedSource:
-        if not isinstance(value, Mapping):
-            raise RuntimeError("approved source snapshot is invalid")
-        required = ("channel", "subject", "body")
-        if set(value) != set(required) or not all(
-            isinstance(value[name], str) for name in required
-        ):
-            raise RuntimeError("approved source snapshot is invalid")
-        return TrustedSource(
-            channel=value["channel"],
-            subject=value["subject"],
-            body=value["body"],
-        )
+        try:
+            return trusted_source_from_snapshot(value)
+        except RuntimeError as error:
+            raise RuntimeError("approved source snapshot is invalid") from error
 
 
 __all__ = [

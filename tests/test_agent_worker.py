@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.agent.models import AgentRunResult, RunStatus, StopReason
+from app.agent.models import AgentMessage, AgentRunResult, MessageRole, RunStatus, StopReason
 from app.core.config import Settings
 from app.domain.job_repository import ClaimedJob
 from app.workers.agent_worker import AgentWorker, RetryableJobError
@@ -147,6 +147,124 @@ def _result(*, status: RunStatus, reason: StopReason, final_response: str | None
         steps=2,
         final_response=final_response,
     )
+
+
+def test_result_summary_keeps_only_safe_routing_fields_from_terminal_tool_data() -> None:
+    result = AgentRunResult(
+        status=RunStatus.COMPLETED,
+        reason=StopReason.EXECUTOR_STOPPED,
+        messages=(
+            AgentMessage(
+                role=MessageRole.TOOL,
+                tool_result={
+                    "status": "awaiting_input",
+                    "reason": "document_unreadable",
+                    "missing_required_fields": ["valid_until", "origin"],
+                    "source": "must not persist",
+                    "document": "must not persist",
+                    "proposal": {"confidence": 0.99},
+                    "source_excerpt": "must not persist",
+                },
+            ),
+        ),
+        steps=2,
+        final_response="document_unreadable",
+    )
+
+    summary = AgentWorker._result_summary(result)
+
+    assert set(summary) == {
+        "status",
+        "reason",
+        "steps",
+        "final_response",
+        "routing_status",
+        "routing_reason",
+        "missing_required_fields",
+    }
+    assert summary == {
+        "status": "completed",
+        "reason": "executor_stopped",
+        "steps": 2,
+        "final_response": "document_unreadable",
+        "routing_status": "awaiting_input",
+        "routing_reason": "document_unreadable",
+        "missing_required_fields": ["origin", "valid_until"],
+    }
+
+
+def test_result_summary_does_not_reuse_routing_data_before_none_tool_result() -> None:
+    result = AgentRunResult(
+        status=RunStatus.COMPLETED,
+        reason=StopReason.EXECUTOR_STOPPED,
+        messages=(
+            AgentMessage(
+                role=MessageRole.TOOL,
+                tool_result={
+                    "status": "awaiting_input",
+                    "reason": "missing_required_fields",
+                    "missing_required_fields": ["origin"],
+                },
+            ),
+            AgentMessage(role=MessageRole.TOOL, tool_result=None),
+        ),
+        steps=2,
+        final_response="tool_result_unavailable",
+    )
+
+    summary = AgentWorker._result_summary(result)
+
+    assert summary == {
+        "status": "completed",
+        "reason": "executor_stopped",
+        "steps": 2,
+        "final_response": "tool_result_unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_persist_result_redacts_document_response_from_job_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    claimed = replace(
+        _claimed(),
+        source_snapshot={
+            "channel": "email",
+            "subject": "Rate confirmation",
+            "body": "Rate confirmation document received.",
+            "document": {
+                "kind": "rate_confirmation",
+                "media_type": "text/plain",
+                "sha256": "a" * 64,
+                "parser_version": "rate_confirmation_document.v1",
+                "text": "secret document excerpt",
+            },
+        },
+    )
+    _FakeRepository.next_claimed = claimed
+    worker = AgentWorker(_SessionFactory(), settings=_settings())
+
+    await worker._persist_result(
+        claimed,
+        _result(
+            status=RunStatus.COMPLETED,
+            reason=StopReason.EXECUTOR_STOPPED,
+            final_response="secret document excerpt",
+        ),
+    )
+
+    repository = _FakeRepository.instances[-1]
+    succeeded = [entry for entry in repository.calls if entry[0] == "mark_succeeded"]
+    assert succeeded
+    summary = succeeded[-1][1][0][1]  # type: ignore[index]
+    assert summary == {
+        "status": "completed",
+        "reason": "executor_stopped",
+        "steps": 2,
+        "final_response": None,
+    }
+    assert "secret document excerpt" not in repr(summary)
 
 
 def _settings() -> Settings:

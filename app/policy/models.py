@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from uuid import UUID
 
 from app.agent import AgentProposal, ToolData
+from app.documents import NormalizedRateConfirmationDocument
 from app.tenants.config import RoutingDecision, RoutingStatus, TenantConfig
 
 
@@ -35,6 +38,36 @@ class TrustedSource:
     channel: str
     subject: str
     body: str
+    document: NormalizedRateConfirmationDocument | None = None
+
+
+def trusted_source_from_snapshot(value: object) -> TrustedSource:
+    """Decode the legacy or document-aware trusted source snapshot."""
+
+    if not isinstance(value, Mapping):
+        raise RuntimeError("source snapshot is invalid")
+    keys = set(value)
+    if keys not in (
+        {"channel", "subject", "body"},
+        {"channel", "subject", "body", "document"},
+    ):
+        raise RuntimeError("source snapshot is invalid")
+    if not all(isinstance(value[name], str) for name in ("channel", "subject", "body")):
+        raise RuntimeError("source snapshot is invalid")
+    document = None
+    if "document" in value:
+        try:
+            document = NormalizedRateConfirmationDocument.model_validate(
+                deepcopy(value["document"])
+            )
+        except Exception as error:
+            raise RuntimeError("source snapshot is invalid") from error
+    return TrustedSource(
+        channel=value["channel"],
+        subject=value["subject"],
+        body=value["body"],
+        document=document,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +91,7 @@ class PolicyInput:
     requires_complete_fields: bool
     registered_actions: frozenset[str]
     runtime: TrustedToolRuntimeContext
+    verified_present_fields: frozenset[str] | None = None
 
 
 @dataclass(frozen=True, slots=True)

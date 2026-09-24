@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -193,9 +193,15 @@ class AgentWorker:
         async with self._session_factory() as session:
             repository = JobRepository(session)
             if result.status == RunStatus.COMPLETED:
+                summary = self._result_summary(result)
+                if "document" in claimed.source_snapshot:
+                    # Provider rationale can repeat source text. Keep the
+                    # durable document outcome to the server-owned routing
+                    # summary and retain the legacy key with a null value.
+                    summary["final_response"] = None
                 await repository.mark_succeeded(
                     claimed.id,
-                    self._result_summary(result),
+                    summary,
                     now=now,
                     tenant_id=claimed.tenant_id,
                     attempt_count=claimed.attempt_count,
@@ -272,12 +278,32 @@ class AgentWorker:
 
     @staticmethod
     def _result_summary(result: AgentRunResult) -> dict[str, object]:
-        return {
+        summary: dict[str, object] = {
             "status": result.status.value,
             "reason": result.reason.value,
             "steps": result.steps,
             "final_response": result.final_response,
         }
+        for message in reversed(result.messages):
+            if message.role.value != "tool":
+                continue
+            data = message.tool_result
+            if data is None or not isinstance(data, Mapping):
+                break
+            status = data.get("status")
+            reason = data.get("reason")
+            missing = data.get("missing_required_fields")
+            if (
+                isinstance(status, str)
+                and isinstance(reason, str)
+                and isinstance(missing, list)
+                and all(isinstance(item, str) for item in missing)
+            ):
+                summary["routing_status"] = status
+                summary["routing_reason"] = reason
+                summary["missing_required_fields"] = sorted(missing)
+            break
+        return summary
 
     def _retry_delay(self, attempt_count: int) -> float:
         index = max(0, min(attempt_count - 1, len(RETRY_DELAYS_SECONDS) - 1))

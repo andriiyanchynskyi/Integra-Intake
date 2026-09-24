@@ -13,6 +13,7 @@ dependencies = [
     "PyYAML>=6.0",
     "httpx>=0.28",
     "structlog>=24.4",
+    "pypdf>=5.0",
 ]
 
 [project.optional-dependencies]

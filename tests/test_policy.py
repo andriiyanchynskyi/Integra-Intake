@@ -6,6 +6,11 @@ from uuid import UUID
 import pytest
 
 from app.agent.models import AgentProposal, ProposalPriority
+from app.documents import (
+    DocumentMediaType,
+    DocumentNormalizer,
+    RateConfirmationDocumentInput,
+)
 from app.policy import (
     PolicyEngine,
     PolicyInput,
@@ -55,6 +60,40 @@ def tenant_config(profile_data: dict[str, object]) -> TenantConfig:
     return TenantConfig.model_validate(profile_data)
 
 
+@pytest.fixture
+def document_tenant_config(profile_data: dict[str, object]) -> TenantConfig:
+    profile = deepcopy(profile_data)
+    profile["intake_types"].append(  # type: ignore[union-attr]
+        {
+            "name": "rate_confirmation",
+            "description": "A freight rate confirmation document",
+            "required_fields": ["summary"],
+        }
+    )
+    return TenantConfig.model_validate(profile)
+
+
+def make_document(
+    *,
+    text: str | None = "Summary: Customer request",
+    content: bytes | None = None,
+    media_type: DocumentMediaType = DocumentMediaType.TEXT,
+):
+    payload: dict[str, object] = {
+        "channel": "email",
+        "subject": "Rate confirmation",
+        "body": "Please process this document.",
+        "media_type": media_type,
+    }
+    if text is not None:
+        payload["text"] = text
+    if content is not None:
+        payload["content"] = content
+    return DocumentNormalizer().normalize(
+        RateConfirmationDocumentInput.model_validate(payload)
+    )
+
+
 def make_proposal(
     *,
     intake_type: str | None = "request",
@@ -95,6 +134,7 @@ def make_runtime(
     tenant_config: TenantConfig,
     *,
     safety_or_legal_risk: bool = False,
+    document=None,
 ) -> TrustedToolRuntimeContext:
     return TrustedToolRuntimeContext(
         tenant_id=UUID("00000000-0000-0000-0000-000000000001"),
@@ -103,6 +143,7 @@ def make_runtime(
             channel="email",
             subject="Customer request",
             body="Please help with this request.",
+            document=document,
         ),
         risk_signals=RiskSignals(safety_or_legal_risk=safety_or_legal_risk),
     )
@@ -116,6 +157,8 @@ def evaluate(
     requires_complete_fields: bool = True,
     registered_actions: frozenset[str] | None = None,
     safety_or_legal_risk: bool = False,
+    document=None,
+    verified_present_fields: frozenset[str] | None = None,
 ):
     return PolicyEngine().evaluate(
         PolicyInput(
@@ -136,7 +179,9 @@ def evaluate(
             runtime=make_runtime(
                 tenant_config,
                 safety_or_legal_risk=safety_or_legal_risk,
+                document=document,
             ),
+            verified_present_fields=verified_present_fields,
         )
     )
 
@@ -388,6 +433,97 @@ def test_complete_create_case_is_ready_and_allowed(
         status=RoutingStatus.READY,
         decision=RoutingDecision.ALLOW,
         reason="action_allowed",
+    )
+
+
+def test_document_policy_accepts_server_verified_present_fields(
+    document_tenant_config: TenantConfig,
+) -> None:
+    outcome = evaluate(
+        document_tenant_config,
+        make_proposal(intake_type="rate_confirmation"),
+        action="create_case",
+        document=make_document(),
+        verified_present_fields=frozenset({"summary"}),
+    )
+
+    assert_outcome(
+        outcome,
+        status=RoutingStatus.READY,
+        decision=RoutingDecision.ALLOW,
+        reason="action_allowed",
+    )
+
+
+def test_document_policy_recomputes_missing_fields_from_verified_candidates(
+    document_tenant_config: TenantConfig,
+) -> None:
+    outcome = evaluate(
+        document_tenant_config,
+        make_proposal(
+            intake_type="rate_confirmation",
+            field_names=("summary",),
+            missing_required_fields=[],
+        ),
+        action="create_case",
+        document=make_document(),
+        verified_present_fields=frozenset(),
+    )
+
+    assert_outcome(
+        outcome,
+        status=RoutingStatus.AWAITING_INPUT,
+        decision=RoutingDecision.DENY,
+        reason="missing_required_fields",
+        missing=("summary",),
+    )
+
+
+def test_unreadable_document_has_server_owned_awaiting_input_outcome(
+    document_tenant_config: TenantConfig,
+) -> None:
+    unreadable = make_document(
+        media_type=DocumentMediaType.PDF,
+        text=None,
+        content=b"malformed-rate-confirmation",
+    )
+
+    outcome = evaluate(
+        document_tenant_config,
+        make_proposal(intake_type="rate_confirmation"),
+        action="create_case",
+        document=unreadable,
+        verified_present_fields=frozenset({"summary"}),
+    )
+
+    assert_outcome(
+        outcome,
+        status=RoutingStatus.AWAITING_INPUT,
+        decision=RoutingDecision.DENY,
+        reason="document_unreadable",
+        missing=("summary",),
+    )
+
+
+def test_document_injection_signal_retains_existing_risk_precedence(
+    document_tenant_config: TenantConfig,
+) -> None:
+    outcome = evaluate(
+        document_tenant_config,
+        make_proposal(
+            intake_type="rate_confirmation",
+            injection=True,
+        ),
+        action="create_case",
+        document=make_document(),
+        verified_present_fields=frozenset({"summary"}),
+    )
+
+    assert_outcome(
+        outcome,
+        status=RoutingStatus.URGENT,
+        decision=RoutingDecision.NEEDS_APPROVAL,
+        reason="safety_or_legal_risk",
     )
 
 

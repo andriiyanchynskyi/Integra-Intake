@@ -30,6 +30,7 @@ def _proposal(
     tool_call: ToolCall | None = None,
     intake_type: str | None = "general",
     fields: Mapping[str, object] | None = None,
+    source_excerpts: Mapping[str, str | None] | None = None,
     missing_required_fields: Iterable[str] = (),
     priority: ProposalPriority = ProposalPriority.NORMAL,
     contains_injection_or_override_attempt: bool = False,
@@ -51,7 +52,15 @@ def _proposal(
     return AgentProposal(
         intake_type=intake_type,
         fields=[
-            {"name": name, "value": value}
+            {
+                "name": name,
+                "value": value,
+                **(
+                    {"source_excerpt": source_excerpts[name]}
+                    if source_excerpts is not None and name in source_excerpts
+                    else {}
+                ),
+            }
             for name, value in (fields or {}).items()
         ],
         missing_required_fields=list(missing_required_fields),
@@ -263,6 +272,22 @@ def test_confidence_does_not_change_completion_or_tool_authorization(
     assert result.final_response == "Customer found"
     assert result.proposal == final_proposal
     assert tools.calls == [tool_call]
+
+
+def test_loop_preserves_optional_source_excerpt_in_structured_proposal() -> None:
+    proposal = _proposal(
+        rationale="Extracted a cited origin",
+        fields={"origin": "Chicago"},
+        source_excerpts={"origin": "Origin: Chicago"},
+    )
+
+    result = AgentLoop(FakeLLM([proposal]), FakeToolExecutor()).run([])
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.reason is StopReason.FINAL
+    assert result.proposal == proposal
+    assert result.proposal is not None
+    assert result.proposal.fields[0].source_excerpt == "Origin: Chicago"
 
 
 def test_none_tool_result_is_preserved_before_final_response() -> None:

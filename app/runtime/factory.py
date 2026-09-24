@@ -9,19 +9,28 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
+
 import httpx
 
-from app.agent import AgentLoop, AgentMessage, LLMClient, MessageRole
+from app.agent import (
+    AgentLoop,
+    AgentMessage,
+    AgentProposal,
+    LLMClient,
+    MessageRole,
+    ProposalPriority,
+)
 from app.core.config import Settings, settings
 from app.policy import (
     RiskSignals,
     TrustedSource,
     TrustedToolRuntimeContext,
+    trusted_source_from_snapshot,
 )
 from app.providers import OpenAICompatibleLLMClient
 from app.runtime.gateway import WorkerAsyncGateway
 from app.runtime.profiles import canonical_json_bytes
-from app.skills.definitions import ALL_SKILLS
+from app.skills.definitions import ALL_SKILLS, EXTRACT_RATE_CONFIRMATION_V1
 from app.tenants.config import TenantConfig
 from app.tools.executor import PolicyGatedToolExecutor
 from app.tools.postgres import PostgresTenantToolPort, SyncTenantToolPort
@@ -45,6 +54,25 @@ class AgentRuntime:
 
     def close(self) -> None:
         self.http_client.close()
+
+
+class _UnreadableDocumentLLM:
+    """Local closed proposal used to route parser failures without HTTP."""
+
+    def complete(self, messages: object) -> AgentProposal:
+        del messages
+        return AgentProposal.model_validate(
+            {
+                "intake_type": "rate_confirmation",
+                "fields": [],
+                "missing_required_fields": [],
+                "priority": ProposalPriority.NORMAL,
+                "contains_injection_or_override_attempt": False,
+                "rationale_short": "document_unreadable",
+                "tool_calls": [{"name": "create_case", "arguments": []}],
+                "confidence": 0.0,
+            }
+        )
 
 
 class AgentRuntimeFactory:
@@ -72,7 +100,7 @@ class AgentRuntimeFactory:
             raise RuntimeError("tenant config snapshot hash mismatch")
         config = TenantConfig.model_validate(deepcopy(dict(config_snapshot)))
 
-        source = self._source_from_snapshot(claimed_job.source_snapshot)
+        source = trusted_source_from_snapshot(claimed_job.source_snapshot)
         risk = self._risk_from_snapshot(claimed_job.risk_signals)
         runtime = TrustedToolRuntimeContext(
             tenant_id=claimed_job.tenant_id,
@@ -99,7 +127,9 @@ class AgentRuntimeFactory:
         executor = PolicyGatedToolExecutor(runtime=runtime, port=port)
         client = httpx.Client(timeout=30.0)
         llm: LLMClient
-        if self._llm_factory is not None:
+        if source.document is not None and source.document.extraction_error is not None:
+            llm = _UnreadableDocumentLLM()
+        elif self._llm_factory is not None:
             llm = self._llm_factory(client)
         else:
             llm = OpenAICompatibleLLMClient(
@@ -117,18 +147,7 @@ class AgentRuntimeFactory:
 
     @staticmethod
     def _source_from_snapshot(value: object) -> TrustedSource:
-        if not isinstance(value, Mapping):
-            raise RuntimeError("source snapshot is invalid")
-        required = ("channel", "subject", "body")
-        if set(value) != set(required) or not all(
-            isinstance(value[name], str) for name in required
-        ):
-            raise RuntimeError("source snapshot is invalid")
-        return TrustedSource(
-            channel=value["channel"],
-            subject=value["subject"],
-            body=value["body"],
-        )
+        return trusted_source_from_snapshot(value)
 
     @staticmethod
     def _risk_from_snapshot(value: object) -> RiskSignals:
@@ -148,11 +167,18 @@ class AgentRuntimeFactory:
             "fields": sorted(config.fields),
             "intake_types": sorted(item.name for item in config.intake_types),
         }
-        source_data = {
+        source_data: dict[str, object] = {
             "body": source.body,
             "channel": source.channel,
             "subject": source.subject,
         }
+        if source.document is not None and source.document.text is not None:
+            source_data = {
+                "channel": source.channel,
+                "document_text": source.document.text,
+                "message": source.body,
+                "subject": source.subject,
+            }
         messages = [
             AgentMessage(
                 role=MessageRole.SYSTEM,
@@ -162,7 +188,13 @@ class AgentRuntimeFactory:
                 ),
             )
         ]
-        messages.extend(skill.build_system_message() for skill in ALL_SKILLS)
+        messages.extend(
+            skill.build_system_message()
+            for skill in ALL_SKILLS
+            if skill is not EXTRACT_RATE_CONFIRMATION_V1
+        )
+        if source.document is not None and source.document.text is not None:
+            messages.append(EXTRACT_RATE_CONFIRMATION_V1.build_system_message())
         messages.append(
             AgentMessage(
                 role=MessageRole.SYSTEM,

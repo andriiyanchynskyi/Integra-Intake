@@ -7,6 +7,7 @@ from app.policy.models import (
     RiskSignals,
     TrustedSource,
     TrustedToolRuntimeContext,
+    trusted_source_from_snapshot,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "RiskSignals",
     "TrustedSource",
     "TrustedToolRuntimeContext",
+    "trusted_source_from_snapshot",
 ]

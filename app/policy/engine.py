@@ -7,6 +7,7 @@ from app.policy.models import (
     proposal_value_is_present,
 )
 from app.tenants.routing import RoutingAssessment, TenantRouter
+from app.tenants.config import RoutingDecision, RoutingStatus
 
 
 class PolicyEngine:
@@ -14,10 +15,41 @@ class PolicyEngine:
 
     def evaluate(self, value: PolicyInput) -> PolicyOutcome:
         known_fields = set(value.runtime.tenant_config.fields)
+        document = value.runtime.source.document if value.runtime.source else None
+        if document is not None and document.extraction_error is not None:
+            if not (
+                value.runtime.risk_signals.safety_or_legal_risk
+                or value.proposal.contains_injection_or_override_attempt
+            ):
+                intake = next(
+                    (
+                        item
+                        for item in value.runtime.tenant_config.intake_types
+                        if item.name == "rate_confirmation"
+                    ),
+                    None,
+                )
+                return PolicyOutcome(
+                    decision=RoutingDecision.DENY,
+                    status=RoutingStatus.AWAITING_INPUT,
+                    reason="document_unreadable",
+                    missing_required_fields=(
+                        tuple(sorted(intake.required_fields)) if intake else ()
+                    ),
+                )
         present_fields = frozenset(
-            item.name
-            for item in value.proposal.fields
-            if item.name in known_fields and proposal_value_is_present(item.value)
+            item
+            for item in (
+                value.verified_present_fields
+                if value.verified_present_fields is not None
+                else (
+                    item.name
+                    for item in value.proposal.fields
+                    if item.name in known_fields
+                    and proposal_value_is_present(item.value)
+                )
+            )
+            if item in known_fields
         )
         assessment = RoutingAssessment(
             intake_type=value.proposal.intake_type or "",

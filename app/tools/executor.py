@@ -35,11 +35,29 @@ def _known_proposal_fields(
     proposal: AgentProposal, runtime: TrustedToolRuntimeContext
 ) -> dict[str, ToolData]:
     known = set(runtime.tenant_config.fields)
+    document = runtime.source.document if runtime.source else None
     return {
         item.name: deepcopy(item.value)
         for item in proposal.fields
         if item.name in known and proposal_value_is_present(item.value)
+        and (
+            document is None
+            or (
+                document.text is not None
+                and item.source_excerpt is not None
+                and bool(item.source_excerpt.strip())
+                and item.source_excerpt in document.text
+            )
+        )
     }
+
+
+def _verified_present_fields(
+    proposal: AgentProposal, runtime: TrustedToolRuntimeContext
+) -> frozenset[str] | None:
+    if runtime.source is None or runtime.source.document is None:
+        return None
+    return frozenset(_known_proposal_fields(proposal, runtime))
 
 
 def _customer_data(summary: CustomerSummary | None) -> ToolData:
@@ -140,6 +158,9 @@ class PolicyGatedToolExecutor:
                 ),
                 registered_actions=frozenset(self._definitions),
                 runtime=self._runtime,
+                verified_present_fields=_verified_present_fields(
+                    proposal, self._runtime
+                ),
             )
         )
         if policy.decision is not RoutingDecision.ALLOW:
@@ -273,19 +294,15 @@ class PolicyGatedToolExecutor:
         ):
             raise _ToolExecutionStop("case_not_found")
         contact_definition = runtime.tenant_config.fields.get("contact")
-        recipient_value = next(
-            (
-                item.value
-                for item in proposal.fields
-                if (
-                    item.name == "contact"
-                    and contact_definition is not None
-                    and contact_definition.type is FieldType.EMAIL
-                    and isinstance(item.value, str)
-                )
-            ),
-            None,
-        )
+        accepted_fields = _known_proposal_fields(proposal, runtime)
+        recipient_value: str | None = None
+        contact_value = accepted_fields.get("contact")
+        if (
+            contact_definition is not None
+            and contact_definition.type is FieldType.EMAIL
+            and isinstance(contact_value, str)
+        ):
+            recipient_value = contact_value
         missing = ", ".join(_recomputed_missing_required_fields(proposal, runtime))
         body = proposal.rationale_short
         if missing:

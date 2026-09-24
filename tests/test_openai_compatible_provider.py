@@ -102,7 +102,12 @@ def test_valid_structured_proposal_uses_openai_compatible_contract() -> None:
             schema["properties"]["fields"]["items"], schema
         )
         assert set(fields_schema["required"]) == {"name", "value"}
-        assert set(fields_schema["properties"]) == {"name", "value"}
+        assert set(fields_schema["properties"]) == {
+            "name",
+            "value",
+            "source_excerpt",
+        }
+        assert "source_excerpt" not in fields_schema["required"]
         tool_calls_schema = _resolve_schema_ref(
             schema["properties"]["tool_calls"]["items"], schema
         )
@@ -132,7 +137,7 @@ def test_valid_structured_proposal_uses_openai_compatible_contract() -> None:
     assert isinstance(proposal, AgentProposal)
     assert proposal.intake_type == "freight"
     assert proposal.model_dump(mode="json")["fields"] == [
-        {"name": "reference", "value": "REF-123"}
+        {"name": "reference", "value": "REF-123", "source_excerpt": None}
     ]
     assert proposal.missing_required_fields == ["weight"]
     assert proposal.priority is ProposalPriority.HIGH
@@ -140,7 +145,7 @@ def test_valid_structured_proposal_uses_openai_compatible_contract() -> None:
     assert proposal.rationale_short == "The shipment needs a weight before routing."
     assert proposal.tool_calls[0].name == "lookup_customer"
     assert proposal.tool_calls[0].model_dump(mode="json")["arguments"] == [
-        {"name": "customer_id", "value": "cust-1"}
+        {"name": "customer_id", "value": "cust-1", "source_excerpt": None}
     ]
     assert proposal.tool_call is not None
     assert proposal.tool_call.arguments == {"customer_id": "cust-1"}

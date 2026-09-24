@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 import inspect
 from typing import Any
@@ -20,6 +20,11 @@ from app.agent import (
     ProposalValue,
     ToolCall,
     ToolExecutionResult,
+)
+from app.documents import (
+    DocumentMediaType,
+    DocumentNormalizer,
+    RateConfirmationDocumentInput,
 )
 from app.policy import RiskSignals, TrustedSource, TrustedToolRuntimeContext
 from app.tenants.config import ActionRule, TenantConfig
@@ -121,10 +126,24 @@ def tenant_config() -> TenantConfig:
     )
 
 
+@pytest.fixture
+def document_tenant_config(tenant_config: TenantConfig) -> TenantConfig:
+    profile = tenant_config.model_dump(mode="json")
+    profile["intake_types"].append(  # type: ignore[union-attr]
+        {
+            "name": "rate_confirmation",
+            "description": "A freight rate confirmation document",
+            "required_fields": ["summary"],
+        }
+    )
+    return TenantConfig.model_validate(profile)
+
+
 def make_proposal(
     *,
     intake_type: str | None = "request",
     fields: Iterable[tuple[str, Any]] = (("summary", "Customer request"),),
+    source_excerpts: Mapping[str, str | None] | None = None,
     tool_name: str | None = None,
     tool_arguments: Iterable[tuple[str, Any]] = (),
     injection: bool = False,
@@ -146,7 +165,16 @@ def make_proposal(
         {
             "intake_type": intake_type,
             "fields": [
-                {"name": name, "value": value} for name, value in fields
+                {
+                    "name": name,
+                    "value": value,
+                    **(
+                        {"source_excerpt": source_excerpts[name]}
+                        if source_excerpts is not None and name in source_excerpts
+                        else {}
+                    ),
+                }
+                for name, value in fields
             ],
             "missing_required_fields": list(missing_required_fields),
             "priority": ProposalPriority.NORMAL,
@@ -175,6 +203,27 @@ def make_runtime(
             body="Trusted source body",
         ),
         risk_signals=RiskSignals(safety_or_legal_risk=risk),
+    )
+
+
+def make_document(
+    *,
+    text: str | None = "Summary: Customer request\nContact: customer@example.com",
+    content: bytes | None = None,
+    media_type: DocumentMediaType = DocumentMediaType.TEXT,
+):
+    payload: dict[str, object] = {
+        "channel": "email",
+        "subject": "Rate confirmation",
+        "body": "Please process this document.",
+        "media_type": media_type,
+    }
+    if text is not None:
+        payload["text"] = text
+    if content is not None:
+        payload["content"] = content
+    return DocumentNormalizer().normalize(
+        RateConfirmationDocumentInput.model_validate(payload)
     )
 
 
@@ -330,6 +379,146 @@ def test_create_case_uses_trusted_source_and_only_declared_fields(
         "summary": "declared summary",
         "contact": "customer@example.com",
     }
+
+
+def test_document_candidates_with_exact_verified_excerpts_can_create_case(
+    tenant_config: TenantConfig,
+) -> None:
+    port = SpyPort()
+    source = TrustedSource(
+        channel="trusted-channel",
+        subject="trusted-subject",
+        body="trusted-body",
+        document=make_document(),
+    )
+    executor, _ = build_executor(tenant_config, port, source=source)
+    proposal = make_proposal(
+        fields=(
+            ("summary", "Customer request"),
+            ("contact", "customer@example.com"),
+            ("not_a_profile_field", "must not persist"),
+        ),
+        source_excerpts={
+            "summary": "Summary: Customer request",
+            "contact": "Contact: customer@example.com",
+            "not_a_profile_field": "Customer request",
+        },
+    )
+
+    created = executor.execute(proposal, ToolCall(name="create_case", arguments={}))
+
+    assert created.data is not None
+    case_id = UUID(created.data["id"])
+    assert port.calls == ["create_case"]
+    assert port.cases[case_id].extracted_fields == {
+        "summary": "Customer request",
+        "contact": "customer@example.com",
+    }
+
+
+def test_document_candidates_without_matching_excerpts_await_input_without_mutation(
+    tenant_config: TenantConfig,
+) -> None:
+    port = SpyPort()
+    source = TrustedSource(
+        channel="trusted-channel",
+        subject="trusted-subject",
+        body="trusted-body",
+        document=make_document(),
+    )
+    executor, _ = build_executor(tenant_config, port, source=source)
+    proposal = make_proposal(
+        fields=(
+            ("summary", "Customer request"),
+            ("contact", "   "),
+            ("not_a_profile_field", "attacker value"),
+        ),
+        source_excerpts={
+            "summary": "not present in the trusted document",
+            "contact": "Contact: customer@example.com",
+            "not_a_profile_field": "Summary: Customer request",
+        },
+    )
+
+    result = executor.execute(proposal, ToolCall(name="create_case", arguments={}))
+
+    assert result.data == {
+        "decision": "deny",
+        "status": "awaiting_input",
+        "reason": "missing_required_fields",
+        "missing_required_fields": ["summary"],
+    }
+    assert result.continue_run is False
+    assert result.final_response == "missing_required_fields"
+    assert port.calls == []
+    assert port.approval_requests == []
+    assert port.cases == {}
+
+
+def test_document_injection_signal_preserves_review_precedence(
+    tenant_config: TenantConfig,
+) -> None:
+    port = SpyPort()
+    source = TrustedSource(
+        channel="trusted-channel",
+        subject="trusted-subject",
+        body="trusted-body",
+        document=make_document(),
+    )
+    executor, _ = build_executor(tenant_config, port, source=source)
+    proposal = make_proposal(
+        injection=True,
+        source_excerpts={"summary": "Summary: Customer request"},
+    )
+
+    result = executor.execute(proposal, ToolCall(name="create_case", arguments={}))
+
+    assert result.data == {
+        "decision": "needs_approval",
+        "status": "urgent",
+        "reason": "safety_or_legal_risk",
+        "missing_required_fields": [],
+        "approval_id": "00000000-0000-0000-0000-000000000008",
+    }
+    assert result.continue_run is False
+    assert result.final_response == "approval_requested"
+    assert port.calls == []
+    assert port.cases == {}
+    assert len(port.approval_requests) == 1
+
+
+def test_unreadable_document_awaits_input_without_handler_or_approval(
+    document_tenant_config: TenantConfig,
+) -> None:
+    port = SpyPort()
+    source = TrustedSource(
+        channel="trusted-channel",
+        subject="trusted-subject",
+        body="trusted-body",
+        document=make_document(
+            media_type=DocumentMediaType.PDF,
+            text=None,
+            content=b"malformed-rate-confirmation",
+        ),
+    )
+    executor, _ = build_executor(document_tenant_config, port, source=source)
+
+    result = executor.execute(
+        make_proposal(source_excerpts={"summary": "Summary: Customer request"}),
+        ToolCall(name="create_case", arguments={}),
+    )
+
+    assert result.data == {
+        "decision": "deny",
+        "status": "awaiting_input",
+        "reason": "document_unreadable",
+        "missing_required_fields": ["summary"],
+    }
+    assert result.continue_run is False
+    assert result.final_response == "document_unreadable"
+    assert port.calls == []
+    assert port.approval_requests == []
+    assert port.cases == {}
 
 
 def test_create_case_rejects_malicious_source_arguments_and_extra_keys(

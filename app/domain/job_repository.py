@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import AgentJob, IdempotencyRecord
+from app.policy.models import TrustedSource
 from app.runtime.profiles import ResolvedTenantProfile
 
 if TYPE_CHECKING:
@@ -57,11 +58,7 @@ class JobRepository:
     ) -> AgentJob:
         job = AgentJob(
             tenant_id=command.tenant_id,
-            source_snapshot={
-                "channel": command.source.channel,
-                "subject": command.source.subject,
-                "body": command.source.body,
-            },
+            source_snapshot=self._source_snapshot(command.source),
             tenant_config_snapshot=deepcopy(profile.snapshot),
             tenant_config_sha256=profile.sha256,
             risk_signals={
@@ -70,6 +67,17 @@ class JobRepository:
         )
         self.session.add(job)
         return job
+
+    @staticmethod
+    def _source_snapshot(source: TrustedSource) -> dict[str, object]:
+        snapshot: dict[str, object] = {
+            "channel": source.channel,
+            "subject": source.subject,
+            "body": source.body,
+        }
+        if source.document is not None:
+            snapshot["document"] = source.document.model_dump(mode="json")
+        return snapshot
 
     async def create_idempotency_record(
         self,

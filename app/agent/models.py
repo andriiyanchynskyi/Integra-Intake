@@ -197,6 +197,14 @@ type ProposalValueData = ProposalScalar | list[ProposalScalar]
 class ProposalValue(_StrictProposalModel):
     name: Annotated[str, Field(min_length=1)]
     value: ProposalValueData
+    source_excerpt: Annotated[str, Field(min_length=1, max_length=500)] | None = None
+
+    @field_validator("source_excerpt")
+    @classmethod
+    def require_non_blank_excerpt(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("source_excerpt must not be blank")
+        return value
 
     @field_validator("value")
     @classmethod
