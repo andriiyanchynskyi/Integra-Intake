@@ -1,0 +1,7 @@
+Synthetic incomplete rate confirmation
+Origin: Chicago
+Destination: Detroit
+Pickup window: 2026-10-04T09:00:00Z
+Commodity: appliances
+Contact: ops@example.test
+Quoted rate: 2500 USD

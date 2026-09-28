@@ -126,23 +126,26 @@ class AgentRuntimeFactory:
         port = SyncTenantToolPort(gateway, async_port)
         executor = PolicyGatedToolExecutor(runtime=runtime, port=port)
         client = httpx.Client(timeout=30.0)
-        llm: LLMClient
-        if source.document is not None and source.document.extraction_error is not None:
-            llm = _UnreadableDocumentLLM()
-        elif self._llm_factory is not None:
-            llm = self._llm_factory(client)
-        else:
-            llm = OpenAICompatibleLLMClient(
-                base_url=self._settings.llm_base_url,
-                api_key=self._settings.llm_api_key.get_secret_value(),
-                model=self._settings.openai_model,
-                client=client,
-            )
-        messages = self._initial_messages(config, source)
+        llm = self.create_llm(source, client)
+        messages = self.initial_messages(config, source)
         return AgentRuntime(
             loop=AgentLoop(llm, executor),
             initial_messages=messages,
             http_client=client,
+        )
+
+    def create_llm(self, source: TrustedSource, client: httpx.Client) -> LLMClient:
+        """Select the local parser-failure fallback or configured provider."""
+
+        if source.document is not None and source.document.extraction_error is not None:
+            return _UnreadableDocumentLLM()
+        if self._llm_factory is not None:
+            return self._llm_factory(client)
+        return OpenAICompatibleLLMClient(
+            base_url=self._settings.llm_base_url,
+            api_key=self._settings.llm_api_key.get_secret_value(),
+            model=self._settings.openai_model,
+            client=client,
         )
 
     @staticmethod
@@ -159,7 +162,7 @@ class AgentRuntimeFactory:
         return RiskSignals(safety_or_legal_risk=signal)
 
     @staticmethod
-    def _initial_messages(
+    def initial_messages(
         config: TenantConfig, source: TrustedSource
     ) -> tuple[AgentMessage, ...]:
         catalog = {
@@ -210,6 +213,14 @@ class AgentRuntimeFactory:
             )
         )
         return tuple(messages)
+
+    @staticmethod
+    def _initial_messages(
+        config: TenantConfig, source: TrustedSource
+    ) -> tuple[AgentMessage, ...]:
+        """Backward-compatible alias for existing internal callers/tests."""
+
+        return AgentRuntimeFactory.initial_messages(config, source)
 
 
 __all__ = ["AgentRuntime", "AgentRuntimeFactory"]

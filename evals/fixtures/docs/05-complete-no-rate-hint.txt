@@ -1,0 +1,9 @@
+Synthetic rate confirmation without optional rate hint
+Origin: Dallas
+Destination: Houston
+Equipment: reefer
+Pickup window: 2026-10-03T07:30:00-05:00
+Commodity: produce
+Contact: fleet@example.test
+Quoted rate: 2800 USD
+Valid until: 2026-10-02T16:00:00-05:00

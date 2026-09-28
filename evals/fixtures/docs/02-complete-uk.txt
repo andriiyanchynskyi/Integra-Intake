@@ -1,0 +1,9 @@
+Синтетичне підтвердження ставки 02
+Origin: Київ
+Destination: Львів
+Equipment: тентований тягач
+Pickup window: 2026-10-02T08:00:00+03:00
+Commodity: меблі
+Contact: dispatch@example.test
+Quoted rate: 3100 USD
+Valid until: 2026-10-01T18:00:00+03:00

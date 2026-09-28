@@ -1,0 +1,86 @@
+%PDF-1.3
+%‚„œ”
+1 0 obj
+<<
+/Producer (pypdf)
+>>
+endobj
+2 0 obj
+<<
+/Type /Pages
+/Count 1
+/Kids [ 4 0 R ]
+>>
+endobj
+3 0 obj
+<<
+/Type /Catalog
+/Pages 2 0 R
+>>
+endobj
+4 0 obj
+<<
+/Type /Page
+/Resources <<
+/Font <<
+/F1 5 0 R
+>>
+>>
+/MediaBox [ 0.0 0.0 612 792 ]
+/Parent 2 0 R
+/Contents 6 0 R
+>>
+endobj
+5 0 obj
+<<
+/Type /Font
+/Subtype /Type1
+/BaseFont /Helvetica
+>>
+endobj
+6 0 obj
+<<
+/Length 370
+>>
+stream
+BT
+/F1 12 Tf
+72 720 Td
+(Synthetic rate confirmation) Tj
+0 -18 Td
+(Origin: Phoenix) Tj
+0 -18 Td
+(Destination: Denver) Tj
+0 -18 Td
+(Equipment: dry_van) Tj
+0 -18 Td
+(Pickup window: 2026-10-05T09:00:00Z) Tj
+0 -18 Td
+(Commodity: electronics) Tj
+0 -18 Td
+(Contact: carrier@example.test) Tj
+0 -18 Td
+(Quoted rate: 2950 USD) Tj
+0 -18 Td
+(Valid until: 2026-10-04T17:00:00Z) Tj
+ET
+endstream
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000015 00000 n 
+0000000054 00000 n 
+0000000113 00000 n 
+0000000162 00000 n 
+0000000294 00000 n 
+0000000364 00000 n 
+trailer
+<<
+/Size 7
+/Root 3 0 R
+/Info 1 0 R
+>>
+startxref
+785
+%%EOF

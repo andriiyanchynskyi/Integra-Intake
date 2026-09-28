@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install package
+        run: python -m pip install -e ".[dev]"
+      - name: Check whitespace
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}...${{ github.sha }}"
+          elif [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            git diff --check HEAD^ HEAD
+          else
+            git diff --check "${{ github.event.before }}...${{ github.sha }}"
+          fi
+      - name: Run unit and API tests
+        run: pytest -q
+      - name: Run deterministic freight evals
+        run: pytest evals/test_freight.py -q --freight-eval-report "${{ runner.temp }}/freight-evals.json"
+      - name: Write freight eval summary
+        if: always()
+        run: python -m evals.freight.reporting --report "${{ runner.temp }}/freight-evals.json" --github-summary "$GITHUB_STEP_SUMMARY"
+      - name: Upload freight eval report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: freight-evals
+          path: ${{ runner.temp }}/freight-evals.json
+          if-no-files-found: ignore
+          retention-days: 14

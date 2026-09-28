@@ -7,6 +7,10 @@ dist/
 *.log
 ROADMAP.md
 docs/
+# The deterministic freight eval corpus reuses these checked-in document
+# fixtures; keep the broad historical docs/ ignore rule elsewhere.
+!evals/fixtures/docs/
+!evals/fixtures/docs/**
 integra_intake.egg-info/
 .superpowers/
 AGENTS.md

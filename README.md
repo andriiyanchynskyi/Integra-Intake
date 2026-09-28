@@ -249,6 +249,23 @@ PostgreSQL integration tests run only when an explicit reachable
 DATABASE_URL is supplied; otherwise they skip instead of pretending to be
 database evidence.
 
+### Deterministic freight evals
+
+Run the provider-free freight corpus with:
+
+~~~bash
+pytest evals/test_freight.py -q
+~~~
+
+The version-controlled dataset contains 40 core and 10 adversarial cases. Each
+case runs once (`k=1`) against scripted typed `AgentProposal` values and the
+current document extraction-error, signed webhook verification/mapping, loop,
+policy, tool, approval, idempotency, and tenant-isolation seams. The standard
+CI gate requires 100% pass rate; it does
+not measure live-model extraction, classification, or injection-detection
+quality. An optional `--freight-eval-report PATH` writes a sanitized JSON
+artifact containing only counts, case IDs, and mismatch codes.
+
 Before handoff, also run:
 
 ~~~bash
@@ -257,6 +274,6 @@ git diff --check
 
 ## Current boundaries
 
-The service does not include eval CI, production observability and traces, MCP,
+The service does not include production observability and traces, MCP,
 Linux/systemd operations, real email-provider OAuth or IMAP, outbound delivery,
 TMS/Odoo, cloud object storage, or production SaaS integrations.

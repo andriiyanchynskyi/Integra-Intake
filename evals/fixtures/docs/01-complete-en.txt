@@ -1,0 +1,9 @@
+Synthetic rate confirmation 01
+Origin: Chicago
+Destination: Detroit
+Equipment: dry_van
+Pickup window: 2026-10-01T09:00:00Z
+Commodity: appliances
+Contact: ops@example.test
+Quoted rate: 2500 USD
+Valid until: 2026-09-30T17:00:00Z

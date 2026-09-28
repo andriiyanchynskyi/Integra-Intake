@@ -1,0 +1,122 @@
+version: 1
+documents:
+  - id: complete-en
+    filename: 01-complete-en.txt
+    media_type: text/plain
+    intake_type: rate_confirmation
+    expected_extraction_error: null
+    expected_verified_fields:
+      - origin
+      - destination
+      - equipment
+      - pickup_window
+      - commodity
+      - contact
+      - quoted_rate
+      - valid_until
+    expected_missing_fields: []
+  - id: complete-uk
+    filename: 02-complete-uk.txt
+    media_type: text/plain
+    intake_type: rate_confirmation
+    expected_extraction_error: null
+    expected_verified_fields:
+      - origin
+      - destination
+      - equipment
+      - pickup_window
+      - commodity
+      - contact
+      - quoted_rate
+      - valid_until
+    expected_missing_fields: []
+  - id: complete-pdf
+    filename: 03-complete.pdf
+    media_type: application/pdf
+    intake_type: rate_confirmation
+    expected_extraction_error: null
+    expected_verified_fields:
+      - origin
+      - destination
+      - equipment
+      - pickup_window
+      - commodity
+      - contact
+      - quoted_rate
+      - valid_until
+    expected_missing_fields: []
+  - id: complete-two-page-pdf
+    filename: 04-complete-two-page.pdf
+    media_type: application/pdf
+    intake_type: rate_confirmation
+    expected_extraction_error: null
+    expected_verified_fields:
+      - origin
+      - destination
+      - equipment
+      - pickup_window
+      - commodity
+      - contact
+      - quoted_rate
+      - valid_until
+    expected_missing_fields: []
+  - id: complete-no-rate-hint
+    filename: 05-complete-no-rate-hint.txt
+    media_type: text/plain
+    intake_type: rate_confirmation
+    expected_extraction_error: null
+    expected_verified_fields:
+      - origin
+      - destination
+      - equipment
+      - pickup_window
+      - commodity
+      - contact
+      - quoted_rate
+      - valid_until
+    expected_missing_fields: []
+  - id: complete-injection-pdf
+    filename: 06-complete-injection.pdf
+    media_type: application/pdf
+    intake_type: rate_confirmation
+    expected_extraction_error: null
+    expected_verified_fields:
+      - origin
+      - destination
+      - equipment
+      - pickup_window
+      - commodity
+      - contact
+      - quoted_rate
+      - valid_until
+    expected_missing_fields: []
+  - id: incomplete
+    filename: 07-incomplete.txt
+    media_type: text/plain
+    intake_type: rate_confirmation
+    expected_extraction_error: null
+    expected_verified_fields:
+      - origin
+      - destination
+      - pickup_window
+      - commodity
+      - contact
+      - quoted_rate
+    expected_missing_fields:
+      - equipment
+      - valid_until
+  - id: malformed-pdf
+    filename: 08-malformed.pdf
+    media_type: application/pdf
+    intake_type: rate_confirmation
+    expected_extraction_error: pdf_malformed
+    expected_verified_fields: []
+    expected_missing_fields:
+      - origin
+      - destination
+      - equipment
+      - pickup_window
+      - commodity
+      - contact
+      - quoted_rate
+      - valid_until
