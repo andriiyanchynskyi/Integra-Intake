@@ -15,11 +15,21 @@ from app.tools.models import (
     UpdateCaseFieldsArgs,
 )
 from app.tools.ports import CustomerNotFoundError, TenantToolPort
+from app.tools.registry import (
+    ActionCapability,
+    ActionCapabilityUnavailable,
+    ActionRegistry,
+    BUILTIN_ACTION_REGISTRY,
+)
 
 __all__ = [
     "CreateCaseArgs",
     "CreateReplyDraftArgs",
     "ApprovalRequested",
+    "ActionCapability",
+    "ActionCapabilityUnavailable",
+    "ActionRegistry",
+    "BUILTIN_ACTION_REGISTRY",
     "CustomerNotFoundError",
     "CustomerLookupResult",
     "CustomerSummary",

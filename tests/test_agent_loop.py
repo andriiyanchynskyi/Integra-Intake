@@ -5,6 +5,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+from uuid import uuid4
 
 import pytest
 
@@ -22,6 +23,7 @@ from app.agent import (
     ToolData,
     ToolExecutionResult,
 )
+from app.observability import EventName, ObservationContext, RecordingObserver
 
 
 def _proposal(
@@ -94,6 +96,7 @@ class FakeToolExecutor:
     def __init__(self, results: Mapping[str, ToolData] | None = None) -> None:
         self.results = dict(results or {})
         self.calls: list[ToolCall] = []
+        self.definitions = {name: object() for name in self.results}
 
     def execute(
         self, proposal: AgentProposal, tool_call: ToolCall
@@ -636,3 +639,51 @@ def test_empty_proposal_fails_without_executing_a_tool() -> None:
             proposal=InvalidProposal(),
         ),
     )
+
+
+def test_loop_emits_safe_step_and_run_events_for_terminal_and_none_result_paths() -> None:
+    tool_call = ToolCall(name="find_customer")
+    observer = RecordingObserver()
+    context = ObservationContext(trace_id=uuid4())
+    result = AgentLoop(
+        FakeLLM(
+            [
+                _proposal(rationale="Looking up the note", tool_call=tool_call),
+                _proposal(rationale="No note exists"),
+            ]
+        ),
+        FakeToolExecutor({"find_customer": None}),
+        observer=observer,
+        context=context,
+    ).run([])
+
+    steps = [item for item in observer.events if item.event is EventName.AGENT_STEP_COMPLETED]
+    runs = [item for item in observer.events if item.event is EventName.AGENT_RUN_FINISHED]
+    assert [item.step for item in steps] == [1, 2]
+    assert steps[0].action_key == "find_customer"
+    assert steps[0].action_known is True
+    assert steps[1].action_key is None
+    assert steps[1].action_known is None
+    assert [item.trace_id for item in (*steps, *runs)] == [context.trace_id] * 3
+    assert len(runs) == 1
+    assert runs[0].stop_reason is StopReason.FINAL
+    assert runs[0].steps == result.steps == 2
+    assert all("No note exists" not in item.model_dump_json() for item in (*steps, *runs))
+
+
+def test_loop_observer_failure_does_not_change_business_result() -> None:
+    class FailingObserver:
+        def emit(self, event: object) -> None:
+            del event
+            raise RuntimeError("SOURCE_BODY_SECRET")
+
+    proposal = _proposal(rationale="Finished")
+    result = AgentLoop(
+        FakeLLM([proposal]),
+        FakeToolExecutor(),
+        observer=FailingObserver(),
+        context=ObservationContext(trace_id=uuid4()),
+    ).run([])
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.reason is StopReason.FINAL

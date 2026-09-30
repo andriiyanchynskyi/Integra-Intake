@@ -278,7 +278,14 @@ class FreightEvalCase(_EvalModel):
                 "approval_required",
                 "case_created",
             )
-            if any(getattr(self.expected, name) is None for name in required):
+            if any(
+                getattr(self.expected, name) is None
+                for name in required
+                if name != "tool_name"
+            ) or (
+                self.expected.tool_name is None
+                and self.expected.routing_reason != "document_unreadable"
+            ):
                 raise ValueError("agent expected outcome is incomplete")
         else:
             if self.scripted_proposals:

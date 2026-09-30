@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
-from typing import Annotated, Literal, Self
+from typing import Annotated, Self
 from uuid import UUID
 
 from pydantic import (
@@ -12,12 +12,14 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    StrictInt,
     StrictStr,
     model_validator,
 )
 
 from app.agent import AgentProposal, ToolData
 from app.policy import TrustedToolRuntimeContext
+from app.tenants.identifiers import SafeIdentifier
 
 
 class StrictToolModel(BaseModel):
@@ -107,14 +109,8 @@ class ReviewFlag(StrictToolModel):
 class PendingAction(StrictToolModel):
     """Closed, validated command frozen for a human approval decision."""
 
-    version: Literal[1] = 1
-    name: Literal[
-        "find_customer",
-        "create_case",
-        "update_case_fields",
-        "create_reply_draft",
-        "flag_for_review",
-    ]
+    version: Annotated[StrictInt, Field(ge=1)] = 1
+    name: SafeIdentifier
     # Values are JSON-compatible dumps of already validated tool/proposal data.
     arguments: dict[str, object]
     known_fields: dict[str, object]
@@ -140,8 +136,12 @@ class ToolDefinition:
         requires_complete_fields: bool,
         arguments_model: type[BaseModel],
         handler: ToolHandler,
+        commits_side_effect: bool = False,
+        pending_action_version: int = 1,
     ) -> None:
         self.name = name
         self.requires_complete_fields = requires_complete_fields
         self.arguments_model = arguments_model
         self.handler = handler
+        self.commits_side_effect = commits_side_effect
+        self.pending_action_version = pending_action_version

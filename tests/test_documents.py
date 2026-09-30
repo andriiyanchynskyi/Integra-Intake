@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from hashlib import sha256
 from io import BytesIO
 import json
@@ -16,12 +17,20 @@ from app.documents import (
     MAX_DOCUMENT_BYTES,
     MAX_DOCUMENT_PAGES,
     MAX_DOCUMENT_TEXT_CHARS,
+    DocumentInput,
     DocumentExtractionError,
     DocumentMediaType,
     DocumentNormalizer,
-    NormalizedRateConfirmationDocument,
-    RateConfirmationDocumentInput,
+    NormalizedDocument,
 )
+from app.documents.legacy import decode_document_snapshot
+from app.documents.registry import (
+    BUILTIN_DOCUMENT_REGISTRY,
+    DocumentCapabilityUnavailable,
+    DocumentNormalizerCapability,
+    DocumentNormalizerRegistry,
+)
+from app.observability import EventName, ObservationContext, RecordingObserver
 from app.policy import RiskSignals, TrustedSource, TrustedToolRuntimeContext
 from app.tenants.loader import load_tenant_config
 from app.tools import InMemoryTenantToolPort, PolicyGatedToolExecutor
@@ -57,7 +66,7 @@ def make_document_input(
     media_type: DocumentMediaType = DocumentMediaType.TEXT,
     text: str | None = "Origin: Chicago\r\nDestination: Detroit\rRate: 2500 USD",
     content: bytes | None = None,
-) -> RateConfirmationDocumentInput:
+) -> DocumentInput:
     payload: dict[str, object] = {
         "channel": "email",
         "subject": "Rate confirmation",
@@ -68,7 +77,7 @@ def make_document_input(
         payload["text"] = text
     if content is not None:
         payload["content"] = content
-    return RateConfirmationDocumentInput.model_validate(payload)
+    return DocumentInput.model_validate(payload)
 
 
 def pdf_bytes(*, pages: int = 1, encrypted: bool = False) -> bytes:
@@ -83,9 +92,121 @@ def pdf_bytes(*, pages: int = 1, encrypted: bool = False) -> bytes:
 
 
 def normalize(
-    value: RateConfirmationDocumentInput,
-) -> NormalizedRateConfirmationDocument:
-    return DocumentNormalizer().normalize(value)
+    value: DocumentInput,
+    *,
+    document_kind: str = "rate_confirmation",
+    target_intake_type: str = "rate_confirmation",
+    normalizer_key: str = "bounded_text_pdf",
+    normalizer_version: int = 1,
+) -> NormalizedDocument:
+    return DocumentNormalizer().normalize(
+        value,
+        document_kind=document_kind,
+        target_intake_type=target_intake_type,
+        normalizer_key=normalizer_key,
+        normalizer_version=normalizer_version,
+    )
+
+
+def _document_capability(
+    *, key: str = "fixture_normalizer", version: int = 1
+) -> DocumentNormalizerCapability:
+    return DocumentNormalizerCapability(
+        key=key,
+        version=version,
+        supported_media_types=frozenset(
+            {DocumentMediaType.TEXT, DocumentMediaType.PDF}
+        ),
+    )
+
+
+def test_document_registry_rejects_duplicate_key_version_pairs() -> None:
+    capability = _document_capability()
+
+    with pytest.raises(ValueError):
+        DocumentNormalizerRegistry((capability, capability))
+
+
+@pytest.mark.parametrize("key", ["BadKey", "bad-key", "bad/key", "1bad", ""])
+def test_document_registry_rejects_unsafe_keys(key: str) -> None:
+    with pytest.raises(ValueError):
+        DocumentNormalizerRegistry((_document_capability(key=key),))
+
+
+def test_document_registry_resolves_exact_normalizer_versions() -> None:
+    registry = DocumentNormalizerRegistry(
+        (
+            _document_capability(version=1),
+            _document_capability(key="other_normalizer", version=2),
+        )
+    )
+
+    assert registry.require("fixture_normalizer", 1).version == 1
+    assert registry.require("other_normalizer", 2).version == 2
+
+    with pytest.raises(DocumentCapabilityUnavailable):
+        registry.require("fixture_normalizer", 2)
+
+
+def test_builtin_document_registry_requires_exact_supported_version() -> None:
+    assert BUILTIN_DOCUMENT_REGISTRY.require("bounded_text_pdf", 1).version == 1
+
+    with pytest.raises(DocumentCapabilityUnavailable):
+        BUILTIN_DOCUMENT_REGISTRY.require("bounded_text_pdf", 2)
+
+
+def test_document_normalization_emits_timed_safe_event() -> None:
+    observer = RecordingObserver()
+    ticks = iter((1_000_000, 4_500_000))
+    normalized = DocumentNormalizer(
+        observer=observer,
+        context=ObservationContext(
+            trace_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        ),
+        clock=lambda: next(ticks),
+    ).normalize(
+        make_document_input(),
+        document_kind="rate_confirmation",
+        target_intake_type="rate_confirmation",
+        normalizer_key="bounded_text_pdf",
+        normalizer_version=1,
+    )
+
+    event = next(
+        item
+        for item in observer.events
+        if item.event is EventName.DOCUMENT_NORMALIZATION_COMPLETED
+    )
+    assert normalized.text is not None
+    assert event.duration_ms == 3
+    assert event.document_media_type is DocumentMediaType.TEXT
+    assert event.document_text_chars == len(normalized.text)
+    assert event.document_error is None
+    assert "Origin: Chicago" not in event.model_dump_json()
+
+
+def test_document_input_and_normalizer_create_a_v2_snapshot_with_trusted_binding() -> None:
+    result = DocumentNormalizer().normalize(
+        DocumentInput(
+            channel="email",
+            subject="doc",
+            body="",
+            media_type=DocumentMediaType.TEXT,
+            text="hello",
+        ),
+        document_kind="rate_confirmation",
+        target_intake_type="rate_confirmation",
+        normalizer_key="bounded_text_pdf",
+        normalizer_version=1,
+    )
+
+    assert result.snapshot_version == 2
+    assert result.document_kind == "rate_confirmation"
+    assert result.target_intake_type == "rate_confirmation"
+    assert result.normalizer_key == "bounded_text_pdf"
+    assert result.normalizer_version == 1
+    assert result.text == "hello"
+    assert result.extraction_error is None
 
 
 def test_document_input_rejects_unknown_keys() -> None:
@@ -98,7 +219,7 @@ def test_document_input_rejects_unknown_keys() -> None:
     }
 
     with pytest.raises(ValidationError):
-        RateConfirmationDocumentInput.model_validate(payload)
+        DocumentInput.model_validate(payload)
 
 
 @pytest.mark.parametrize(
@@ -140,7 +261,7 @@ def test_document_input_requires_exactly_one_media_payload(
     payload: dict[str, object],
 ) -> None:
     with pytest.raises(ValidationError):
-        RateConfirmationDocumentInput.model_validate(payload)
+        DocumentInput.model_validate(payload)
 
 
 @pytest.mark.parametrize(
@@ -164,7 +285,7 @@ def test_document_input_rejects_mismatched_media_payload(
     }
 
     with pytest.raises(ValidationError):
-        RateConfirmationDocumentInput.model_validate(values)
+        DocumentInput.model_validate(values)
 
 
 @pytest.mark.parametrize(
@@ -181,7 +302,7 @@ def test_document_input_rejects_blank_message_metadata(field: str, value: str) -
     payload[field] = value
 
     with pytest.raises(ValidationError):
-        RateConfirmationDocumentInput.model_validate(payload)
+        DocumentInput.model_validate(payload)
 
 
 def test_document_input_rejects_blank_text() -> None:
@@ -196,7 +317,7 @@ def test_document_input_rejects_empty_pdf_bytes() -> None:
 
 def test_document_input_rejects_unsupported_media_type() -> None:
     with pytest.raises(ValidationError):
-        RateConfirmationDocumentInput.model_validate(
+        DocumentInput.model_validate(
             {
                 "channel": "email",
                 "subject": "Rate confirmation",
@@ -210,7 +331,10 @@ def test_normalizer_normalizes_line_endings_and_hashes_original_plaintext() -> N
     source = "Origin: Chicago\r\nDestination: Detroit\rRate: 2500 USD"
     result = normalize(make_document_input(text=source))
 
-    assert result.kind == "rate_confirmation"
+    assert result.document_kind == "rate_confirmation"
+    assert result.target_intake_type == "rate_confirmation"
+    assert result.normalizer_key == "bounded_text_pdf"
+    assert result.normalizer_version == 1
     assert result.media_type is DocumentMediaType.TEXT
     assert result.text == "Origin: Chicago\nDestination: Detroit\nRate: 2500 USD"
     assert result.extraction_error is None
@@ -316,7 +440,7 @@ def test_normalized_snapshot_rejects_unknown_keys() -> None:
     payload["unexpected"] = "not part of the snapshot"
 
     with pytest.raises(ValidationError):
-        NormalizedRateConfirmationDocument.model_validate(payload)
+        NormalizedDocument.model_validate(payload)
 
 
 def test_normalized_snapshot_requires_exactly_one_text_or_error() -> None:
@@ -326,12 +450,39 @@ def test_normalized_snapshot_requires_exactly_one_text_or_error() -> None:
     both = dict(payload)
     both["extraction_error"] = DocumentExtractionError.DOCUMENT_TEXT_EMPTY.value
     with pytest.raises(ValidationError):
-        NormalizedRateConfirmationDocument.model_validate(both)
+        NormalizedDocument.model_validate(both)
 
     neither = dict(payload)
     neither["text"] = None
     with pytest.raises(ValidationError):
-        NormalizedRateConfirmationDocument.model_validate(neither)
+        NormalizedDocument.model_validate(neither)
+
+
+def test_legacy_rate_confirmation_snapshot_decodes_to_v2_without_rewriting_input_json() -> None:
+    legacy_snapshot = {
+        "kind": "rate_confirmation",
+        "media_type": DocumentMediaType.TEXT.value,
+        "sha256": "a" * 64,
+        "parser_version": "rate_confirmation_document.v1",
+        "text": "hello",
+    }
+    original_snapshot = deepcopy(legacy_snapshot)
+    original_json = json.dumps(legacy_snapshot, sort_keys=True)
+
+    result = decode_document_snapshot(legacy_snapshot)
+
+    assert legacy_snapshot == original_snapshot
+    assert json.dumps(legacy_snapshot, sort_keys=True) == original_json
+    assert result.snapshot_version == 2
+    assert result.document_kind == "rate_confirmation"
+    assert result.target_intake_type == "rate_confirmation"
+    assert result.normalizer_key == "bounded_text_pdf"
+    assert result.normalizer_version == 1
+    assert result.media_type is DocumentMediaType.TEXT
+    assert result.text == "hello"
+    assert result.extraction_error is None
+    assert "kind" not in result.model_dump(mode="json")
+    assert "parser_version" not in result.model_dump(mode="json")
 
 
 def _fixture_manifest() -> dict[str, object]:
@@ -340,7 +491,7 @@ def _fixture_manifest() -> dict[str, object]:
 
 def _normalize_fixture(
     entry: dict[str, object],
-) -> tuple[bytes, NormalizedRateConfirmationDocument]:
+) -> tuple[bytes, NormalizedDocument]:
     raw = (DOCUMENT_FIXTURES / str(entry["filename"])).read_bytes()
     media_type = DocumentMediaType(str(entry["media_type"]))
     payload: dict[str, object] = {
@@ -354,13 +505,17 @@ def _normalize_fixture(
     else:
         payload["content"] = raw
     return raw, DocumentNormalizer().normalize(
-        RateConfirmationDocumentInput.model_validate(payload)
+        DocumentInput.model_validate(payload),
+        document_kind="rate_confirmation",
+        target_intake_type=str(entry["intake_type"]),
+        normalizer_key="bounded_text_pdf",
+        normalizer_version=1,
     )
 
 
 def _fixture_proposal(
     entry: dict[str, object],
-    document: NormalizedRateConfirmationDocument,
+    document: NormalizedDocument,
     *,
     invent_missing: bool = False,
 ) -> AgentProposal:
@@ -440,7 +595,11 @@ def test_document_fixtures_normalize_to_manifest_outcomes(entry_index: int) -> N
     raw, normalized = _normalize_fixture(entry)
     snapshot = normalized.model_dump(mode="json")
 
-    assert normalized.kind == "rate_confirmation"
+    assert normalized.snapshot_version == 2
+    assert normalized.document_kind == "rate_confirmation"
+    assert normalized.target_intake_type == entry["intake_type"]
+    assert normalized.normalizer_key == "bounded_text_pdf"
+    assert normalized.normalizer_version == 1
     assert normalized.media_type.value == entry["media_type"]
     actual_error = (
         normalized.extraction_error.value

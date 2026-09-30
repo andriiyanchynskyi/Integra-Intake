@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from uuid import UUID
 
@@ -14,6 +16,29 @@ from app.tools.models import ApprovalRequested, PendingAction
 
 class ApprovalCreationConflict(RuntimeError):
     """The claimed job is no longer able to create an approval."""
+
+
+@dataclass(frozen=True, slots=True)
+class ExpiredApprovalObservation:
+    """Safe correlation data for an approval expired by the worker."""
+
+    trace_id: UUID
+    tenant_id: UUID
+    job_id: UUID
+    approval_id: UUID
+    created_at: datetime
+    decided_at: datetime
+    tenant_config_snapshot: dict[str, object] = field(default_factory=dict)
+    tenant_config_sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalObservationIdentity:
+    """Stored job identity used for later approval observations."""
+
+    trace_id: UUID
+    tenant_config_snapshot: dict[str, object]
+    tenant_config_sha256: str
 
 
 class ApprovalRepository:
@@ -120,7 +145,21 @@ class ApprovalRepository:
         )
         return (await self.session.execute(statement)).scalar_one_or_none()
 
-    async def expire_due(self, *, now: datetime, limit: int = 100) -> int:
+    async def get_job_trace_id(self, approval: Approval) -> UUID:
+        if approval.job_id is None:
+            raise ApprovalCreationConflict("approval job is unavailable")
+        statement = select(AgentJob.trace_id).where(
+            AgentJob.id == approval.job_id,
+            AgentJob.tenant_id == approval.tenant_id,
+        )
+        trace_id = (await self.session.execute(statement)).scalar_one_or_none()
+        if trace_id is None:
+            raise ApprovalCreationConflict("approval job is unavailable")
+        return trace_id
+
+    async def expire_due(
+        self, *, now: datetime, limit: int = 100
+    ) -> tuple[ExpiredApprovalObservation, ...]:
         async with self.session.begin():
             statement = (
                 select(Approval)
@@ -134,9 +173,69 @@ class ApprovalRepository:
                 .with_for_update(skip_locked=True)
             )
             approvals = (await self.session.execute(statement)).scalars().all()
+            observations: list[ExpiredApprovalObservation] = []
             for approval in approvals:
                 self.expire_locked(approval, now=now)
-            return len(approvals)
+                if approval.job_id is None or approval.created_at is None:
+                    continue
+                identity = await self.get_job_observation_identity(approval)
+                if identity is None:
+                    continue
+                observations.append(
+                    ExpiredApprovalObservation(
+                        trace_id=identity.trace_id,
+                        tenant_id=approval.tenant_id,
+                        job_id=approval.job_id,
+                        approval_id=approval.id,
+                        created_at=approval.created_at,
+                        decided_at=now,
+                        tenant_config_snapshot=deepcopy(
+                            identity.tenant_config_snapshot
+                        )
+                        if identity is not None
+                        else {},
+                        tenant_config_sha256=(
+                            identity.tenant_config_sha256
+                            if identity is not None
+                            else None
+                        ),
+                    )
+                )
+            return tuple(observations)
+
+    async def _trace_id_for_approval(self, approval: Approval) -> UUID | None:
+        if approval.job_id is None:
+            return None
+        statement = select(AgentJob.trace_id).where(
+            AgentJob.id == approval.job_id,
+            AgentJob.tenant_id == approval.tenant_id,
+        )
+        return (await self.session.execute(statement)).scalar_one_or_none()
+
+    async def get_job_observation_identity(
+        self, approval: Approval
+    ) -> ApprovalObservationIdentity | None:
+        if approval.job_id is None:
+            return None
+        statement = select(
+            AgentJob.trace_id,
+            AgentJob.tenant_config_snapshot,
+            AgentJob.tenant_config_sha256,
+        ).where(
+            AgentJob.id == approval.job_id,
+            AgentJob.tenant_id == approval.tenant_id,
+        )
+        row = (await self.session.execute(statement)).one_or_none()
+        if row is None:
+            return None
+        trace_id, snapshot, sha256 = row
+        if not isinstance(snapshot, dict) or not isinstance(sha256, str):
+            return None
+        return ApprovalObservationIdentity(
+            trace_id=trace_id,
+            tenant_config_snapshot=deepcopy(snapshot),
+            tenant_config_sha256=sha256,
+        )
 
     def expire_locked(self, approval: Approval, *, now: datetime) -> None:
         """Transition one already-locked pending row to timeout rejection."""
@@ -196,4 +295,9 @@ class ApprovalRepository:
         return event
 
 
-__all__ = ["ApprovalCreationConflict", "ApprovalRepository"]
+__all__ = [
+    "ApprovalCreationConflict",
+    "ApprovalObservationIdentity",
+    "ApprovalRepository",
+    "ExpiredApprovalObservation",
+]

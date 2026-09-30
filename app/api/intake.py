@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +20,7 @@ from app.domain.intake import (
     IntakeEnqueueService,
 )
 from app.policy.models import TrustedSource
+from app.observability.middleware import bind_request_context, request_context, request_observer
 from app.runtime.profiles import TenantProfileResolver, TenantProfileUnavailableError
 
 
@@ -36,6 +37,7 @@ class IntakeAcceptedResponse(BaseModel):
 @router.post("", response_model=IntakeAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)
 async def enqueue_intake(
     request: CreateIntakeRequest,
+    http_request: Request,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     tenant: Tenant = Depends(get_current_tenant),
     session: AsyncSession = Depends(get_db_session, use_cache=False),
@@ -55,11 +57,14 @@ async def enqueue_intake(
         tenant_slug=tenant.slug,
         source=source,
         idempotency_key=idempotency_key,
+        trace_id=request_context(http_request).trace_id,
     )
     try:
         result = await IntakeEnqueueService(
             session,
             TenantProfileResolver(settings.tenant_profiles_directory),
+            observer=request_observer(http_request),
+            context=request_context(http_request),
         ).enqueue(command)
     except IdempotencyConflict as error:
         raise HTTPException(
@@ -76,4 +81,12 @@ async def enqueue_intake(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Invalid intake request",
         ) from error
+    bind_request_context(
+        http_request,
+        request_context(http_request).bind(
+            tenant_id=tenant.id,
+            job_id=result.job_id,
+            trace_id=result.trace_id,
+        ),
+    )
     return IntakeAcceptedResponse(job_id=result.job_id, status="queued")

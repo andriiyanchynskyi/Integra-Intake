@@ -2,6 +2,8 @@
 
 from app.tenants.config import (
     ActionRule,
+    ActionExecutionMode,
+    DocumentBindingConfig,
     FieldDefinition,
     FieldType,
     IntakeTypeConfig,
@@ -10,11 +12,14 @@ from app.tenants.config import (
     RoutingStatus,
     TenantConfig,
 )
+from app.tenants.identifiers import SAFE_IDENTIFIER_PATTERN, SafeIdentifier
 from app.tenants.loader import TenantConfigError, load_tenant_config, parse_tenant_config
 from app.tenants.routing import RoutingAssessment, RoutingOutcome, TenantRouter
 
 __all__ = [
     "ActionRule",
+    "ActionExecutionMode",
+    "DocumentBindingConfig",
     "FieldDefinition",
     "FieldType",
     "IntakeTypeConfig",
@@ -23,6 +28,8 @@ __all__ = [
     "RoutingDecision",
     "RoutingOutcome",
     "RoutingStatus",
+    "SAFE_IDENTIFIER_PATTERN",
+    "SafeIdentifier",
     "TenantConfig",
     "TenantConfigError",
     "TenantRouter",

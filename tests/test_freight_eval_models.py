@@ -35,6 +35,7 @@ DATASET_PATH = PROJECT_ROOT / "evals" / "datasets" / "freight.v1.yaml"
 DOCUMENT_FIXTURES = PROJECT_ROOT / "evals" / "fixtures" / "docs"
 MANIFEST_PATH = DOCUMENT_FIXTURES / "manifest.yaml"
 WORKFLOW_PATH = PROJECT_ROOT / ".github" / "workflows" / "ci.yml"
+ATTRIBUTES_PATH = PROJECT_ROOT / ".gitattributes"
 CASE_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 CORE_COUNTS = {
@@ -618,6 +619,12 @@ def _ci_step(workflow: dict[str, object], name: str) -> dict[str, object]:
         if step.get("name") == name:
             return step
     raise AssertionError(f"CI step not found: {name}")
+
+
+def test_pdf_fixtures_are_declared_binary_for_git() -> None:
+    assert ATTRIBUTES_PATH.is_file(), "missing .gitattributes"
+    rules = ATTRIBUTES_PATH.read_text(encoding="utf-8").splitlines()
+    assert "*.pdf binary" in rules
 
 
 def test_ci_workflow_triggers_and_python_version_are_explicit() -> None:

@@ -19,6 +19,7 @@ from app.inbound import (
     parse_webhook_email_payload,
 )
 from app.runtime.profiles import TenantProfileResolver, TenantProfileUnavailableError
+from app.observability.middleware import bind_request_context, request_context, request_observer
 
 from app.api.intake import IntakeAcceptedResponse
 
@@ -27,13 +28,18 @@ router = APIRouter(prefix="/inbound/email", tags=["inbound"])
 
 
 def get_inbound_intake_service(
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_db_session, use_cache=False)],
 ) -> InboundIntakeService:
     return InboundIntakeService(
         IntakeEnqueueService(
             session,
             TenantProfileResolver(settings.tenant_profiles_directory),
-        )
+            observer=request_observer(request),
+            context=request_context(request),
+        ),
+        observer=request_observer(request),
+        context=request_context(request),
     )
 
 
@@ -80,6 +86,14 @@ async def receive_email_webhook(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Invalid inbound payload",
         ) from error
+    bind_request_context(
+        request,
+        request_context(request).bind(
+            tenant_id=tenant.id,
+            job_id=result.job_id,
+            trace_id=result.trace_id,
+        ),
+    )
     return IntakeAcceptedResponse(job_id=result.job_id, status="queued")
 
 

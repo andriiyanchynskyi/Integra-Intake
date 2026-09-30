@@ -1,6 +1,7 @@
 """PostgreSQL migration integration tests."""
 
 from uuid import uuid4
+from pathlib import Path
 
 import pytest
 from sqlalchemy import CheckConstraint, ForeignKeyConstraint, UniqueConstraint, text
@@ -23,6 +24,8 @@ PHASE_TWO_TABLES = {
 }
 PHASE_SEVEN_TABLES = PHASE_TWO_TABLES | {"agent_jobs"}
 PHASE_EIGHT_TABLES = PHASE_SEVEN_TABLES | {"approval_events"}
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+TRACE_MIGRATION_PATH = PROJECT_ROOT / "alembic" / "versions" / "007_phase12_job_trace_id.py"
 TENANT_SCOPED_TABLES = PHASE_EIGHT_TABLES - {"tenants"}
 JSONB_COLUMNS = {
     "customers": {"attributes"},
@@ -87,6 +90,9 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
     assert agent_jobs.c.attempt_count.nullable is False
     assert str(agent_jobs.c.attempt_count.server_default.arg) == "0"
     assert agent_jobs.c.tenant_config_sha256.nullable is False
+    assert agent_jobs.c.trace_id.nullable is False
+    assert isinstance(agent_jobs.c.trace_id.type, PG_UUID)
+    assert agent_jobs.c.trace_id.type.as_uuid is True
     for name in (
         "source_snapshot",
         "tenant_config_snapshot",
@@ -112,6 +118,12 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
         isinstance(constraint, UniqueConstraint)
         and constraint.name == "uq_agent_jobs_tenant_id_id"
         and tuple(column.name for column in constraint.columns) == ("tenant_id", "id")
+        for constraint in agent_jobs.constraints
+    )
+    assert any(
+        isinstance(constraint, UniqueConstraint)
+        and constraint.name == "uq_agent_jobs_trace_id"
+        and tuple(column.name for column in constraint.columns) == ("trace_id",)
         for constraint in agent_jobs.constraints
     )
     assert {
@@ -147,6 +159,8 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
         and tuple(column.name for column in constraint.columns) == ("tenant_id", "id")
         for constraint in approvals.constraints
     )
+
+
     assert any(
         isinstance(constraint, UniqueConstraint)
         and constraint.name == "uq_approvals_job_id"
@@ -199,6 +213,18 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
             == (f"{referenced_table}.tenant_id", f"{referenced_table}.id")
             for constraint in Base.metadata.tables[table_name].constraints
         )
+
+
+def test_phase12_trace_migration_is_append_only_and_backfills_before_not_null() -> None:
+    assert TRACE_MIGRATION_PATH.is_file()
+    source = TRACE_MIGRATION_PATH.read_text(encoding="utf-8")
+    assert 'revision: str = "007_phase12_job_trace_id"' in source
+    assert 'down_revision: Union[str, None] = "006_phase8_approval_status_check"' in source
+    assert 'sa.Column("trace_id", postgresql.UUID(as_uuid=True), nullable=True)' in source
+    assert "UPDATE agent_jobs SET trace_id = gen_random_uuid()" in source
+    assert '"trace_id",' in source and "nullable=False" in source
+    assert '"uq_agent_jobs_trace_id"' in source
+    assert 'op.drop_constraint("uq_agent_jobs_trace_id"' in source
 
 
 async def query_schema_contract(connection: AsyncConnection) -> None:
@@ -297,6 +323,9 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
         "updated_at",
     ):
         assert ("agent_jobs", name) in column_map
+    assert ("agent_jobs", "trace_id") in column_map
+    assert column_map[("agent_jobs", "trace_id")].udt_name == "uuid"
+    assert column_map[("agent_jobs", "trace_id")].is_nullable == "NO"
 
     primary_keys = await connection.execute(
         text(
@@ -336,6 +365,7 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
     assert "UNIQUE (tenant_id, key)" in constraint_map["uq_idempotency_records_tenant_id_key"]
     assert "UNIQUE (tenant_id, id)" in constraint_map["uq_approvals_tenant_id_id"]
     assert "UNIQUE (job_id)" in constraint_map["uq_approvals_job_id"]
+    assert "UNIQUE (trace_id)" in constraint_map["uq_agent_jobs_trace_id"]
     assert any("UNIQUE (slug)" in definition for definition in constraint_map.values())
     for table_name, referenced_table, local_columns in (
         ("intake_cases", "customers", "tenant_id, customer_id"),
@@ -392,12 +422,12 @@ async def assert_tenant_boundaries(connection: AsyncConnection) -> None:
     await connection.execute(
         text(
             "INSERT INTO agent_jobs "
-            "(id, tenant_id, source_snapshot, tenant_config_snapshot, tenant_config_sha256) "
-            "VALUES (:id, :tenant_id, '{}'::jsonb, '{}'::jsonb, :sha256)"
+            "(id, tenant_id, trace_id, source_snapshot, tenant_config_snapshot, tenant_config_sha256) "
+            "VALUES (:id, :tenant_id, :trace_id, '{}'::jsonb, '{}'::jsonb, :sha256)"
         ),
         [
-            {"id": agent_job_a, "tenant_id": tenant_a, "sha256": "a" * 64},
-            {"id": agent_job_b, "tenant_id": tenant_b, "sha256": "b" * 64},
+            {"id": agent_job_a, "tenant_id": tenant_a, "trace_id": uuid4(), "sha256": "a" * 64},
+            {"id": agent_job_b, "tenant_id": tenant_b, "trace_id": uuid4(), "sha256": "b" * 64},
         ],
     )
     legacy_approval_id = uuid4()

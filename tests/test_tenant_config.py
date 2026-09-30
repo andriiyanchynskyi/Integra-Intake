@@ -15,7 +15,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 @pytest.fixture
 def valid_profile() -> dict[str, object]:
     return {
+        "profile_version": 2,
         "slug": "acme",
+        "scenario_key": "test_scenario",
         "display_name": "Acme",
         "intake_types": [
             {
@@ -28,9 +30,18 @@ def valid_profile() -> dict[str, object]:
             "summary": {"type": "short_text", "label": "Summary"},
         },
         "action_policy": {
-            "create_case": {"allowed": True, "requires_approval": False},
-            "send_reply": {"allowed": True, "requires_approval": True},
+            "create_case": {
+                "allowed": True,
+                "requires_approval": False,
+                "execution": "executable",
+            },
+            "send_reply": {
+                "allowed": True,
+                "requires_approval": True,
+                "execution": "policy_only",
+            },
         },
+        "documents": {},
         "routing": {
             "outcome_names": [
                 "urgent",
@@ -247,6 +258,81 @@ def test_example_tenant_profiles_load(filename: str, expected_slug: str) -> None
     assert config.slug == expected_slug
 
 
+def test_profiles_have_explicit_scenario_identity() -> None:
+    expected = {
+        "freight-broker.yaml": "freight_broker",
+        "repair-service.yaml": "repair_service",
+        "language-school.yaml": "language_school",
+    }
+
+    for filename, scenario_key in expected.items():
+        config = load_tenant_config(PROJECT_ROOT / "examples" / filename)
+
+        assert (config.profile_version, config.scenario_key) == (2, scenario_key)
+
+
+@pytest.mark.parametrize("unsafe_key", ["Customer Name", "bad/type"])
+def test_tenant_config_rejects_unsafe_identifier_keys(
+    valid_profile: dict[str, object], unsafe_key: str
+) -> None:
+    valid_profile["fields"][unsafe_key] = {  # type: ignore[index]
+        "type": "short_text",
+        "label": "Unsafe",
+    }
+
+    with pytest.raises(ValidationError):
+        TenantConfig.model_validate(valid_profile)
+
+
+def test_tenant_config_rejects_duplicate_inbound_defaults(
+    valid_profile: dict[str, object],
+) -> None:
+    valid_profile["documents"] = {  # type: ignore[index]
+        "primary_document": {
+            "intake_type": "request",
+            "normalizer": "bounded_text_pdf",
+            "normalizer_version": 1,
+            "default_for_inbound": True,
+        },
+        "secondary_document": {
+            "intake_type": "request",
+            "normalizer": "bounded_text_pdf",
+            "normalizer_version": 1,
+            "default_for_inbound": True,
+        },
+    }
+
+    with pytest.raises(ValidationError, match="at most one inbound default"):
+        TenantConfig.model_validate(valid_profile)
+
+
+def test_tenant_config_rejects_an_action_missing_execution_mode(
+    valid_profile: dict[str, object],
+) -> None:
+    valid_profile["action_policy"]["create_case"].pop(  # type: ignore[index]
+        "execution"
+    )
+
+    with pytest.raises(ValidationError, match="execution"):
+        TenantConfig.model_validate(valid_profile)
+
+
+def test_tenant_config_rejects_a_document_binding_with_unknown_intake_type(
+    valid_profile: dict[str, object],
+) -> None:
+    valid_profile["documents"] = {  # type: ignore[index]
+        "unsupported_document": {
+            "intake_type": "unknown",
+            "normalizer": "bounded_text_pdf",
+            "normalizer_version": 1,
+            "default_for_inbound": False,
+        }
+    }
+
+    with pytest.raises(ValidationError, match="unknown intake types"):
+        TenantConfig.model_validate(valid_profile)
+
+
 @pytest.mark.parametrize(
     "filename",
     ["freight-broker.yaml", "repair-service.yaml", "language-school.yaml"],
@@ -424,6 +510,7 @@ def test_router_allows_configured_find_customer_when_required_fields_are_optiona
     valid_profile["action_policy"]["find_customer"] = {  # type: ignore[index]
         "allowed": True,
         "requires_approval": False,
+        "execution": "executable",
     }
     router = TenantRouter(TenantConfig.model_validate(valid_profile))
 
@@ -454,6 +541,7 @@ def test_router_honors_each_approval_mechanism(
         valid_profile["action_policy"]["archive"] = {  # type: ignore[index]
             "allowed": True,
             "requires_approval": False,
+            "execution": "executable",
         }
         valid_profile["routing"]["always_approval_actions"].append("archive")  # type: ignore[union-attr]
         action = "archive"

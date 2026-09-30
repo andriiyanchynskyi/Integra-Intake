@@ -2,12 +2,27 @@
 
 IntegraIntake is a policy-governed, multi-tenant intake engine. It accepts
 structured case requests and one email-like inbound webhook, normalizes
-bounded freight documents, queues tenant-scoped jobs, and runs a synchronous
-agent loop behind an asynchronous PostgreSQL worker.
+profile-bound bounded documents, queues tenant-scoped jobs, and runs a
+synchronous agent loop behind an asynchronous PostgreSQL worker.
 
 The service uses one provider-neutral signed webhook for email-like messages.
 It does not include IMAP, Gmail OAuth, a production email SaaS integration, or
 outbound delivery.
+
+## Observability
+
+- `X-Trace-ID` is server-generated and follows accepted intake work into the
+  queued job and worker; `X-Correlation-ID` is optional, bounded, and untrusted.
+- The API and worker emit structured JSON events with safe IDs, closed
+  outcomes, request/queue/worker/provider/tool/document/approval durations,
+  agent stop reasons, policy and approval decisions, and provider token counts
+  only when the provider supplies them.
+- Events and logs are source-free: they never contain request or document content, credentials,
+  authorization or signature headers, proposals, tool payloads, exception text,
+  or a transcript.
+- The local-first scope has no external observability backend, trace table,
+  dashboard, alerting, or content-bearing transcript persistence. Existing
+  case and approval audit records remain the durable business history.
 
 ## Data flow
 
@@ -23,7 +38,7 @@ server-derived tenant
         |
         +--> POST /v1/inbound/email/webhook
                               -> strict InboundMessage
-                              -> bounded document normalization
+                              -> profile-bound document normalization
                               -> idempotent AgentJob
                                       |
                                       v
@@ -33,6 +48,8 @@ server-derived tenant
                               synchronous AgentLoop
                                       |
                                       v
+                         profile resolution -> deterministic preflight
+                                      |
                          structured proposal -> policy/tools/approval
 ~~~
 
@@ -41,6 +58,11 @@ Request JSON cannot select a tenant. Every repository operation includes the
 authenticated tenant ID, and cross-tenant case reads behave like missing
 resources (404).
 
+Each HTTP request receives a server request ID and provisional trace ID before
+authentication. A newly created intake job persists that trace; an idempotent
+duplicate reuses the existing job trace. Approval decisions use a fresh request
+ID but resolve business events back to the original job trace.
+
 ## Implemented capabilities
 
 - FastAPI application with /health, OpenAPI, Docker Compose, PostgreSQL,
@@ -48,7 +70,8 @@ resources (404).
 - Tenant-scoped API keys. Raw keys are printed once by the local seed command;
   PostgreSQL stores only a SHA-256 digest and a display-safe prefix.
 - Strict YAML tenant profiles with safe loading, field catalogs, action policy,
-  and deterministic routing. Policy precedence remains code-owned.
+  scenario identity, capability-owned action/document bindings, and
+  deterministic routing. Policy precedence remains code-owned.
 - Direct case creation and retrieval through /v1/cases.
 - An idempotent PostgreSQL intake boundary through /v1/intake, leased worker
   jobs, bounded retries, and safe durable error codes.
@@ -59,13 +82,17 @@ resources (404).
   other model signals never authorize an action.
 - Human approval decisions with tenant-scoped operator credentials, expiry,
   append-only approval events, and execute-once behavior.
-- Freight document normalization for bounded text/plain and
-  application/pdf rate confirmations. Normalized snapshots contain extracted
-  text or a typed extraction error plus a SHA-256 digest; raw document bytes
-  are not persisted or sent to the model.
+- Profile-bound normalization for bounded text/plain and application/pdf
+  documents. Normalized v2 snapshots contain extracted text or a typed
+  extraction error plus a SHA-256 digest; raw document bytes are not persisted
+  or sent to the model. Unreadable documents terminate in deterministic
+  preflight without provider, tool, or approval calls.
 - A signed email-like inbound webhook at
   POST /v1/inbound/email/webhook. It accepts one bounded attachment and
   reuses the existing intake/job flow.
+- Reusable provider-free eval contracts under `evals/core/`, with compact
+  repair and language-school suites. The freight corpus remains domain-owned
+  at exactly 40 core and 10 adversarial cases.
 
 ## API
 
@@ -154,6 +181,9 @@ provider_id) contract. It must not bypass the existing enqueue service.
 - Tenant profile routing and action policy are deterministic. LLM confidence,
   priority, and injection flags are informational inputs to policy, never
   permission to perform a side effect.
+- Profile compilation resolves only registered executable actions and exact
+  document-normalizer versions. Policy-only actions remain visible to policy
+  but are not executable capabilities.
 
 ## Quick start
 
@@ -198,6 +228,9 @@ python -m app.workers
 
 The worker is a separate process. The API accepts work and returns; it does
 not wait for an LLM call.
+
+Both entry points use JSON stdout events suitable for local inspection. No
+provider credential or source payload is required to run the service locally.
 
 ### 5. Create a direct case
 
@@ -245,6 +278,11 @@ Unit and API tests use fakes, dependency overrides, and httpx transports.
 Webhook tests cover signing, timestamp expiry, replay rejection, strict
 payload validation, limits, duplicate delivery, idempotency conflicts,
 tenant isolation, attachment privacy, normalization, and worker hand-off.
+Universal scenario contract tests cover the repair and language-school
+matrices, fixed trace/scenario identity, capability extension seams, and
+source-free seven-key result projections. Those suites use only synthetic
+typed proposals and local ports; they add no scenario-specific production
+parser or outbound delivery integration.
 PostgreSQL integration tests run only when an explicit reachable
 DATABASE_URL is supplied; otherwise they skip instead of pretending to be
 database evidence.
@@ -274,6 +312,7 @@ git diff --check
 
 ## Current boundaries
 
-The service does not include production observability and traces, MCP,
-Linux/systemd operations, real email-provider OAuth or IMAP, outbound delivery,
-TMS/Odoo, cloud object storage, or production SaaS integrations.
+The service includes local structured observability but does not include an
+external trace/metrics backend, dashboards, alerts, MCP, Linux/systemd
+operations, real email-provider OAuth or IMAP, outbound delivery, TMS/Odoo,
+cloud object storage, or production SaaS integrations.

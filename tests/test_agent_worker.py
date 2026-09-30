@@ -3,23 +3,44 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
+import yaml
 
 from app.agent.models import AgentMessage, AgentRunResult, MessageRole, RunStatus, StopReason
 from app.core.config import Settings
-from app.domain.job_repository import ClaimedJob
+from app.documents import DocumentExtractionError
+from app.domain.approval_repository import ExpiredApprovalObservation
+from app.domain.job_repository import ClaimedJob, LeaseRecoveryObservation
+from app.observability import EventName, OutcomeCode, RecordingObserver, WorkerErrorCode
+from app.runtime.preflight import TerminalPreflightResult
+from app.runtime.profiles import canonical_json_bytes
+from app.tenants.config import RoutingStatus
 from app.workers.agent_worker import AgentWorker, RetryableJobError
 
 
+_REPAIR_PROFILE_SNAPSHOT = yaml.safe_load(
+    (Path(__file__).parents[1] / "examples" / "repair-service.yaml").read_text(
+        encoding="utf-8"
+    )
+)
+_REPAIR_PROFILE_SHA256 = hashlib.sha256(
+    canonical_json_bytes(_REPAIR_PROFILE_SNAPSHOT)
+).hexdigest()
+
+
 def _claimed(*, side_effect_committed_at: datetime | None = None) -> ClaimedJob:
+    now = datetime.now(timezone.utc)
     return ClaimedJob(
         id=uuid4(),
         tenant_id=uuid4(),
+        trace_id=uuid4(),
         status="running",
         source_snapshot={"channel": "email", "subject": "Load", "body": "Need a truck"},
         tenant_config_snapshot={"display_name": "test"},
@@ -27,6 +48,19 @@ def _claimed(*, side_effect_committed_at: datetime | None = None) -> ClaimedJob:
         risk_signals={"safety_or_legal_risk": False},
         attempt_count=1,
         side_effect_committed_at=side_effect_committed_at,
+        created_at=now - timedelta(seconds=1),
+        available_at=now - timedelta(seconds=1),
+        started_at=now,
+    )
+
+
+def _repair_claimed(
+    *, side_effect_committed_at: datetime | None = None
+) -> ClaimedJob:
+    return replace(
+        _claimed(side_effect_committed_at=side_effect_committed_at),
+        tenant_config_snapshot=_REPAIR_PROFILE_SNAPSHOT,
+        tenant_config_sha256=_REPAIR_PROFILE_SHA256,
     )
 
 
@@ -54,20 +88,22 @@ _WORKER_CALLS: list[str] = []
 
 class _FakeApprovalRepository:
     instances: list["_FakeApprovalRepository"] = []
+    expired: tuple[ExpiredApprovalObservation, ...] = ()
 
     def __init__(self, session: object) -> None:
         self.calls: list[tuple[str, object]] = []
         _FakeApprovalRepository.instances.append(self)
 
-    async def expire_due(self, **kwargs: object) -> int:
+    async def expire_due(self, **kwargs: object) -> object:
         self.calls.append(("expire_due", kwargs))
         _WORKER_CALLS.append("expire_due")
-        return 0
+        return type(self).expired
 
 
 class _FakeRepository:
     instances: list["_FakeRepository"] = []
     next_claimed: ClaimedJob | None = None
+    recovered: tuple[LeaseRecoveryObservation, ...] = ()
 
     def __init__(self, session: object) -> None:
         self.claimed = _FakeRepository.next_claimed
@@ -76,11 +112,11 @@ class _FakeRepository:
         self.now: datetime | None = None
         _FakeRepository.instances.append(self)
 
-    async def recover_expired_leases(self, **kwargs: object) -> int:
+    async def recover_expired_leases(self, **kwargs: object) -> object:
         self.calls.append(("recover_expired_leases", kwargs))
         _WORKER_CALLS.append("recover_expired_leases")
         self.now = kwargs["now"]  # type: ignore[assignment]
-        return 0
+        return type(self).recovered
 
     async def claim_next(self, **kwargs: object) -> ClaimedJob | None:
         self.calls.append(("claim_next", kwargs))
@@ -130,11 +166,11 @@ class _Runtime:
 
 
 class _RuntimeFactory:
-    def __init__(self, runtime: _Runtime) -> None:
+    def __init__(self, runtime: object) -> None:
         self.runtime = runtime
         self.calls: list[tuple[ClaimedJob, object]] = []
 
-    def build(self, claimed: ClaimedJob, gateway: object) -> _Runtime:
+    def build(self, claimed: ClaimedJob, gateway: object) -> object:
         self.calls.append((claimed, gateway))
         return self.runtime
 
@@ -146,6 +182,23 @@ def _result(*, status: RunStatus, reason: StopReason, final_response: str | None
         messages=(),
         steps=2,
         final_response=final_response,
+    )
+
+
+def _terminal_preflight(
+    *, reason: str, routing_status: RoutingStatus
+) -> TerminalPreflightResult:
+    return TerminalPreflightResult(
+        routing_status=routing_status,
+        reason=reason,  # type: ignore[arg-type]
+        target_intake_type="synthetic_intake",
+        missing_required_fields=("required_field",),
+        document_kind="synthetic_document",
+        extraction_error=(
+            DocumentExtractionError.PDF_MALFORMED
+            if reason == "document_unreadable"
+            else None
+        ),
     )
 
 
@@ -279,7 +332,9 @@ def _settings() -> Settings:
 def _install_repository(monkeypatch: pytest.MonkeyPatch) -> None:
     _FakeRepository.instances.clear()
     _FakeRepository.next_claimed = None
+    _FakeRepository.recovered = ()
     _FakeApprovalRepository.instances.clear()
+    _FakeApprovalRepository.expired = ()
     _WORKER_CALLS.clear()
     monkeypatch.setattr("app.workers.agent_worker.JobRepository", _FakeRepository)
     monkeypatch.setattr(
@@ -334,6 +389,203 @@ async def test_serve_once_runs_loop_through_injected_to_thread_seam(
         "steps": 2,
         "final_response": "done",
     }
+
+
+@pytest.mark.asyncio
+async def test_terminal_unreadable_preflight_is_persisted_as_safe_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    claimed = _claimed()
+    _FakeRepository.next_claimed = claimed
+    terminal = _terminal_preflight(
+        reason="document_unreadable",
+        routing_status=RoutingStatus.AWAITING_INPUT,
+    )
+    runtime_factory = _RuntimeFactory(terminal)
+    observer = RecordingObserver()
+    worker = AgentWorker(
+        _SessionFactory(),
+        runtime_factory=runtime_factory,
+        settings=_settings(),
+        observer=observer,
+        to_thread=asyncio.to_thread,
+    )
+
+    assert await worker.serve_once() is True
+    assert runtime_factory.calls and runtime_factory.calls[0][0] == claimed
+    assert not hasattr(terminal, "loop")
+
+    repository = _FakeRepository.instances[-1]
+    succeeded = [entry for entry in repository.calls if entry[0] == "mark_succeeded"]
+    assert succeeded
+    summary = succeeded[-1][1][0][1]  # type: ignore[index]
+    assert summary == {
+        "status": "completed",
+        "reason": "executor_stopped",
+        "steps": 0,
+        "final_response": "document_unreadable",
+        "routing_status": "awaiting_input",
+        "routing_reason": "document_unreadable",
+        "missing_required_fields": ["required_field"],
+    }
+    assert "synthetic_document" not in repr(summary)
+    assert not [entry for entry in repository.calls if entry[0] == "mark_failed"]
+    assert not [entry for entry in repository.calls if entry[0] == "schedule_retry"]
+    finished = [
+        event for event in observer.events if event.event is EventName.WORKER_JOB_FINISHED
+    ]
+    assert finished[-1].outcome is OutcomeCode.SUCCEEDED
+    assert finished[-1].worker_error_code is None
+
+
+@pytest.mark.asyncio
+async def test_capability_unavailable_preflight_is_non_retryable_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    claimed = _repair_claimed()
+    _FakeRepository.next_claimed = claimed
+    terminal = _terminal_preflight(
+        reason="capability_unavailable",
+        routing_status=RoutingStatus.REJECTED,
+    )
+    runtime_factory = _RuntimeFactory(terminal)
+    observer = RecordingObserver()
+    worker = AgentWorker(
+        _SessionFactory(),
+        runtime_factory=runtime_factory,
+        settings=_settings(),
+        observer=observer,
+        to_thread=asyncio.to_thread,
+    )
+
+    assert await worker.serve_once() is True
+    assert not hasattr(terminal, "loop")
+
+    repository = _FakeRepository.instances[-1]
+    failed = [entry for entry in repository.calls if entry[0] == "mark_failed"]
+    assert failed
+    assert failed[-1][1][0][1] == "capability_unavailable"  # type: ignore[index]
+    assert not [entry for entry in repository.calls if entry[0] == "mark_succeeded"]
+    assert not [entry for entry in repository.calls if entry[0] == "schedule_retry"]
+    finished = [
+        event for event in observer.events if event.event is EventName.WORKER_JOB_FINISHED
+    ]
+    assert finished[-1].outcome is OutcomeCode.FAILED
+    assert finished[-1].worker_error_code is WorkerErrorCode.CAPABILITY_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_worker_emits_one_trace_bound_lifecycle_for_successful_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    claimed = _repair_claimed()
+    _FakeRepository.next_claimed = claimed
+    observer = RecordingObserver()
+    ticks = iter((1_000_000, 7_000_000))
+    runtime = _Runtime(
+        _result(
+            status=RunStatus.COMPLETED,
+            reason=StopReason.FINAL,
+            final_response="done",
+        )
+    )
+    worker = AgentWorker(
+        _SessionFactory(),
+        runtime_factory=_RuntimeFactory(runtime),
+        settings=_settings(),
+        observer=observer,
+        monotonic_clock=lambda: next(ticks),
+        to_thread=asyncio.to_thread,
+    )
+
+    assert await worker.serve_once() is True
+    events = [
+        event
+        for event in observer.events
+        if event.event
+        in {
+            EventName.WORKER_JOB_CLAIMED,
+            EventName.WORKER_JOB_RUN_STARTED,
+            EventName.WORKER_JOB_FINISHED,
+        }
+    ]
+    assert [event.event for event in events] == [
+        EventName.WORKER_JOB_CLAIMED,
+        EventName.WORKER_JOB_RUN_STARTED,
+        EventName.WORKER_JOB_FINISHED,
+    ]
+    assert all(event.trace_id == claimed.trace_id for event in events)
+    assert all(event.scenario_key == "repair_service" for event in events)
+    assert all(event.profile_fingerprint == _REPAIR_PROFILE_SHA256 for event in events)
+    assert events[-1].outcome is OutcomeCode.SUCCEEDED
+    assert events[-1].steps == 2
+    assert events[-1].stop_reason is StopReason.FINAL
+    assert events[-1].duration_ms == 6
+    assert events[-1].queue_latency_ms is not None
+    assert events[-1].total_latency_ms is not None
+    assert events[-1].queue_latency_ms >= 0
+    assert events[-1].total_latency_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_worker_emits_expiry_and_lease_recovery_without_source_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    trace_id = uuid4()
+    tenant_id = uuid4()
+    job_id = uuid4()
+    approval_id = uuid4()
+    created_at = datetime(2026, 9, 23, 12, tzinfo=timezone.utc)
+    _FakeApprovalRepository.expired = (
+        ExpiredApprovalObservation(
+            trace_id=trace_id,
+            tenant_id=tenant_id,
+            job_id=job_id,
+            approval_id=approval_id,
+            created_at=created_at,
+            decided_at=created_at + timedelta(seconds=4),
+        ),
+    )
+    _FakeRepository.recovered = (
+        LeaseRecoveryObservation(
+            trace_id=trace_id,
+            tenant_id=tenant_id,
+            job_id=job_id,
+            attempt_count=3,
+            status="queued",
+            error_code="lease_expired",
+        ),
+    )
+    observer = RecordingObserver()
+    worker = AgentWorker(
+        _SessionFactory(),
+        settings=_settings(),
+        observer=observer,
+    )
+
+    assert await worker.serve_once() is False
+    events = [
+        event
+        for event in observer.events
+        if event.event
+        in {
+            EventName.APPROVAL_EXPIRED,
+            EventName.WORKER_JOB_LEASE_RECOVERED,
+        }
+    ]
+    assert [event.event for event in events] == [
+        EventName.APPROVAL_EXPIRED,
+        EventName.WORKER_JOB_LEASE_RECOVERED,
+    ]
+    assert all(event.trace_id == trace_id for event in events)
+    assert events[0].duration_ms == 4000
+    assert events[1].attempt_count == 3
+    assert events[1].worker_error_code is WorkerErrorCode.LEASE_EXPIRED
+    assert all("source" not in event.model_dump_json() for event in events)
 
 
 @pytest.mark.asyncio
@@ -446,6 +698,8 @@ async def test_retryable_pre_side_effect_error_is_scheduled_for_retry(
         _SessionFactory(),
         runtime_factory=_RuntimeFactory(runtime),
         settings=_settings(),
+        observer=RecordingObserver(),
+        random_uniform=lambda _lower, _upper: 0.0,
         to_thread=asyncio.to_thread,
     )
     assert await worker.serve_once() is True
@@ -454,6 +708,16 @@ async def test_retryable_pre_side_effect_error_is_scheduled_for_retry(
     assert retry
     assert retry[-1][1][0][0] == claimed.id  # type: ignore[index]
     assert retry[-1][1][0][1] == "provider_unavailable"  # type: ignore[index]
+
+    events = worker._observer.events  # type: ignore[attr-defined]
+    scheduled = [
+        event for event in events if event.event is EventName.WORKER_JOB_RETRY_SCHEDULED
+    ]
+    assert len(scheduled) == 1
+    assert scheduled[0].trace_id == claimed.trace_id
+    assert scheduled[0].attempt_count == claimed.attempt_count
+    assert scheduled[0].retry_delay_ms == 500
+    assert scheduled[0].worker_error_code is WorkerErrorCode.PROVIDER_UNAVAILABLE
 
 
 @pytest.mark.asyncio

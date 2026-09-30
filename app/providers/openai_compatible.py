@@ -3,13 +3,26 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from copy import deepcopy
+from uuid import uuid4
 
 import httpx
 from pydantic import ValidationError
 
 from app.agent import AgentMessage, AgentProposal, MessageRole, ToolCall
+from app.observability import (
+    Component,
+    EventLevel,
+    EventName,
+    NULL_OBSERVER,
+    ObservationContext,
+    ObservationEvent,
+    Observer,
+    OutcomeCode,
+    safe_emit,
+)
 
 
 class StructuredProposalValidationError(RuntimeError):
@@ -143,16 +156,27 @@ class OpenAICompatibleLLMClient:
         api_key: str,
         model: str,
         client: httpx.Client,
+        observer: Observer = NULL_OBSERVER,
+        context: ObservationContext | None = None,
+        clock: Callable[[], int] = time.perf_counter_ns,
     ) -> None:
         self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
         self._api_key = api_key
         self._model = model
         self._client = client
+        self._observer = observer
+        self._context = context or ObservationContext(trace_id=uuid4())
+        self._clock = clock
 
     def complete(self, messages: Sequence[AgentMessage]) -> AgentProposal:
         original = deepcopy(tuple(messages))
         try:
-            return self._complete_once(original)
+            proposal, _usage = self._attempt(
+                original,
+                call_index=1,
+                validation_retry=False,
+            )
+            return proposal
         except (
             json.JSONDecodeError,
             ValidationError,
@@ -168,7 +192,12 @@ class OpenAICompatibleLLMClient:
             AgentMessage(role=MessageRole.USER, content=feedback),
         )
         try:
-            return self._complete_once(retry_messages)
+            proposal, _usage = self._attempt(
+                retry_messages,
+                call_index=2,
+                validation_retry=True,
+            )
+            return proposal
         except (
             json.JSONDecodeError,
             ValidationError,
@@ -180,6 +209,7 @@ class OpenAICompatibleLLMClient:
             retry_feedback = _redact_secret(
                 _validation_feedback(retry_error), self._api_key
             )
+        self._emit_structured_failure()
         # Keep the provider exception out of the public error context. It may
         # contain untrusted response details, so expose only the sanitized
         # validator summary above.
@@ -188,9 +218,76 @@ class OpenAICompatibleLLMClient:
             + retry_feedback
         ) from _SanitizedValidationCause(retry_feedback)
 
+    def _attempt(
+        self,
+        messages: Sequence[AgentMessage],
+        *,
+        call_index: int,
+        validation_retry: bool,
+    ) -> tuple[AgentProposal, dict[str, int]]:
+        started_ns = self._clock()
+        try:
+            proposal, usage = self._complete_once(messages)
+        except (
+            json.JSONDecodeError,
+            ValidationError,
+            ValueError,
+            KeyError,
+            IndexError,
+            TypeError,
+        ):
+            self._emit_call(
+                call_index=call_index,
+                validation_retry=validation_retry,
+                started_ns=started_ns,
+                outcome=OutcomeCode.INVALID_SCHEMA,
+            )
+            raise
+        except httpx.HTTPStatusError as error:
+            self._emit_call(
+                call_index=call_index,
+                validation_retry=validation_retry,
+                started_ns=started_ns,
+                outcome=OutcomeCode.HTTP_ERROR,
+                status_code=error.response.status_code,
+            )
+            raise
+        except httpx.TimeoutException:
+            self._emit_call(
+                call_index=call_index,
+                validation_retry=validation_retry,
+                started_ns=started_ns,
+                outcome=OutcomeCode.TIMEOUT,
+            )
+            raise
+        except httpx.RequestError:
+            self._emit_call(
+                call_index=call_index,
+                validation_retry=validation_retry,
+                started_ns=started_ns,
+                outcome=OutcomeCode.NETWORK_ERROR,
+            )
+            raise
+        except Exception:
+            self._emit_call(
+                call_index=call_index,
+                validation_retry=validation_retry,
+                started_ns=started_ns,
+                outcome=OutcomeCode.FAILED,
+            )
+            raise
+        self._emit_call(
+            call_index=call_index,
+            validation_retry=validation_retry,
+            started_ns=started_ns,
+            outcome=OutcomeCode.SUCCESS,
+            usage=usage,
+        )
+        return proposal, usage
+
     def _complete_once(
         self, messages: Sequence[AgentMessage]
-    ) -> AgentProposal:
+    ) -> tuple[AgentProposal, dict[str, int]]:
         payload = {
             "model": self._model,
             "messages": _provider_messages(messages),
@@ -213,4 +310,79 @@ class OpenAICompatibleLLMClient:
         content = body["choices"][0]["message"]["content"]
         if not isinstance(content, str):
             raise ValueError("provider response content must be a JSON string")
-        return AgentProposal.model_validate_json(content)
+        usage = _validated_usage(body.get("usage"))
+        return AgentProposal.model_validate_json(content), usage
+
+    def _emit_call(
+        self,
+        *,
+        call_index: int,
+        validation_retry: bool,
+        started_ns: int,
+        outcome: OutcomeCode,
+        status_code: int | None = None,
+        usage: dict[str, int] | None = None,
+    ) -> None:
+        payload: dict[str, object] = {
+            "event": EventName.PROVIDER_CALL_COMPLETED,
+            "level": (
+                EventLevel.INFO
+                if outcome is OutcomeCode.SUCCESS
+                else EventLevel.WARNING
+            ),
+            "trace_id": self._context.trace_id,
+            "request_id": self._context.request_id,
+            "tenant_id": self._context.tenant_id,
+            "job_id": self._context.job_id,
+            "component": Component.PROVIDER,
+            "scenario_key": self._context.scenario_key,
+            "profile_fingerprint": self._context.profile_fingerprint,
+            "outcome": outcome,
+            "duration_ms": max(0, (self._clock() - started_ns) // 1_000_000),
+            "provider_call_index": call_index,
+            "validation_retry": validation_retry,
+            "status_code": status_code,
+        }
+        if usage:
+            payload.update(usage)
+        safe_emit(self._observer, ObservationEvent.model_validate(payload))
+
+    def _emit_structured_failure(self) -> None:
+        safe_emit(
+            self._observer,
+            ObservationEvent(
+                event=EventName.PROVIDER_STRUCTURED_OUTPUT_FAILED,
+                level=EventLevel.ERROR,
+                trace_id=self._context.trace_id,
+                request_id=self._context.request_id,
+                tenant_id=self._context.tenant_id,
+                job_id=self._context.job_id,
+                component=Component.PROVIDER,
+                scenario_key=self._context.scenario_key,
+                profile_fingerprint=self._context.profile_fingerprint,
+                outcome=OutcomeCode.INVALID_SCHEMA,
+            ),
+        )
+
+
+def _validated_usage(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    usage: dict[str, int] = {}
+    for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        token_value = value.get(name)
+        if (
+            isinstance(token_value, int)
+            and not isinstance(token_value, bool)
+            and token_value >= 0
+        ):
+            usage[name] = token_value
+    if {
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+    } <= usage.keys() and usage["total_tokens"] != (
+        usage["prompt_tokens"] + usage["completion_tokens"]
+    ):
+        return {}
+    return usage

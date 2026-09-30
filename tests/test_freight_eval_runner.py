@@ -18,6 +18,7 @@ from app.agent import (
     ToolExecutionResult,
 )
 from app.documents import DocumentMediaType
+from app.observability import EventName, ObservationContext, RecordingObserver
 from app.policy import (
     PolicyInput,
     PolicyEngine,
@@ -31,12 +32,8 @@ from evals.freight.loader import ResolvedDocumentFixture
 from evals.freight.models import (
     FreightEvalCase,
 )
-from evals.freight.runner import (
-    FreightEvalExecutionError,
-    RecordingPolicy,
-    ScriptedLLM,
-    run_freight_eval_case,
-)
+from evals.core import RecordingPolicy, ScriptedLLM
+from evals.freight.runner import FreightEvalExecutionError, run_freight_eval_case
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -312,6 +309,46 @@ async def test_runner_invokes_real_loop_and_policy_for_body_source(
     assert result.observation.case_created is True
     assert result.observation.provider_calls == 0
     assert result.observation.llm_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_runner_observer_uses_one_fixed_trace_without_changing_report(
+    tenant_config: TenantConfig,
+    document_fixtures: dict[str, ResolvedDocumentFixture],
+) -> None:
+    case = _case(
+        case_id="body-runner-observability",
+        source={
+            "kind": "body",
+            "channel": "email",
+            "subject": "Load request",
+            "body": "Need a dry van from Chicago to Detroit.",
+        },
+        proposals=[_complete_load_proposal(), _proposal(tool_name=None)],
+    )
+    observer = RecordingObserver()
+    trace_id = UUID("00000000-0000-0000-0000-000000000077")
+
+    result = await run_freight_eval_case(
+        case,
+        tenant_config=tenant_config,
+        document_fixtures=document_fixtures,
+        observer=observer,
+        context=ObservationContext(trace_id=trace_id),
+    )
+
+    assert result.passed
+    names = {event.event for event in observer.events}
+    assert {
+        EventName.AGENT_STEP_COMPLETED,
+        EventName.AGENT_RUN_FINISHED,
+        EventName.POLICY_EVALUATED,
+        EventName.TOOL_EXECUTION_COMPLETED,
+    } <= names
+    assert all(event.trace_id == trace_id for event in observer.events)
+    assert "trace_id" not in result.model_dump_json()
+    assert "events" not in result.model_dump_json()
+    assert "Need a dry van" not in result.model_dump_json()
 @pytest.mark.asyncio
 async def test_runner_document_source_uses_normalizer_and_manifest_fixture(
     tenant_config: TenantConfig,
@@ -423,12 +460,14 @@ async def test_runner_malformed_document_is_safe_and_has_no_side_effects(
             "policy_decision": "deny",
             "routing_status": "awaiting_input",
             "routing_reason": "document_unreadable",
-            "tool_name": "create_case",
+            "tool_name": None,
             "approval_required": False,
             "case_created": False,
             "document_extraction_error": "pdf_malformed",
             "provider_calls": 0,
-            "llm_calls": 1,
+            "llm_calls": 0,
+            "steps": 0,
+            "stop_reason": None,
         },
     )
 

@@ -4,10 +4,13 @@ from collections.abc import Iterable
 from contextlib import AbstractAsyncContextManager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import hashlib
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+import yaml
 from sqlalchemy.dialects import postgresql
 
 from app.auth import AuthenticatedOperator
@@ -19,6 +22,8 @@ from app.domain.approvals import (
     ApprovalExpired,
     ApprovalNotFound,
 )
+from app.observability import EventName, OutcomeCode, RecordingObserver
+from app.runtime.profiles import canonical_json_bytes
 from app.tools.models import PendingAction
 
 
@@ -27,15 +32,40 @@ TENANT_B = UUID("00000000-0000-0000-0000-000000000002")
 APPROVAL_ID = UUID("00000000-0000-0000-0000-000000000010")
 JOB_ID = UUID("00000000-0000-0000-0000-000000000020")
 CASE_ID = UUID("00000000-0000-0000-0000-000000000030")
+TRACE_ID = UUID("00000000-0000-0000-0000-000000000040")
 DECISION_TIME = datetime(2026, 9, 23, 13, tzinfo=timezone.utc)
+REPAIR_PROFILE_SNAPSHOT = yaml.safe_load(
+    (Path(__file__).parents[1] / "examples" / "repair-service.yaml").read_text(
+        encoding="utf-8"
+    )
+)
+REPAIR_PROFILE_SHA256 = hashlib.sha256(
+    canonical_json_bytes(REPAIR_PROFILE_SNAPSHOT)
+).hexdigest()
+CURRENT_PROFILE_SHA256 = hashlib.sha256(
+    canonical_json_bytes(
+        {
+            **REPAIR_PROFILE_SNAPSHOT,
+            "display_name": "Changed repair service profile",
+        }
+    )
+).hexdigest()
 
 
 class _ScalarResult:
-    def __init__(self, value: Approval | None) -> None:
+    def __init__(self, value: object) -> None:
         self.value = value
 
-    def scalar_one_or_none(self) -> Approval | None:
+    def scalar_one_or_none(self) -> object:
         return self.value
+
+
+class _RowResult:
+    def __init__(self, row: tuple[object, ...] | None) -> None:
+        self.row = row
+
+    def one_or_none(self) -> tuple[object, ...] | None:
+        return self.row
 
 
 class _Transaction(AbstractAsyncContextManager["_Transaction"]):
@@ -68,10 +98,31 @@ class _ApprovalSession:
     def add(self, value: ApprovalEvent) -> None:
         self.events.append(value)
 
-    async def execute(self, statement: object) -> _ScalarResult:
+    async def execute(self, statement: object) -> _ScalarResult | _RowResult:
         compiled = statement.compile(dialect=postgresql.dialect())
         query = str(compiled)
         self.queries.append(query)
+        if "FROM agent_jobs" in query:
+            params = compiled.params
+            job_id = params["id_1"]
+            tenant_id = params["tenant_id_1"]
+            approval = next(
+                (
+                    value
+                    for value in self.approvals
+                    if value.job_id == job_id and value.tenant_id == tenant_id
+                ),
+                None,
+            )
+            return _RowResult(
+                (
+                    TRACE_ID,
+                    deepcopy(REPAIR_PROFILE_SNAPSHOT),
+                    REPAIR_PROFILE_SHA256,
+                )
+                if approval is not None
+                else None
+            )
         assert "FROM approvals" in query
         assert "FOR UPDATE" in query.upper()
         params = compiled.params
@@ -182,7 +233,7 @@ def _approval(
         decision={},
         policy_reason="approval_required",
         pending_action=action.model_dump(mode="json"),
-        tenant_config_sha256="a" * 64,
+        tenant_config_sha256=REPAIR_PROFILE_SHA256,
         expires_at=expires_at,
         execution_result=None,
     )
@@ -193,8 +244,16 @@ def _service(
     executor: _RecordingExecutor,
     *,
     now: datetime = DECISION_TIME,
+    observer: RecordingObserver | None = None,
+    request_id: UUID | None = None,
 ) -> ApprovalDecisionService:
-    return ApprovalDecisionService(session, executor, clock=lambda: now)
+    return ApprovalDecisionService(
+        session,
+        executor,
+        clock=lambda: now,
+        observer=observer or RecordingObserver(),
+        request_id=request_id,
+    )
 
 
 def _request(decision: str, reason: str = "Reviewed by operations") -> ApprovalDecisionRequest:
@@ -250,6 +309,54 @@ async def test_approve_executes_create_case_once_and_retries_are_idempotent() ->
         await service.decide(APPROVAL_ID, operator, _request("reject"))
     assert executor.calls == 1
     assert len(session.events) == 2
+
+
+@pytest.mark.asyncio
+async def test_approval_observations_use_original_job_trace_and_redact_decision_data() -> None:
+    approval = _approval()
+    approval.created_at = DECISION_TIME - timedelta(seconds=2)
+    session = _ApprovalSession([approval])
+    observer = RecordingObserver()
+    request_id = UUID("00000000-0000-0000-0000-000000000041")
+    result = await _service(
+        session,
+        _RecordingExecutor(),
+        observer=observer,
+        request_id=request_id,
+    ).decide(
+        APPROVAL_ID,
+        _operator(),
+        _request("approve", "DECISION_REASON_SECRET"),
+    )
+
+    assert result.status == "approved"
+    events = [
+        event
+        for event in observer.events
+        if event.event
+        in {
+            EventName.APPROVAL_DECIDED,
+            EventName.APPROVAL_ACTION_COMPLETED,
+        }
+    ]
+    assert [event.event for event in events] == [
+        EventName.APPROVAL_DECIDED,
+        EventName.APPROVAL_ACTION_COMPLETED,
+    ]
+    assert [event.outcome for event in events] == [
+        OutcomeCode.APPROVED,
+        OutcomeCode.EXECUTED,
+    ]
+    assert all(event.trace_id == TRACE_ID for event in events)
+    assert all(event.scenario_key == "repair_service" for event in events)
+    assert all(event.profile_fingerprint == REPAIR_PROFILE_SHA256 for event in events)
+    assert REPAIR_PROFILE_SHA256 != CURRENT_PROFILE_SHA256
+    assert all(event.request_id == request_id for event in events)
+    assert all(event.action_key == "create_case" for event in events)
+    assert all(event.action_known is True for event in events)
+    assert events[0].duration_ms == events[1].duration_ms == 2000
+    assert all("DECISION_REASON_SECRET" not in event.model_dump_json() for event in events)
+    assert all("pending_action" not in event.model_dump_json() for event in events)
 
 
 @pytest.mark.asyncio
@@ -312,6 +419,43 @@ async def test_expired_approve_transitions_to_expired_and_never_executes_action(
     assert approval.decided_by_actor_ref == "system_timeout"
     assert executor.calls == 0
     assert [event.event_type for event in session.events] == ["approval_expired"]
+
+
+@pytest.mark.asyncio
+async def test_expired_approval_emits_decision_and_timeout_events() -> None:
+    approval = _approval(expires_at=DECISION_TIME - timedelta(seconds=1))
+    approval.created_at = DECISION_TIME - timedelta(seconds=3)
+    observer = RecordingObserver()
+    session = _ApprovalSession([approval])
+
+    with pytest.raises(ApprovalExpired):
+        await _service(
+            session,
+            _RecordingExecutor(),
+            observer=observer,
+        ).decide(
+            APPROVAL_ID,
+            _operator(),
+            _request("approve"),
+        )
+
+    events = [
+        event
+        for event in observer.events
+        if event.event
+        in {EventName.APPROVAL_DECIDED, EventName.APPROVAL_EXPIRED}
+    ]
+    assert [event.outcome for event in events] == [
+        OutcomeCode.EXPIRED,
+        OutcomeCode.EXPIRED,
+    ]
+    assert all(event.trace_id == TRACE_ID for event in events)
+    assert all(event.scenario_key == "repair_service" for event in events)
+    assert all(event.profile_fingerprint == REPAIR_PROFILE_SHA256 for event in events)
+    assert REPAIR_PROFILE_SHA256 != CURRENT_PROFILE_SHA256
+    assert all(event.action_key == "create_case" for event in events)
+    assert all(event.action_known is True for event in events)
+    assert all(event.duration_ms == 3000 for event in events)
 
 
 @pytest.mark.asyncio

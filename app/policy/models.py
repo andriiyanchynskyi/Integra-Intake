@@ -5,11 +5,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from app.agent import AgentProposal, ToolData
-from app.documents import NormalizedRateConfirmationDocument
+from app.documents import NormalizedDocument, decode_document_snapshot
 from app.tenants.config import RoutingDecision, RoutingStatus, TenantConfig
+
+if TYPE_CHECKING:
+    from app.tenants.compiled import CompiledTenantProfile, ImmutableTenantConfig
 
 
 def proposal_value_is_present(value: object) -> bool:
@@ -38,7 +42,7 @@ class TrustedSource:
     channel: str
     subject: str
     body: str
-    document: NormalizedRateConfirmationDocument | None = None
+    document: NormalizedDocument | None = None
     sender: str | None = None
 
 
@@ -63,9 +67,7 @@ def trusted_source_from_snapshot(value: object) -> TrustedSource:
     document = None
     if "document" in value:
         try:
-            document = NormalizedRateConfirmationDocument.model_validate(
-                deepcopy(value["document"])
-            )
+            document = decode_document_snapshot(deepcopy(value["document"]))
         except Exception as error:
             raise RuntimeError("source snapshot is invalid") from error
     return TrustedSource(
@@ -82,7 +84,8 @@ class TrustedToolRuntimeContext:
     """Server-owned context held by a policy-gated executor."""
 
     tenant_id: UUID
-    tenant_config: TenantConfig
+    tenant_config: TenantConfig | ImmutableTenantConfig
+    compiled_profile: CompiledTenantProfile | None = None
     source: TrustedSource | None = None
     case_id: UUID | None = None
     risk_signals: RiskSignals = field(default_factory=RiskSignals)

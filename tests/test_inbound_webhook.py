@@ -33,13 +33,14 @@ from app.agent import (
 from app.db.models import Tenant
 from app.db.session import get_db_session
 from app.documents import (
+    DocumentInput,
     DocumentExtractionError,
     DocumentMediaType,
     MAX_DOCUMENT_BYTES,
-    NormalizedRateConfirmationDocument,
-    RateConfirmationDocumentInput,
+    NormalizedDocument,
 )
 from app.domain.intake import (
+    EnqueueDocumentIntakeCommand,
     EnqueueIntakeCommand,
     EnqueueResult,
     IdempotencyConflict,
@@ -53,7 +54,7 @@ from app.inbound import (
 )
 from app.inbound.service import InboundIntakeService
 from app.main import app
-from app.policy import TrustedToolRuntimeContext
+from app.policy import TrustedSource, TrustedToolRuntimeContext
 from app.runtime.factory import AgentRuntimeFactory
 from app.runtime.profiles import TenantProfileUnavailableError
 from app.tenants.loader import load_tenant_config
@@ -67,13 +68,48 @@ class _RecordingEnqueueService:
     """Small async double for the existing enqueue boundary."""
 
     job_id: UUID
+    document_normalizer: Any | None = None
 
     def __post_init__(self) -> None:
+        self.trace_id = uuid4()
         self.commands: list[EnqueueIntakeCommand] = []
+        self.document_commands: list[EnqueueDocumentIntakeCommand] = []
+        self.document_sources: list[TrustedSource] = []
 
     async def enqueue(self, command: EnqueueIntakeCommand) -> EnqueueResult:
         self.commands.append(command)
-        return EnqueueResult(job_id=self.job_id, created=True)
+        return EnqueueResult(
+            job_id=self.job_id,
+            created=True,
+            trace_id=self.trace_id,
+        )
+
+    async def enqueue_document(
+        self, command: EnqueueDocumentIntakeCommand
+    ) -> EnqueueResult:
+        self.document_commands.append(command)
+        if self.document_normalizer is not None:
+            normalized = self.document_normalizer.normalize(
+                command.document,
+                document_kind="rate_confirmation",
+                target_intake_type="rate_confirmation",
+                normalizer_key="bounded_text_pdf",
+                normalizer_version=1,
+            )
+            self.document_sources.append(
+                TrustedSource(
+                    channel=command.document.channel,
+                    sender=command.sender,
+                    subject=command.document.subject,
+                    body="Document received.",
+                    document=normalized,
+                )
+            )
+        return EnqueueResult(
+            job_id=self.job_id,
+            created=True,
+            trace_id=self.trace_id,
+        )
 
 
 class _RecordingInboundService:
@@ -81,6 +117,7 @@ class _RecordingInboundService:
 
     def __init__(self, job_id: UUID | None = None) -> None:
         self.job_id = job_id or uuid4()
+        self.trace_id = uuid4()
         self.messages: list[InboundMessage] = []
         self.error: Exception | None = None
 
@@ -88,18 +125,37 @@ class _RecordingInboundService:
         self.messages.append(message)
         if self.error is not None:
             raise self.error
-        return EnqueueResult(job_id=self.job_id, created=True)
+        return EnqueueResult(
+            job_id=self.job_id,
+            created=True,
+            trace_id=self.trace_id,
+        )
 
 
 class _FakeNormalizer:
-    def __init__(self, result: NormalizedRateConfirmationDocument) -> None:
+    def __init__(self, result: NormalizedDocument) -> None:
         self.result = result
-        self.inputs: list[RateConfirmationDocumentInput] = []
+        self.inputs: list[DocumentInput] = []
+        self.bindings: list[tuple[str, str, str, int]] = []
 
     def normalize(
-        self, value: RateConfirmationDocumentInput
-    ) -> NormalizedRateConfirmationDocument:
+        self,
+        value: DocumentInput,
+        *,
+        document_kind: str,
+        target_intake_type: str,
+        normalizer_key: str,
+        normalizer_version: int,
+    ) -> NormalizedDocument:
         self.inputs.append(value)
+        self.bindings.append(
+            (
+                document_kind,
+                target_intake_type,
+                normalizer_key,
+                normalizer_version,
+            )
+        )
         return self.result
 
 
@@ -347,7 +403,11 @@ async def test_body_only_service_enqueues_existing_command_with_provider_id_key(
 
     result = await service.enqueue(message)
 
-    assert result == EnqueueResult(job_id=enqueue.job_id, created=True)
+    assert result == EnqueueResult(
+        job_id=enqueue.job_id,
+        created=True,
+        trace_id=enqueue.trace_id,
+    )
     assert len(enqueue.commands) == 1
     command = enqueue.commands[0]
     assert isinstance(command, EnqueueIntakeCommand)
@@ -362,7 +422,7 @@ async def test_body_only_service_enqueues_existing_command_with_provider_id_key(
 
 
 @pytest.mark.asyncio
-async def test_pdf_attachment_is_normalized_only_through_injected_to_thread_and_safe_source(
+async def test_pdf_attachment_delegates_document_command_and_normalizer_through_enqueue_service(
 ) -> None:
     raw_pdf = b"%PDF-raw-secret"
     encoded = base64.b64encode(raw_pdf).decode("ascii")
@@ -373,9 +433,13 @@ async def test_pdf_attachment_is_normalized_only_through_injected_to_thread_and_
             attachments=[_attachment(content=raw_pdf)],
         )
     )
-    normalized = NormalizedRateConfirmationDocument(
+    normalized = NormalizedDocument(
+        document_kind="rate_confirmation",
+        target_intake_type="rate_confirmation",
         media_type=DocumentMediaType.PDF,
         sha256="a" * 64,
+        normalizer_key="bounded_text_pdf",
+        normalizer_version=1,
         text="Origin: Chicago\nDestination: Detroit",
     )
     normalizer = _FakeNormalizer(normalized)
@@ -394,20 +458,29 @@ async def test_pdf_attachment_is_normalized_only_through_injected_to_thread_and_
 
     await service.enqueue(message)
 
-    assert len(thread_calls) == 1
-    assert getattr(thread_calls[0][0], "__self__", None) is normalizer
+    assert thread_calls == []
     assert len(normalizer.inputs) == 1
     document_input = normalizer.inputs[0]
+    assert isinstance(document_input, DocumentInput)
     assert document_input.media_type is DocumentMediaType.PDF
     assert document_input.content == raw_pdf
     assert document_input.body == "Please process the attachment."
+    assert normalizer.bindings == [
+        ("rate_confirmation", "rate_confirmation", "bounded_text_pdf", 1)
+    ]
 
-    assert len(enqueue.commands) == 1
-    command = enqueue.commands[0]
-    assert command.source.body == "Please process the attachment."
-    assert command.source.sender == "dispatcher@example.test"
-    assert command.source.document == normalized
-    source_repr = repr(command.source)
+    assert len(enqueue.document_commands) == 1
+    command = enqueue.document_commands[0]
+    assert command.tenant_id == message.tenant_id
+    assert command.tenant_slug == message.tenant_slug
+    assert command.idempotency_key == "email_webhook:provider-123"
+    assert command.sender == "dispatcher@example.test"
+    assert len(enqueue.document_sources) == 1
+    source = enqueue.document_sources[0]
+    assert source.body == "Document received."
+    assert source.sender == "dispatcher@example.test"
+    assert source.document == normalized
+    source_repr = repr(source)
     assert raw_pdf not in source_repr.encode("utf-8")
     assert encoded not in source_repr
     assert "content" not in normalized.model_dump(mode="json")
@@ -416,28 +489,29 @@ async def test_pdf_attachment_is_normalized_only_through_injected_to_thread_and_
 @pytest.mark.asyncio
 async def test_malformed_normalizer_result_is_still_enqueued_as_document_source() -> None:
     message = _message(_payload(attachments=[_attachment()]))
-    malformed = NormalizedRateConfirmationDocument(
+    malformed = NormalizedDocument(
+        document_kind="rate_confirmation",
+        target_intake_type="rate_confirmation",
         media_type=DocumentMediaType.PDF,
         sha256="b" * 64,
+        normalizer_key="bounded_text_pdf",
+        normalizer_version=1,
         extraction_error=DocumentExtractionError.PDF_MALFORMED,
     )
     normalizer = _FakeNormalizer(malformed)
     enqueue = _RecordingEnqueueService(job_id=uuid4())
 
-    async def injected_to_thread(function: object, *args: object) -> object:
-        return function(*args)  # type: ignore[operator]
-
     service = InboundIntakeService(
         enqueue,
         normalizer=normalizer,
-        to_thread=injected_to_thread,
     )
 
     result = await service.enqueue(message)
 
     assert result.created is True
-    assert len(enqueue.commands) == 1
-    document = enqueue.commands[0].source.document
+    assert len(enqueue.document_commands) == 1
+    assert len(normalizer.inputs) == 1
+    document = enqueue.document_sources[0].document
     assert document == malformed
     assert document is not None
     assert document.text is None
@@ -458,24 +532,26 @@ async def test_attachment_boundary_keeps_only_normalized_safe_metadata_downstrea
             attachments=[_attachment(content=raw_pdf)],
         )
     )
-    normalized = NormalizedRateConfirmationDocument(
+    normalized = NormalizedDocument(
+        document_kind="rate_confirmation",
+        target_intake_type="rate_confirmation",
         media_type=DocumentMediaType.PDF,
         sha256="c" * 64,
+        normalizer_key="bounded_text_pdf",
+        normalizer_version=1,
         extraction_error=DocumentExtractionError.PDF_MALFORMED,
     )
     enqueue = _RecordingEnqueueService(job_id=uuid4())
     normalizer = _FakeNormalizer(normalized)
 
-    async def injected_to_thread(function: object, *args: object) -> object:
-        return function(*args)  # type: ignore[operator]
-
     await InboundIntakeService(
         enqueue,
         normalizer=normalizer,
-        to_thread=injected_to_thread,
     ).enqueue(message)
 
-    source = enqueue.commands[0].source
+    assert len(enqueue.document_commands) == 1
+    assert len(normalizer.inputs) == 1
+    source = enqueue.document_sources[0]
     source_snapshot = JobRepository._source_snapshot(source)
     snapshot_text = repr(source_snapshot)
     assert source_snapshot["document"] == normalized.model_dump(mode="json")

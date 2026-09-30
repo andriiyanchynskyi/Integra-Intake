@@ -17,26 +17,22 @@ class PolicyEngine:
         known_fields = set(value.runtime.tenant_config.fields)
         document = value.runtime.source.document if value.runtime.source else None
         if document is not None and document.extraction_error is not None:
-            if not (
-                value.runtime.risk_signals.safety_or_legal_risk
-                or value.proposal.contains_injection_or_override_attempt
-            ):
-                intake = next(
-                    (
-                        item
-                        for item in value.runtime.tenant_config.intake_types
-                        if item.name == "rate_confirmation"
-                    ),
-                    None,
-                )
-                return PolicyOutcome(
-                    decision=RoutingDecision.DENY,
-                    status=RoutingStatus.AWAITING_INPUT,
-                    reason="document_unreadable",
-                    missing_required_fields=(
-                        tuple(sorted(intake.required_fields)) if intake else ()
-                    ),
-                )
+            intake = next(
+                (
+                    item
+                    for item in value.runtime.tenant_config.intake_types
+                    if item.name == document.target_intake_type
+                ),
+                None,
+            )
+            return PolicyOutcome(
+                decision=RoutingDecision.DENY,
+                status=RoutingStatus.AWAITING_INPUT,
+                reason="document_unreadable",
+                missing_required_fields=(
+                    tuple(sorted(intake.required_fields)) if intake else ()
+                ),
+            )
         present_fields = frozenset(
             item
             for item in (

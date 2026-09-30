@@ -112,3 +112,19 @@ ALL_SKILLS = (
     DRAFT_OPS_REPLY_V1,
     EXTRACT_RATE_CONFIRMATION_V1,
 )
+
+GENERIC_SKILLS = (
+    EXTRACT_LOAD_REQUEST_V1,
+    CLASSIFY_INTAKE_V1,
+    DRAFT_OPS_REPLY_V1,
+)
+
+DOCUMENT_SKILLS = {
+    "rate_confirmation": EXTRACT_RATE_CONFIRMATION_V1,
+}
+
+
+def skill_for_document_kind(document_kind: str) -> SkillDefinition | None:
+    """Resolve an optional document prompt without coupling runtime to a scenario."""
+
+    return DOCUMENT_SKILLS.get(document_kind)

@@ -1,4 +1,6 @@
+profile_version: 2
 slug: repair-service
+scenario_key: repair_service
 display_name: Repair service
 intake_types:
   - name: service_request
@@ -18,13 +20,14 @@ fields:
   preferred_time: {type: date_time, label: Preferred appointment}
   serial_number: {type: short_text, label: Serial number}
 action_policy:
-  create_case: {allowed: true, requires_approval: false}
-  find_customer: {allowed: true, requires_approval: false}
-  update_case_fields: {allowed: true, requires_approval: false}
-  create_reply_draft: {allowed: true, requires_approval: false}
-  send_reply: {allowed: true, requires_approval: true}
-  close_case: {allowed: true, requires_approval: true}
-  flag_for_review: {allowed: true, requires_approval: false}
+  create_case: {allowed: true, requires_approval: false, execution: executable}
+  find_customer: {allowed: true, requires_approval: false, execution: executable}
+  update_case_fields: {allowed: true, requires_approval: false, execution: executable}
+  create_reply_draft: {allowed: true, requires_approval: false, execution: executable}
+  send_reply: {allowed: true, requires_approval: true, execution: policy_only}
+  close_case: {allowed: true, requires_approval: true, execution: policy_only}
+  flag_for_review: {allowed: true, requires_approval: false, execution: executable}
+documents: {}
 routing:
   outcome_names: [urgent, awaiting_input, pending_approval, ready, rejected]
   always_approval_actions: [send_reply, close_case]

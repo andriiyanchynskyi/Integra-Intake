@@ -570,14 +570,14 @@ cases:
       policy_decision: deny
       routing_status: awaiting_input
       routing_reason: document_unreadable
-      tool_name: create_case
+      tool_name: null
       approval_required: false
       case_created: false
       document_extraction_error: pdf_malformed
       provider_calls: 0
-      llm_calls: 1
-      steps: 1
-      stop_reason: executor_stopped
+      llm_calls: 0
+      steps: 0
+      stop_reason: null
     metadata: *core_agent
   - id: doc-missing-excerpt
     category: document

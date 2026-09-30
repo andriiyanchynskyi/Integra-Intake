@@ -125,6 +125,7 @@ class AgentJob(TimestampedModel, Base):
     __tablename__ = "agent_jobs"
     __table_args__ = (
         UniqueConstraint("tenant_id", "id", name="uq_agent_jobs_tenant_id_id"),
+        UniqueConstraint("trace_id", name="uq_agent_jobs_trace_id"),
         Index("ix_agent_jobs_tenant_id_id", "tenant_id", "id"),
         Index("ix_agent_jobs_status_available_at", "status", "available_at"),
         Index("ix_agent_jobs_running_lease", "status", "lease_expires_at"),
@@ -132,6 +133,9 @@ class AgentJob(TimestampedModel, Base):
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
     tenant_id: Mapped[UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    trace_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False, default=uuid4
+    )
     status: Mapped[str] = mapped_column(
         String(50), nullable=False, default="queued", server_default="queued"
     )

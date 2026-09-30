@@ -31,6 +31,11 @@ from app.tools.models import (
     UpdatedCase,
 )
 from app.tools.ports import CustomerNotFoundError, TenantToolPort
+from app.tools.registry import (
+    ActionCapabilityUnavailable,
+    ActionRegistry,
+    BUILTIN_ACTION_REGISTRY,
+)
 
 
 class PostgresTenantToolPort:
@@ -288,6 +293,12 @@ class SyncTenantToolPort(TenantToolPort):
 class PostgresApprovalActionExecutor:
     """Execute one frozen approval command in the caller's transaction."""
 
+    def __init__(
+        self,
+        action_registry: ActionRegistry = BUILTIN_ACTION_REGISTRY,
+    ) -> None:
+        self._action_registry = action_registry
+
     async def execute(
         self,
         session: AsyncSession,
@@ -315,43 +326,87 @@ class PostgresApprovalActionExecutor:
         ):
             raise RuntimeError("approval trusted job is unavailable")
 
-        if action.name == "create_case":
-            result = await self._create_case(session, approval, job, action)
-            case_id = result.get("case_id")
-            if not isinstance(case_id, str):
-                raise RuntimeError("approved case result is invalid")
-            approval.case_id = UUID(case_id)
+        try:
+            capability = self._action_registry.require(action.name)
+        except ActionCapabilityUnavailable as error:
+            raise RuntimeError("approval action is not registered") from error
+        if action.version != capability.pending_action_version:
+            raise RuntimeError("approval action version is unavailable")
+        try:
+            capability.arguments_model.model_validate(action.arguments)
+        except Exception as error:
+            raise RuntimeError("approved action arguments are invalid") from error
+
+        handlers = {
+            "create_case": self._create_case,
+            "update_case_fields": self._update_case_fields,
+            "find_customer": self._find_customer,
+            "create_reply_draft": self._create_reply_draft,
+            "flag_for_review": self._flag_for_review,
+        }
+        if frozenset(handlers) != self._action_registry.keys:
+            raise RuntimeError("action registry and approval handlers are incompatible")
+        handler = handlers.get(capability.key)
+        if handler is None:
+            raise RuntimeError("approval action is not registered")
+        result = await handler(session, approval, job, action)
+        if capability.commits_side_effect:
             job.side_effect_committed_at = now
-            return result
-        if action.name == "update_case_fields":
-            result = await self._update_case_fields(session, approval, job, action)
-            job.side_effect_committed_at = now
-            return result
-        if action.name == "find_customer":
-            values = FindCustomerArgs.model_validate(action.arguments)
-            customer = await CaseRepository(session).find_customer_for_tenant(
-                approval.tenant_id,
-                email=values.email,
-                external_id=values.external_id,
+        case_id = result.get("case_id")
+        if isinstance(case_id, str):
+            try:
+                approval.case_id = UUID(case_id)
+            except ValueError as error:
+                raise RuntimeError("approved case result is invalid") from error
+        return result
+
+    async def _find_customer(
+        self,
+        session: AsyncSession,
+        approval: Approval,
+        job: AgentJob,
+        action: PendingAction,
+    ) -> dict[str, object]:
+        del job
+        values = FindCustomerArgs.model_validate(action.arguments)
+        customer = await CaseRepository(session).find_customer_for_tenant(
+            approval.tenant_id,
+            email=values.email,
+            external_id=values.external_id,
+        )
+        return {
+            "found": customer is not None,
+            "customer_id": str(customer.id) if customer is not None else None,
+        }
+
+    async def _create_reply_draft(
+        self,
+        session: AsyncSession,
+        approval: Approval,
+        job: AgentJob,
+        action: PendingAction,
+    ) -> dict[str, object]:
+        del job
+        values = CreateReplyDraftArgs.model_validate(action.arguments)
+        if values.case_id is not None:
+            case = await CaseRepository(session).get_for_tenant(
+                values.case_id, approval.tenant_id
             )
-            return {
-                "found": customer is not None,
-                "customer_id": str(customer.id) if customer is not None else None,
-            }
-        if action.name == "create_reply_draft":
-            values = CreateReplyDraftArgs.model_validate(action.arguments)
-            if values.case_id is not None:
-                case = await CaseRepository(session).get_for_tenant(
-                    values.case_id, approval.tenant_id
-                )
-                if case is None:
-                    raise RuntimeError("approved case is unavailable")
-                approval.case_id = case.id
-            return {"outcome": "draft_generated", "persisted": False}
-        if action.name == "flag_for_review":
-            FlagForReviewArgs.model_validate(action.arguments)
-            return {"outcome": "review_flagged", "persisted": False}
-        raise RuntimeError("approval action is not registered")
+            if case is None:
+                raise RuntimeError("approved case is unavailable")
+            approval.case_id = case.id
+        return {"outcome": "draft_generated", "persisted": False}
+
+    async def _flag_for_review(
+        self,
+        session: AsyncSession,
+        approval: Approval,
+        job: AgentJob,
+        action: PendingAction,
+    ) -> dict[str, object]:
+        del session, approval, job
+        FlagForReviewArgs.model_validate(action.arguments)
+        return {"outcome": "review_flagged", "persisted": False}
 
     async def _create_case(
         self,

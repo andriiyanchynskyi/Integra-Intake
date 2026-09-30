@@ -14,12 +14,23 @@ from dataclasses import dataclass
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import ApiKey, Tenant
 from app.db.session import get_db_session
+from app.observability import (
+    Component,
+    CredentialKind,
+    EventName,
+    ObservationEvent,
+    ObservationContext,
+    OutcomeCode,
+    request_context,
+    request_observer,
+    safe_emit,
+)
 
 
 API_KEY_PREFIX = "ik_"
@@ -51,10 +62,12 @@ def generate_api_key() -> tuple[str, str, str]:
 
 
 async def get_current_tenant(
+    request: Request = None,  # type: ignore[assignment]
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
     session: AsyncSession = Depends(get_db_session),
 ) -> Tenant:
     if x_api_key is None or not API_KEY_TOKEN_PATTERN.fullmatch(x_api_key):
+        _emit_authentication(request, CredentialKind.SERVICE_API_KEY, OutcomeCode.REJECTED)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
@@ -62,10 +75,17 @@ async def get_current_tenant(
 
     tenant = await _resolve_active_tenant(x_api_key, session)
     if tenant is None:
+        _emit_authentication(request, CredentialKind.SERVICE_API_KEY, OutcomeCode.REJECTED)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
         )
+    _emit_authentication(
+        request,
+        CredentialKind.SERVICE_API_KEY,
+        OutcomeCode.AUTHENTICATED,
+        tenant_id=tenant.id,
+    )
     return tenant
 
 
@@ -82,12 +102,14 @@ async def _resolve_active_tenant(
 
 
 async def get_current_operator(
+    request: Request = None,  # type: ignore[assignment]
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
     session: AsyncSession = Depends(get_db_session),
 ) -> AuthenticatedOperator:
     """Authenticate only active operator credentials allowed to decide approvals."""
 
     if x_api_key is None or not API_KEY_TOKEN_PATTERN.fullmatch(x_api_key):
+        _emit_authentication(request, CredentialKind.OPERATOR_API_KEY, OutcomeCode.REJECTED)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid operator API key",
@@ -107,12 +129,46 @@ async def get_current_operator(
     )
     credential = (await session.execute(statement)).scalar_one_or_none()
     if credential is None or not credential.actor_ref:
+        _emit_authentication(request, CredentialKind.OPERATOR_API_KEY, OutcomeCode.REJECTED)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid operator API key",
         )
+    _emit_authentication(
+        request,
+        CredentialKind.OPERATOR_API_KEY,
+        OutcomeCode.AUTHENTICATED,
+        tenant_id=credential.tenant_id,
+    )
     return AuthenticatedOperator(
         tenant_id=credential.tenant_id,
         actor_ref=credential.actor_ref,
         credential_id=credential.id,
+    )
+
+
+def _emit_authentication(
+    request: Request | None,
+    credential_kind: CredentialKind,
+    outcome: OutcomeCode,
+    *,
+    tenant_id: UUID | None = None,
+) -> None:
+    if request is None:
+        return
+    try:
+        context: ObservationContext = request_context(request)
+    except RuntimeError:
+        return
+    safe_emit(
+        request_observer(request),
+        ObservationEvent(
+            event=EventName.AUTH_COMPLETED,
+            trace_id=context.trace_id,
+            request_id=context.request_id,
+            tenant_id=tenant_id,
+            component=Component.AUTH,
+            outcome=outcome,
+            credential_kind=credential_kind,
+        ),
     )

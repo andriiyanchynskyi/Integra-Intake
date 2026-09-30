@@ -12,9 +12,11 @@ from app.auth.api_keys import (
     hash_api_key,
 )
 from app.auth.inbound_webhook import (
+    InboundSignatureOutcome,
     MAX_SIGNATURE_AGE_SECONDS,
     SIGNATURE_VERSION,
     get_current_inbound_tenant,
+    inbound_signature_outcome,
     read_bounded_inbound_body,
     sign_inbound_webhook,
     signature_payload,
@@ -32,8 +34,10 @@ __all__ = [
     "get_current_tenant",
     "hash_api_key",
     "MAX_SIGNATURE_AGE_SECONDS",
+    "InboundSignatureOutcome",
     "SIGNATURE_VERSION",
     "get_current_inbound_tenant",
+    "inbound_signature_outcome",
     "read_bounded_inbound_body",
     "sign_inbound_webhook",
     "signature_payload",

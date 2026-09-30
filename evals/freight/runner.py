@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import base64
-from collections import deque
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 
-from app.agent import AgentLoop, AgentMessage, AgentProposal, MessageRole
+from app.agent import AgentLoop, AgentMessage, MessageRole
 from app.auth.inbound_webhook import (
     sign_inbound_webhook,
     verify_inbound_webhook_signature,
@@ -26,25 +25,33 @@ from app.domain.intake import (
     IdempotencyConflict,
     IntakeEnqueueService,
 )
+from app.observability import (
+    NULL_OBSERVER,
+    ObservationContext,
+    Observer,
+)
 from app.inbound import (
     InboundIntakeService,
     WebhookAttachmentPayload,
     WebhookEmailPayload,
     parse_webhook_email_payload,
 )
-from app.policy import (
-    PolicyEngine,
-    PolicyInput,
-    PolicyOutcome,
-    RiskSignals,
-    TrustedSource,
-    TrustedToolRuntimeContext,
-)
+from app.policy import RiskSignals, TrustedSource, TrustedToolRuntimeContext
 from app.runtime.factory import AgentRuntimeFactory
+from app.runtime.preflight import TerminalPreflightResult, preflight_document
 from app.runtime.profiles import TenantProfileResolver
+from app.tenants.compiled import compile_tenant_profile
 from app.tenants.config import TenantConfig
 from app.tools.executor import PolicyGatedToolExecutor
 from app.tools.in_memory import InMemoryTenantToolPort
+
+from evals.core import (
+    RecordingPolicy,
+    ScenarioExecutionError,
+    ScriptedLLM,
+    profile_fingerprint,
+)
+from app.domain.job_repository import JobObservationIdentity
 
 from .loader import ResolvedDocumentFixture
 from .models import (
@@ -59,75 +66,7 @@ from .models import (
 )
 
 
-class FreightEvalExecutionError(RuntimeError):
-    """A safe, stable scripted-evaluation execution failure."""
-
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
-
-
-class ScriptedLLM:
-    """Return a fixed typed proposal sequence without inspecting messages."""
-
-    def __init__(self, proposals: Sequence[AgentProposal]) -> None:
-        validated = tuple(AgentProposal.model_validate(item) for item in proposals)
-        self._proposals = deque(deepcopy(validated))
-        self.calls = 0
-        self.returned_proposals: list[AgentProposal] = []
-
-    def complete(self, messages: Sequence[AgentMessage]) -> AgentProposal:
-        del messages
-        self.calls += 1
-        if not self._proposals:
-            raise FreightEvalExecutionError("scripted_proposals_exhausted")
-        proposal = deepcopy(self._proposals.popleft())
-        self.returned_proposals.append(deepcopy(proposal))
-        return proposal
-
-    def assert_consumed(self) -> None:
-        if self._proposals:
-            raise FreightEvalExecutionError("scripted_proposals_unused")
-
-
-class RecordingPolicy:
-    """Delegate policy decisions to the production engine and record outcomes."""
-
-    def __init__(self) -> None:
-        self._delegate = PolicyEngine()
-        self.outcomes: list[PolicyOutcome] = []
-
-    def evaluate(self, value: PolicyInput) -> PolicyOutcome:
-        outcome = self._delegate.evaluate(value)
-        self.outcomes.append(outcome)
-        return outcome
-
-
-class _RecordingLLM:
-    """Record a real local fallback client without changing its behavior."""
-
-    def __init__(self, delegate: object) -> None:
-        self._delegate = delegate
-        self.calls = 0
-        self.returned_proposals: list[AgentProposal] = []
-
-    def complete(self, messages: Sequence[AgentMessage]) -> AgentProposal:
-        self.calls += 1
-        proposal = AgentProposal.model_validate(self._delegate.complete(messages))
-        self.returned_proposals.append(deepcopy(proposal))
-        return proposal
-
-
-class _ProviderCallGuard:
-    """Fail closed if the runtime tries to construct a real provider client."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def __call__(self, client: object) -> object:
-        del client
-        self.calls += 1
-        raise FreightEvalExecutionError("provider_called")
+FreightEvalExecutionError = ScenarioExecutionError
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +80,7 @@ class _MemoryIdempotencyRecord:
 @dataclass(frozen=True, slots=True)
 class _MemoryJob:
     id: UUID
+    trace_id: UUID
 
 
 class _AsyncTransaction:
@@ -168,6 +108,7 @@ class _MemoryIntakeRepository:
     def __init__(self) -> None:
         self.idempotency: dict[tuple[UUID, str], _MemoryIdempotencyRecord] = {}
         self.jobs: dict[UUID, EnqueueIntakeCommand] = {}
+        self.job_profiles: dict[UUID, tuple[dict[str, object], str]] = {}
 
     async def get_idempotency_for_tenant(
         self, tenant_id: UUID, key: str, *, for_update: bool = False
@@ -178,10 +119,35 @@ class _MemoryIntakeRepository:
     async def create_job(
         self, command: EnqueueIntakeCommand, profile: object
     ) -> _MemoryJob:
-        del profile
-        job = _MemoryJob(id=uuid4())
+        job = _MemoryJob(id=uuid4(), trace_id=command.trace_id)
         self.jobs[job.id] = deepcopy(command)
+        snapshot = getattr(profile, "snapshot", None)
+        sha256 = getattr(profile, "sha256", None)
+        if isinstance(snapshot, dict) and isinstance(sha256, str):
+            self.job_profiles[job.id] = (deepcopy(snapshot), sha256)
         return job
+
+    async def get_trace_id(
+        self, job_id: UUID, *, tenant_id: UUID
+    ) -> UUID | None:
+        command = self.jobs.get(job_id)
+        if command is None or command.tenant_id != tenant_id:
+            return None
+        return command.trace_id
+
+    async def get_observation_identity(
+        self, job_id: UUID, *, tenant_id: UUID
+    ) -> JobObservationIdentity | None:
+        command = self.jobs.get(job_id)
+        profile = self.job_profiles.get(job_id)
+        if command is None or command.tenant_id != tenant_id or profile is None:
+            return None
+        snapshot, sha256 = profile
+        return JobObservationIdentity(
+            trace_id=command.trace_id,
+            tenant_config_snapshot=deepcopy(snapshot),
+            tenant_config_sha256=sha256,
+        )
 
     async def create_idempotency_record(
         self,
@@ -207,7 +173,38 @@ class _RecordingEnqueue:
 
     async def enqueue(self, command: EnqueueIntakeCommand) -> EnqueueResult:
         self.commands.append(deepcopy(command))
-        return self._result or EnqueueResult(job_id=uuid4(), created=True)
+        return self._result or EnqueueResult(
+            job_id=uuid4(), created=True, trace_id=command.trace_id
+        )
+
+    async def enqueue_document(self, command: object) -> EnqueueResult:
+        document = command.document
+        normalized = DocumentNormalizer().normalize(
+            document,
+            document_kind="rate_confirmation",
+            target_intake_type="rate_confirmation",
+            normalizer_key="bounded_text_pdf",
+            normalizer_version=1,
+        )
+        source = TrustedSource(
+            channel=document.channel,
+            subject=document.subject,
+            body="Document received.",
+            sender=command.sender,
+            document=normalized,
+        )
+        enqueue = EnqueueIntakeCommand(
+            tenant_id=command.tenant_id,
+            tenant_slug=command.tenant_slug,
+            source=source,
+            idempotency_key=command.idempotency_key,
+            trace_id=command.trace_id,
+            risk_signals=command.risk_signals,
+        )
+        self.commands.append(deepcopy(enqueue))
+        return self._result or EnqueueResult(
+            job_id=uuid4(), created=True, trace_id=command.trace_id
+        )
 
 
 _EVAL_WEBHOOK_SIGNING_KEY = "ik_" + ("A" * 43)
@@ -259,9 +256,17 @@ def _read_document_fixture(
 def _document_source(
     source: FreightDocumentSource,
     fixture: ResolvedDocumentFixture,
+    *,
+    tenant_config: TenantConfig,
+    observer: Observer,
+    context: ObservationContext,
 ) -> TrustedSource:
     text, content = _read_document_fixture(source, fixture)
-    normalized = DocumentNormalizer().normalize(
+    binding = compile_tenant_profile(
+        tenant_config,
+        profile_fingerprint=profile_fingerprint(tenant_config),
+    ).documents["rate_confirmation"]
+    normalized = DocumentNormalizer(observer=observer, context=context).normalize(
         RateConfirmationDocumentInput(
             channel=source.channel,
             subject=source.subject,
@@ -269,7 +274,11 @@ def _document_source(
             media_type=fixture.media_type,
             text=text,
             content=content,
-        )
+        ),
+        document_kind=binding.document_kind,
+        target_intake_type=binding.target_intake_type,
+        normalizer_key=binding.normalizer_key,
+        normalizer_version=binding.normalizer_version,
     )
     return TrustedSource(
         channel=source.channel,
@@ -285,6 +294,8 @@ async def _webhook_source(
     fixture: ResolvedDocumentFixture | None,
     tenant_id: UUID,
     tenant_slug: str,
+    observer: Observer,
+    context: ObservationContext,
 ) -> tuple[TrustedSource, bool]:
     attachments: list[WebhookAttachmentPayload] = []
     if fixture is not None:
@@ -305,7 +316,11 @@ async def _webhook_source(
     verified_payload = _verified_webhook_payload(payload)
     message = verified_payload.to_message(tenant_id, tenant_slug)
     recorder = _RecordingEnqueue()
-    await InboundIntakeService(recorder).enqueue(message)
+    await InboundIntakeService(
+        recorder,
+        observer=observer,
+        context=context,
+    ).enqueue(message)
     if len(recorder.commands) != 1:
         raise FreightEvalExecutionError("webhook_source_unavailable")
     return recorder.commands[0].source, True
@@ -329,6 +344,8 @@ async def _source_for_case(
     tenant_id: UUID,
     tenant_config: TenantConfig,
     document_fixtures: Mapping[str, ResolvedDocumentFixture],
+    observer: Observer,
+    context: ObservationContext,
 ) -> tuple[TrustedSource, bool]:
     source = case.source
     if isinstance(source, FreightBodySource):
@@ -337,13 +354,21 @@ async def _source_for_case(
         fixture = _fixture_for(source.fixture_id, document_fixtures)
         if fixture is None:
             raise FreightEvalExecutionError("document_fixture_unavailable")
-        return _document_source(source, fixture), False
+        return _document_source(
+            source,
+            fixture,
+            tenant_config=tenant_config,
+            observer=observer,
+            context=context,
+        ), False
     fixture = _fixture_for(source.document_fixture_id, document_fixtures)
     return await _webhook_source(
         source,
         fixture=fixture,
         tenant_id=tenant_id,
         tenant_slug=tenant_config.slug if tenant_config else "freight-broker",
+        observer=observer,
+        context=context,
     )
 
 
@@ -360,29 +385,70 @@ def _agent_observation(
     source: TrustedSource,
     tenant_config: TenantConfig,
     signature_verified: bool,
+    observer: Observer,
+    context: ObservationContext,
 ) -> tuple[FreightEvalObservation, tuple[str, ...]]:
     tenant_id = uuid5(NAMESPACE_URL, f"https://integra.invalid/freight/{case.id}")
+    compiled = compile_tenant_profile(
+        tenant_config,
+        profile_fingerprint=profile_fingerprint(tenant_config),
+    )
+    context = context.bind(
+        tenant_id=tenant_id,
+        job_id=tenant_id,
+        scenario_key=compiled.scenario_key,
+        profile_fingerprint=compiled.profile_fingerprint,
+    )
+    preflight = preflight_document(source, tenant_config)
+    if isinstance(preflight, TerminalPreflightResult):
+        return (
+            FreightEvalObservation(
+                intake_type=preflight.target_intake_type,
+                missing_required_fields=preflight.missing_required_fields,
+                policy_decision="deny",
+                routing_status=preflight.routing_status.value,
+                routing_reason=preflight.reason,
+                tool_name=None,
+                approval_required=False,
+                case_created=False,
+                signature_verified=signature_verified,
+                document_extraction_error=(
+                    preflight.extraction_error.value
+                    if preflight.extraction_error is not None
+                    else None
+                ),
+                provider_calls=0,
+                llm_calls=0,
+                steps=0,
+                stop_reason=None,
+            ),
+            (),
+        )
+
     policy = RecordingPolicy()
     port = InMemoryTenantToolPort()
     runtime = TrustedToolRuntimeContext(
         tenant_id=tenant_id,
         tenant_config=tenant_config,
+        compiled_profile=compiled,
         source=source,
         risk_signals=RiskSignals(),
         job_id=tenant_id,
     )
-    provider_guard = _ProviderCallGuard()
-    runtime_factory = AgentRuntimeFactory(object(), llm_factory=provider_guard)
-    unreadable_document = (
-        source.document is not None and source.document.extraction_error is not None
+    llm = ScriptedLLM(case.scripted_proposals)
+    executor = PolicyGatedToolExecutor(
+        runtime=runtime,
+        port=port,
+        policy=policy,
+        observer=observer,
+        context=context,
     )
-    if unreadable_document:
-        llm = _RecordingLLM(runtime_factory.create_llm(source, object()))
-    else:
-        llm = ScriptedLLM(case.scripted_proposals)
-    executor = PolicyGatedToolExecutor(runtime=runtime, port=port, policy=policy)
-    loop = AgentLoop(llm, executor)
-    initial_messages = AgentRuntimeFactory.initial_messages(tenant_config, source)
+    loop = AgentLoop(llm, executor, observer=observer, context=context)
+    initial_messages = AgentRuntimeFactory.initial_messages(
+        tenant_config,
+        source,
+        compiled_profile=compiled,
+    )
     extra_mismatches: list[str] = []
     run_result = None
     try:
@@ -395,9 +461,6 @@ def _agent_observation(
     except FreightEvalExecutionError as error:
         extra_mismatches.append(error.code)
 
-    if unreadable_document and case.scripted_proposals:
-        if not llm.returned_proposals or llm.returned_proposals[0] != case.scripted_proposals[0]:
-            extra_mismatches.append("unreadable_fallback_mismatch")
     first_proposal = llm.returned_proposals[0] if llm.returned_proposals else None
     outcome = policy.outcomes[-1] if policy.outcomes else None
     missing = (
@@ -418,7 +481,7 @@ def _agent_observation(
             if source.document is not None and source.document.extraction_error is not None
             else None
         ),
-        provider_calls=provider_guard.calls,
+        provider_calls=0,
         llm_calls=llm.calls,
         steps=run_result.steps if run_result is not None else None,
         stop_reason=run_result.reason.value if run_result is not None else None,
@@ -483,6 +546,8 @@ async def _run_agent_case(
     *,
     tenant_config: TenantConfig,
     document_fixtures: Mapping[str, ResolvedDocumentFixture],
+    observer: Observer,
+    context: ObservationContext,
 ) -> FreightEvalCaseResult:
     tenant_id = uuid5(NAMESPACE_URL, f"https://integra.invalid/freight/{case.id}")
     try:
@@ -491,12 +556,16 @@ async def _run_agent_case(
             tenant_id=tenant_id,
             tenant_config=tenant_config,
             document_fixtures=document_fixtures,
+            observer=observer,
+            context=context,
         )
         observation, extra = _agent_observation(
             case,
             source=source,
             tenant_config=tenant_config,
             signature_verified=signature_verified,
+            observer=observer,
+            context=context,
         )
         return _result(case, observation, extra)
     except FreightEvalExecutionError as error:
@@ -510,6 +579,8 @@ async def _run_webhook_invariant(
     *,
     tenant_config: TenantConfig,
     document_fixtures: Mapping[str, ResolvedDocumentFixture],
+    observer: Observer,
+    context: ObservationContext,
 ) -> FreightEvalCaseResult:
     source = case.source
     tenant_a = uuid5(NAMESPACE_URL, f"https://integra.invalid/tenant/{case.id}/a")
@@ -521,7 +592,12 @@ async def _run_webhook_invariant(
     repository = _MemoryIntakeRepository()
     session = _MemoryIntakeSession()
     profile_resolver = TenantProfileResolver(Path(__file__).resolve().parents[2] / "examples")
-    service = IntakeEnqueueService(session, profile_resolver)
+    service = IntakeEnqueueService(
+        session,
+        profile_resolver,
+        observer=observer,
+        context=context,
+    )
     service.repository = repository  # eval-only seam; production service is unchanged
 
     async def enqueue_for(tenant_id: UUID, body: str) -> EnqueueResult:
@@ -548,7 +624,11 @@ async def _run_webhook_invariant(
         message = _verified_webhook_payload(payload).to_message(
             tenant_id, tenant_config.slug
         )
-        return await InboundIntakeService(service).enqueue(message)
+        return await InboundIntakeService(
+            service,
+            observer=observer,
+            context=context,
+        ).enqueue(message)
 
     duplicate_reused = False
     conflict_raised = False
@@ -596,20 +676,30 @@ async def run_freight_eval_case(
     *,
     tenant_config: TenantConfig,
     document_fixtures: Mapping[str, ResolvedDocumentFixture],
+    observer: Observer = NULL_OBSERVER,
+    context: ObservationContext | None = None,
 ) -> FreightEvalCaseResult:
     """Execute one case using only typed fakes and current application seams."""
+
+    context = context or ObservationContext(
+        trace_id=uuid5(NAMESPACE_URL, f"https://integra.invalid/freight/trace/{case.id}")
+    )
 
     if case.kind is EvalCaseKind.AGENT:
         return await _run_agent_case(
             case,
             tenant_config=tenant_config,
             document_fixtures=document_fixtures,
+            observer=observer,
+            context=context,
         )
     try:
         return await _run_webhook_invariant(
             case,
             tenant_config=tenant_config,
             document_fixtures=document_fixtures,
+            observer=observer,
+            context=context,
         )
     except FreightEvalExecutionError as error:
         return _result(case, _blank_observation(), (error.code,))

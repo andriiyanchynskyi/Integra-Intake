@@ -1,17 +1,20 @@
 """Pydantic contract for version-controlled tenant workflow profiles."""
 
 from enum import Enum
-from typing import Self
+from typing import Annotated, Literal, Self
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
     StrictBool,
+    StrictInt,
     StrictStr,
     field_validator,
     model_validator,
 )
+
+from app.tenants.identifiers import SafeIdentifier
 
 
 class StrictModel(BaseModel):
@@ -63,9 +66,9 @@ class FieldDefinition(StrictModel):
 
 
 class IntakeTypeConfig(StrictModel):
-    name: StrictStr = Field(min_length=1)
+    name: SafeIdentifier
     description: StrictStr = Field(min_length=1)
-    required_fields: list[StrictStr] = Field(default_factory=list)
+    required_fields: list[SafeIdentifier] = Field(default_factory=list)
 
     @field_validator("required_fields")
     @classmethod
@@ -75,14 +78,27 @@ class IntakeTypeConfig(StrictModel):
         return value
 
 
+class ActionExecutionMode(str, Enum):
+    EXECUTABLE = "executable"
+    POLICY_ONLY = "policy_only"
+
+
 class ActionRule(StrictModel):
     allowed: StrictBool
     requires_approval: StrictBool
+    execution: ActionExecutionMode
+
+
+class DocumentBindingConfig(StrictModel):
+    intake_type: SafeIdentifier
+    normalizer: SafeIdentifier
+    normalizer_version: Annotated[StrictInt, Field(ge=1)]
+    default_for_inbound: StrictBool = False
 
 
 class RoutingConfig(StrictModel):
     outcome_names: list[RoutingStatus]
-    always_approval_actions: list[StrictStr]
+    always_approval_actions: list[SafeIdentifier]
 
     @model_validator(mode="after")
     def validate_routing_catalog(self) -> Self:
@@ -99,11 +115,14 @@ class RoutingConfig(StrictModel):
 
 
 class TenantConfig(StrictModel):
+    profile_version: Literal[2]
     slug: StrictStr = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    scenario_key: SafeIdentifier
     display_name: StrictStr = Field(min_length=1)
     intake_types: list[IntakeTypeConfig] = Field(min_length=1)
-    fields: dict[str, FieldDefinition] = Field(min_length=1)
-    action_policy: dict[str, ActionRule] = Field(min_length=1)
+    fields: dict[SafeIdentifier, FieldDefinition] = Field(min_length=1)
+    action_policy: dict[SafeIdentifier, ActionRule] = Field(min_length=1)
+    documents: dict[SafeIdentifier, DocumentBindingConfig] = Field(default_factory=dict)
     routing: RoutingConfig
 
     @model_validator(mode="after")
@@ -135,4 +154,22 @@ class TenantConfig(StrictModel):
                 "always_approval_actions reference unknown actions: "
                 + ", ".join(missing_actions)
             )
+
+        document_intake_types = {
+            document.intake_type for document in self.documents.values()
+        }
+        missing_document_intakes = sorted(
+            document_intake_types - set(names)
+        )
+        if missing_document_intakes:
+            raise ValueError(
+                "documents reference unknown intake types: "
+                + ", ".join(missing_document_intakes)
+            )
+
+        default_documents = sum(
+            document.default_for_inbound for document in self.documents.values()
+        )
+        if default_documents > 1:
+            raise ValueError("documents may contain at most one inbound default")
         return self

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import AuthenticatedOperator, get_current_operator
@@ -18,6 +18,7 @@ from app.domain.approvals import (
     ApprovalExpired,
     ApprovalNotFound,
 )
+from app.observability.middleware import request_context, request_observer
 from app.tools.postgres import PostgresApprovalActionExecutor
 
 
@@ -31,6 +32,7 @@ router = APIRouter(prefix="/approvals", tags=["approvals"])
 async def decide_approval(
     approval_id: UUID,
     request: ApprovalDecisionRequest,
+    http_request: Request,
     operator: Annotated[AuthenticatedOperator, Depends(get_current_operator)],
     session: Annotated[AsyncSession, Depends(get_db_session, use_cache=False)],
 ) -> ApprovalDecisionResponse:
@@ -38,6 +40,8 @@ async def decide_approval(
         return await ApprovalDecisionService(
             session,
             PostgresApprovalActionExecutor(),
+            observer=request_observer(http_request),
+            request_id=request_context(http_request).request_id,
         ).decide(approval_id, operator, request)
     except ApprovalNotFound as error:
         raise HTTPException(

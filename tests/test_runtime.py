@@ -12,16 +12,23 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from pydantic import ValidationError
 
 from app.documents import (
     DocumentMediaType,
     DocumentNormalizer,
-    RateConfirmationDocumentInput,
+    DocumentInput,
+    NormalizedDocument,
 )
 from app.policy import TrustedSource, TrustedToolRuntimeContext
+from app.observability import (
+    CapabilityErrorCode,
+    EventName,
+    ObservationContext,
+    RecordingObserver,
+)
 from app.runtime.factory import AgentRuntimeFactory
 from app.runtime.gateway import WorkerAsyncGateway
+from app.runtime.preflight import TerminalPreflightResult
 from app.runtime.profiles import (
     TenantProfileResolver,
     TenantProfileUnavailableError,
@@ -144,7 +151,7 @@ def _document_snapshot(
     text: str | None = "Origin: Chicago\nDestination: Detroit",
     content: bytes | None = None,
     media_type: DocumentMediaType = DocumentMediaType.TEXT,
-) -> tuple[dict[str, object], object]:
+) -> tuple[dict[str, object], NormalizedDocument]:
     payload: dict[str, object] = {
         "channel": "email",
         "subject": "Rate confirmation",
@@ -156,7 +163,11 @@ def _document_snapshot(
     if content is not None:
         payload["content"] = content
     normalized = DocumentNormalizer().normalize(
-        RateConfirmationDocumentInput.model_validate(payload)
+        DocumentInput.model_validate(payload),
+        document_kind="rate_confirmation",
+        target_intake_type="rate_confirmation",
+        normalizer_key="bounded_text_pdf",
+        normalizer_version=1,
     )
     return normalized.model_dump(mode="json"), normalized
 
@@ -177,6 +188,7 @@ def _claimed_job(
     return SimpleNamespace(
         id=job_id,
         tenant_id=tenant_id,
+        trace_id=uuid4(),
         source_snapshot=source_snapshot
         or {
             "channel": "email",
@@ -210,6 +222,7 @@ def test_agent_runtime_factory_reconstructs_trusted_context_and_message_order(
 
     monkeypatch.setattr(factory_module, "PostgresTenantToolPort", _FakeAsyncPort)
     provider_clients: list[object] = []
+    observer = RecordingObserver()
 
     def llm_factory(client: object) -> _FakeLLM:
         provider_clients.append(client)
@@ -222,6 +235,7 @@ def test_agent_runtime_factory_reconstructs_trusted_context_and_message_order(
         runtime = AgentRuntimeFactory(
             session_factory,
             llm_factory=llm_factory,
+            observer=observer,
         ).build(job, WorkerAsyncGateway(owner_loop))
     finally:
         owner_loop.close()
@@ -233,6 +247,9 @@ def test_agent_runtime_factory_reconstructs_trusted_context_and_message_order(
         context = runtime.loop.tools._runtime
         assert context.tenant_id == job.tenant_id
         assert context.job_id == job.id
+        assert runtime.loop._context.trace_id == job.trace_id
+        assert runtime.loop.tools._context.trace_id == job.trace_id
+        assert runtime.loop.tools._observer is observer
         assert context.source == TrustedSource(**job.source_snapshot)
         assert context.risk_signals.safety_or_legal_risk is True
         assert context.tenant_config.model_dump(mode="json") == job.tenant_config_snapshot
@@ -255,13 +272,22 @@ def test_agent_runtime_factory_reconstructs_trusted_context_and_message_order(
             skill.system_prompt for skill in generic_skills
         ]
         catalog = json.loads(messages[4].content or "")
+        expected_actions = [
+            "create_case",
+            "create_reply_draft",
+            "find_customer",
+            "flag_for_review",
+            "update_case_fields",
+        ]
         assert catalog == {
-            "actions": sorted(job.tenant_config_snapshot["action_policy"]),
+            "actions": expected_actions,
             "fields": sorted(job.tenant_config_snapshot["fields"]),
             "intake_types": sorted(
                 item["name"] for item in job.tenant_config_snapshot["intake_types"]
             ),
         }
+        assert len(catalog["actions"]) == 5
+        assert "send_reply" not in catalog["actions"]
         assert json.loads(messages[5].content or "") == {
             "body": job.source_snapshot["body"],
             "channel": job.source_snapshot["channel"],
@@ -272,6 +298,39 @@ def test_agent_runtime_factory_reconstructs_trusted_context_and_message_order(
         assert "safety_or_legal_risk" not in prompt_text
     finally:
         runtime.close()
+
+
+def test_agent_runtime_factory_binds_trace_to_default_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.runtime import factory as factory_module
+
+    class _FakeAsyncPort:
+        def __init__(self, session_factory: object, *, job_id: object) -> None:
+            del session_factory, job_id
+
+    class _FakeProvider:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(factory_module, "PostgresTenantToolPort", _FakeAsyncPort)
+    monkeypatch.setattr(factory_module, "OpenAICompatibleLLMClient", _FakeProvider)
+    observer = RecordingObserver()
+    job = _claimed_job()
+    owner_loop = asyncio.new_event_loop()
+    runtime = AgentRuntimeFactory(object(), observer=observer).build(
+        job,
+        WorkerAsyncGateway(owner_loop),
+    )
+    try:
+        provider = runtime.loop.llm
+        assert provider.kwargs["observer"] is observer
+        assert provider.kwargs["context"].trace_id == job.trace_id
+        assert provider.kwargs["context"].tenant_id == job.tenant_id
+        assert provider.kwargs["context"].job_id == job.id
+    finally:
+        runtime.close()
+        owner_loop.close()
 
 
 def test_agent_runtime_factory_user_envelope_includes_sender_only_as_source_metadata(
@@ -380,13 +439,22 @@ def test_agent_runtime_factory_builds_document_messages_and_skill_order(
         ]
         assert messages[4].content == EXTRACT_RATE_CONFIRMATION_V1.system_prompt
         catalog = json.loads(messages[5].content or "")
+        expected_actions = [
+            "create_case",
+            "create_reply_draft",
+            "find_customer",
+            "flag_for_review",
+            "update_case_fields",
+        ]
         assert catalog == {
-            "actions": sorted(job.tenant_config_snapshot["action_policy"]),
+            "actions": expected_actions,
             "fields": sorted(job.tenant_config_snapshot["fields"]),
             "intake_types": sorted(
                 item["name"] for item in job.tenant_config_snapshot["intake_types"]
             ),
         }
+        assert len(catalog["actions"]) == 5
+        assert "send_reply" not in catalog["actions"]
         assert json.loads(messages[6].content or "") == {
             "channel": "email",
             "document_text": normalized.text,
@@ -402,14 +470,16 @@ def test_agent_runtime_factory_builds_document_messages_and_skill_order(
         owner_loop.close()
 
 
-def test_agent_runtime_factory_uses_static_unreadable_proposal_without_provider(
+def test_agent_runtime_factory_returns_unreadable_terminal_preflight_without_provider_or_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.runtime import factory as factory_module
 
+    created_ports: list[tuple[object, object]] = []
+
     class _FakeAsyncPort:
         def __init__(self, session_factory: object, *, job_id: object) -> None:
-            del session_factory, job_id
+            created_ports.append((session_factory, job_id))
 
     monkeypatch.setattr(factory_module, "PostgresTenantToolPort", _FakeAsyncPort)
     provider_clients: list[object] = []
@@ -432,26 +502,99 @@ def test_agent_runtime_factory_uses_static_unreadable_proposal_without_provider(
         }
     )
     owner_loop = asyncio.new_event_loop()
-    runtime = AgentRuntimeFactory(object(), llm_factory=llm_factory).build(
-        job,
-        WorkerAsyncGateway(owner_loop),
+    try:
+        result = AgentRuntimeFactory(object(), llm_factory=llm_factory).build(
+            job,
+            WorkerAsyncGateway(owner_loop),
+        )
+
+        assert isinstance(result, TerminalPreflightResult)
+        assert result.routing_status.value == "awaiting_input"
+        assert result.reason == "document_unreadable"
+        assert result.target_intake_type == normalized.target_intake_type
+        assert result.document_kind == normalized.document_kind
+        assert result.extraction_error is normalized.extraction_error
+        assert result.missing_required_fields == tuple(
+            sorted(
+                next(
+                    intake.required_fields
+                    for intake in load_tenant_config(
+                        PROJECT_ROOT / "examples" / "freight-broker.yaml"
+                    ).intake_types
+                    if intake.name == normalized.target_intake_type
+                )
+            )
+        )
+        assert provider_clients == []
+        assert created_ports == []
+    finally:
+        owner_loop.close()
+
+
+def test_agent_runtime_factory_returns_capability_terminal_without_provider_or_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.runtime import factory as factory_module
+
+    created_ports: list[tuple[object, object]] = []
+
+    class _FakeAsyncPort:
+        def __init__(self, session_factory: object, *, job_id: object) -> None:
+            created_ports.append((session_factory, job_id))
+
+    monkeypatch.setattr(factory_module, "PostgresTenantToolPort", _FakeAsyncPort)
+    provider_clients: list[object] = []
+
+    def llm_factory(client: object) -> _FakeLLM:
+        provider_clients.append(client)
+        return _FakeLLM(client)
+
+    job = _claimed_job()
+    snapshot = dict(job.tenant_config_snapshot)
+    action_policy = dict(snapshot["action_policy"])
+    action_policy["future_action"] = {
+        "allowed": True,
+        "requires_approval": False,
+        "execution": "executable",
+    }
+    snapshot["action_policy"] = action_policy
+    job.tenant_config_snapshot = snapshot
+    job.tenant_config_sha256 = hashlib.sha256(
+        canonical_json_bytes(snapshot)
+    ).hexdigest()
+
+    owner_loop = asyncio.new_event_loop()
+    try:
+        result = AgentRuntimeFactory(object(), llm_factory=llm_factory).build(
+            job,
+            WorkerAsyncGateway(owner_loop),
+        )
+
+        assert isinstance(result, TerminalPreflightResult)
+        assert result.routing_status.value == "rejected"
+        assert result.reason == "capability_unavailable"
+        assert result.target_intake_type is None
+        assert result.document_kind is None
+        assert result.extraction_error is None
+        assert result.missing_required_fields == ()
+        assert provider_clients == []
+        assert created_ports == []
+    finally:
+        owner_loop.close()
+
+
+def test_common_runtime_and_policy_code_has_no_freight_preflight_literals() -> None:
+    from app.policy import engine as policy_engine
+    from app.runtime import factory as factory_module
+
+    sources = [inspect.getsource(factory_module), inspect.getsource(policy_engine)]
+    sources.extend(
+        path.read_text(encoding="utf-8")
+        for path in (PROJECT_ROOT / "app" / "policy").glob("*.py")
     )
 
-    try:
-        assert provider_clients == []
-        assert runtime.loop.llm.__class__.__name__ == "_UnreadableDocumentLLM"
-        proposal = runtime.loop.llm.complete(runtime.initial_messages)
-        assert proposal.intake_type == "rate_confirmation"
-        assert proposal.fields == []
-        assert proposal.tool_call is not None
-        assert proposal.tool_call.name == "create_case"
-        prompt_text = "\n".join(message.content or "" for message in runtime.initial_messages)
-        assert normalized.sha256 not in prompt_text
-        assert "malformed-rate-confirmation-secret" not in prompt_text
-        assert EXTRACT_RATE_CONFIRMATION_V1.system_prompt not in prompt_text
-    finally:
-        runtime.close()
-        owner_loop.close()
+    assert all("rate_confirmation" not in source for source in sources)
+    assert all("_UnreadableDocumentLLM" not in source for source in sources)
 
 
 @pytest.mark.parametrize(
@@ -466,6 +609,7 @@ def test_agent_runtime_factory_rejects_invalid_document_snapshot_before_provider
     invalid_document: object,
 ) -> None:
     provider_calls: list[object] = []
+    observer = RecordingObserver()
 
     def llm_factory(client: object) -> _FakeLLM:
         provider_calls.append(client)
@@ -480,19 +624,40 @@ def test_agent_runtime_factory_rejects_invalid_document_snapshot_before_provider
     job = _claimed_job(source_snapshot=source_snapshot)
     owner_loop = asyncio.new_event_loop()
     try:
-        with pytest.raises(RuntimeError, match="source snapshot is invalid"):
-            AgentRuntimeFactory(object(), llm_factory=llm_factory).build(
-                job,
-                WorkerAsyncGateway(owner_loop),
-            )
+        result = AgentRuntimeFactory(
+            object(),
+            llm_factory=llm_factory,
+            observer=observer,
+        ).build(job, WorkerAsyncGateway(owner_loop))
     finally:
         owner_loop.close()
 
+    assert isinstance(result, TerminalPreflightResult)
+    assert result.reason == "snapshot_incompatible"
+    assert result.routing_status.value == "rejected"
+    assert result.target_intake_type is None
+    assert result.document_kind is None
+    assert result.extraction_error is None
+    capability_events = [
+        event
+        for event in observer.events
+        if event.event
+        in {
+            EventName.PROFILE_RESOLUTION_COMPLETED,
+            EventName.RUNTIME_PREFLIGHT_COMPLETED,
+        }
+    ]
+    assert capability_events
+    assert all(
+        event.capability_error is CapabilityErrorCode.SNAPSHOT_INCOMPATIBLE
+        for event in capability_events
+    )
     assert provider_calls == []
 
 
 def test_agent_runtime_factory_rejects_invalid_snapshot_before_provider_use() -> None:
     provider_calls: list[object] = []
+    observer = RecordingObserver()
 
     def llm_factory(client: object) -> _FakeLLM:
         provider_calls.append(client)
@@ -505,12 +670,36 @@ def test_agent_runtime_factory_rejects_invalid_snapshot_before_provider_use() ->
         canonical_json_bytes(invalid_snapshot)
     ).hexdigest()
 
-    with pytest.raises(ValidationError):
-        AgentRuntimeFactory(object(), llm_factory=llm_factory).build(
-            job,
-            WorkerAsyncGateway(asyncio.new_event_loop()),
-        )
+    owner_loop = asyncio.new_event_loop()
+    try:
+        result = AgentRuntimeFactory(
+            object(),
+            llm_factory=llm_factory,
+            observer=observer,
+        ).build(job, WorkerAsyncGateway(owner_loop))
+    finally:
+        owner_loop.close()
 
+    assert isinstance(result, TerminalPreflightResult)
+    assert result.reason == "snapshot_incompatible"
+    assert result.routing_status.value == "rejected"
+    assert result.target_intake_type is None
+    assert result.document_kind is None
+    assert result.extraction_error is None
+    capability_events = [
+        event
+        for event in observer.events
+        if event.event
+        in {
+            EventName.PROFILE_RESOLUTION_COMPLETED,
+            EventName.RUNTIME_PREFLIGHT_COMPLETED,
+        }
+    ]
+    assert capability_events
+    assert all(
+        event.capability_error is CapabilityErrorCode.SNAPSHOT_INCOMPATIBLE
+        for event in capability_events
+    )
     assert provider_calls == []
 
 

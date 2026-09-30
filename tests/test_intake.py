@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -29,12 +29,18 @@ from app.domain.intake import (
 from app.documents import (
     DocumentMediaType,
     DocumentNormalizer,
-    RateConfirmationDocumentInput,
+    DocumentInput,
+    NormalizedDocument,
 )
 from app.main import app
+from app.observability import (
+    EventName,
+    ObservationContext,
+    OutcomeCode,
+    RecordingObserver,
+)
 from app.policy import TrustedSource
-from app.runtime.profiles import ResolvedTenantProfile
-from app.tenants.loader import load_tenant_config
+from app.runtime.profiles import ResolvedTenantProfile, TenantProfileResolver
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +51,22 @@ class _ScalarResult:
     value: IdempotencyRecord | None
 
     def scalar_one_or_none(self) -> IdempotencyRecord | None:
+        return self.value
+
+
+@dataclass
+class _UUIDScalarResult:
+    value: UUID | None
+
+    def scalar_one_or_none(self) -> UUID | None:
+        return self.value
+
+
+@dataclass
+class _RowResult:
+    value: tuple[UUID, dict[str, object], str] | None
+
+    def one_or_none(self) -> tuple[UUID, dict[str, object], str] | None:
         return self.value
 
 
@@ -105,8 +127,30 @@ class _IntakeSession:
             if record.id is None:
                 record.id = uuid4()
 
-    async def execute(self, statement: object) -> _ScalarResult:
+    async def execute(
+        self, statement: object
+    ) -> _ScalarResult | _UUIDScalarResult | _RowResult:
         compiled = statement.compile(dialect=postgresql.dialect())
+        if "tenant_config_snapshot" in str(compiled):
+            job = next(
+                (item for item in self.jobs if item.id in compiled.params.values()),
+                None,
+            )
+            return _RowResult(
+                None
+                if job is None
+                else (
+                    job.trace_id,
+                    job.tenant_config_snapshot,
+                    job.tenant_config_sha256,
+                )
+            )
+        if "agent_jobs.trace_id" in str(compiled):
+            job_id = next(
+                value for value in compiled.params.values() if isinstance(value, UUID)
+            )
+            job = next((item for item in self.jobs if item.id == job_id), None)
+            return _UUIDScalarResult(job.trace_id if job is not None else None)
         tenant_id = compiled.params["tenant_id_1"]
         key = compiled.params["key_1"]
         value = next(
@@ -131,20 +175,7 @@ class _ProfileResolver:
 
 
 def _profile() -> ResolvedTenantProfile:
-    config = load_tenant_config(PROJECT_ROOT / "examples" / "freight-broker.yaml")
-    snapshot = config.model_dump(mode="json")
-    encoded = json.dumps(
-        snapshot,
-        allow_nan=False,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return ResolvedTenantProfile(
-        config=config,
-        snapshot=snapshot,
-        sha256=hashlib.sha256(encoded).hexdigest(),
-    )
+    return TenantProfileResolver(PROJECT_ROOT / "examples").resolve("freight-broker")
 
 
 def _command(
@@ -166,7 +197,7 @@ def _document_input(
     text: str | None = "Origin: Chicago\r\nDestination: Detroit",
     content: bytes | None = None,
     media_type: DocumentMediaType = DocumentMediaType.TEXT,
-) -> RateConfirmationDocumentInput:
+) -> DocumentInput:
     payload: dict[str, object] = {
         "channel": "email",
         "subject": "Rate confirmation",
@@ -177,13 +208,13 @@ def _document_input(
         payload["text"] = text
     if content is not None:
         payload["content"] = content
-    return RateConfirmationDocumentInput.model_validate(payload)
+    return DocumentInput.model_validate(payload)
 
 
 def _document_command(
     tenant_id: UUID,
     *,
-    document: RateConfirmationDocumentInput | None = None,
+    document: DocumentInput | None = None,
     key: str = "document-1",
 ) -> EnqueueDocumentIntakeCommand:
     return EnqueueDocumentIntakeCommand(
@@ -192,6 +223,26 @@ def _document_command(
         document=document or _document_input(),
         idempotency_key=key,
     )
+
+
+def _normalize(document: DocumentInput) -> NormalizedDocument:
+    return DocumentNormalizer().normalize(
+        document,
+        document_kind="rate_confirmation",
+        target_intake_type="rate_confirmation",
+        normalizer_key="bounded_text_pdf",
+        normalizer_version=1,
+    )
+
+
+@dataclass
+class _RecordingNormalizer:
+    result: NormalizedDocument
+    calls: list[tuple[DocumentInput, dict[str, object]]] = field(default_factory=list)
+
+    def normalize(self, value: DocumentInput, **kwargs: object) -> NormalizedDocument:
+        self.calls.append((value, kwargs))
+        return self.result
 
 
 def test_create_intake_request_forbids_extra_fields() -> None:
@@ -251,9 +302,9 @@ def test_trusted_source_sender_is_optional_and_changes_only_new_hash() -> None:
 
 def test_canonical_intake_hash_includes_document_digest_and_outcome() -> None:
     source = TrustedSource(channel="email", subject="Rate", body="Document received")
-    first_document = DocumentNormalizer().normalize(_document_input(text="Origin: Chicago"))
-    changed_document = DocumentNormalizer().normalize(_document_input(text="Origin: Detroit"))
-    malformed_document = DocumentNormalizer().normalize(
+    first_document = _normalize(_document_input(text="Origin: Chicago"))
+    changed_document = _normalize(_document_input(text="Origin: Detroit"))
+    malformed_document = _normalize(
         _document_input(
             media_type=DocumentMediaType.PDF,
             text=None,
@@ -271,7 +322,7 @@ def test_canonical_intake_hash_includes_document_digest_and_outcome() -> None:
 
 
 def test_trusted_source_keeps_document_optional_and_typed() -> None:
-    document = DocumentNormalizer().normalize(_document_input())
+    document = _normalize(_document_input())
     legacy = TrustedSource(channel="email", subject="Load", body="Need a truck")
     with_document = TrustedSource(
         channel="email",
@@ -346,12 +397,75 @@ async def test_enqueue_fresh_then_reuses_same_idempotency_record() -> None:
 
 
 @pytest.mark.asyncio
+async def test_duplicate_reuses_stored_trace_and_profile_identity_after_profile_change(
+    tmp_path: Path,
+) -> None:
+    session = _IntakeSession()
+    observer = RecordingObserver()
+    tenant_id = uuid4()
+    provisional = uuid4()
+    duplicate_request_trace = uuid4()
+    profile_dir = tmp_path / "profiles"
+    profile_dir.mkdir()
+    profile_path = profile_dir / "freight-broker.yaml"
+    profile_path.write_text(
+        (PROJECT_ROOT / "examples" / "freight-broker.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    resolver = TenantProfileResolver(profile_dir)
+    original_profile = resolver.resolve("freight-broker")
+    service = IntakeEnqueueService(
+        session,
+        resolver,
+        observer=observer,
+        context=ObservationContext(trace_id=provisional),
+    )
+
+    first = await service.enqueue(
+        replace(_command(tenant_id), trace_id=provisional)
+    )
+    changed_yaml = profile_path.read_text(encoding="utf-8").replace(
+        "display_name: Freight broker",
+        "display_name: Freight broker changed",
+        1,
+    )
+    profile_path.write_text(changed_yaml, encoding="utf-8")
+    changed_profile = resolver.resolve("freight-broker")
+    assert changed_profile.sha256 != original_profile.sha256
+
+    second = await service.enqueue(
+        replace(
+            _command(tenant_id, key="request-1"),
+            trace_id=duplicate_request_trace,
+        )
+    )
+
+    assert first.trace_id == provisional
+    assert second.trace_id == first.trace_id
+    assert session.jobs[0].tenant_config_snapshot["scenario_key"] == "freight_broker"
+    assert session.jobs[0].tenant_config_sha256 == original_profile.sha256
+    events = [
+        event
+        for event in observer.events
+        if event.event is EventName.INTAKE_ENQUEUE_COMPLETED
+    ]
+    assert [event.outcome for event in events] == [OutcomeCode.CREATED, OutcomeCode.REUSED]
+    assert all(event.trace_id == first.trace_id for event in events)
+    assert [event.scenario_key for event in events] == ["freight_broker"] * 2
+    assert [event.profile_fingerprint for event in events] == [
+        original_profile.sha256,
+        original_profile.sha256,
+    ]
+    assert all("Need a truck" not in event.model_dump_json() for event in events)
+
+
+@pytest.mark.asyncio
 async def test_inbound_provider_id_reuses_per_tenant_and_conflicts_on_changed_source() -> None:
     session = _IntakeSession()
     service = IntakeEnqueueService(session, _ProfileResolver(_profile()))
     tenant_id = uuid4()
     provider_key = "email_webhook:provider-duplicate-1"
-    normalized = DocumentNormalizer().normalize(_document_input(text="Origin: Chicago"))
+    normalized = _normalize(_document_input(text="Origin: Chicago"))
     source = TrustedSource(
         channel="email_webhook",
         sender="dispatcher@example.test",
@@ -381,7 +495,7 @@ async def test_inbound_provider_id_reuses_per_tenant_and_conflicts_on_changed_so
         replace(source, sender="other-dispatcher@example.test"),
         replace(
             source,
-            document=DocumentNormalizer().normalize(
+            document=_normalize(
                 _document_input(text="Origin: Detroit")
             ),
         ),
@@ -403,27 +517,81 @@ async def test_inbound_provider_id_reuses_per_tenant_and_conflicts_on_changed_so
 
 
 @pytest.mark.asyncio
-async def test_enqueue_document_stores_normalized_document_snapshot_and_safe_body() -> None:
+async def test_enqueue_document_uses_compiled_default_binding_and_generic_body_marker() -> None:
     session = _IntakeSession()
-    service = IntakeEnqueueService(session, _ProfileResolver(_profile()))
     document = _document_input(text="Origin: Chicago\r\nDestination: Detroit")
+    normalized = NormalizedDocument(
+        document_kind="rate_confirmation",
+        target_intake_type="rate_confirmation",
+        media_type=DocumentMediaType.TEXT,
+        sha256="a" * 64,
+        normalizer_key="bounded_text_pdf",
+        normalizer_version=1,
+        text="Origin: Chicago\nDestination: Detroit",
+    )
+    normalizer = _RecordingNormalizer(normalized)
+    service = IntakeEnqueueService(
+        session,
+        _ProfileResolver(_profile()),
+        document_normalizer=normalizer,
+    )
     command = _document_command(uuid4(), document=document)
 
     result = await service.enqueue_document(command)
 
     assert result.created is True
+    assert normalizer.calls == [
+        (
+            document,
+            {
+                "document_kind": "rate_confirmation",
+                "target_intake_type": "rate_confirmation",
+                "normalizer_key": "bounded_text_pdf",
+                "normalizer_version": 1,
+            },
+        )
+    ]
     assert len(session.jobs) == 1
     snapshot = session.jobs[0].source_snapshot
     assert snapshot["channel"] == "email"
     assert snapshot["subject"] == "Rate confirmation"
-    assert snapshot["body"] == "Rate confirmation document received."
-    assert snapshot["document"] == DocumentNormalizer().normalize(document).model_dump(
-        mode="json"
-    )
+    assert snapshot["body"] == "Document received."
+    assert snapshot["document"] == normalized.model_dump(mode="json")
     assert set(snapshot) == {"channel", "subject", "body", "document"}
     assert snapshot["document"]["text"] == (  # type: ignore[index]
         "Origin: Chicago\nDestination: Detroit"
     )
+
+
+@pytest.mark.asyncio
+async def test_repair_document_intake_rejects_before_normalizer_call() -> None:
+    session = _IntakeSession()
+    normalizer = _RecordingNormalizer(
+        NormalizedDocument(
+            document_kind="rate_confirmation",
+            target_intake_type="rate_confirmation",
+            media_type=DocumentMediaType.TEXT,
+            sha256="b" * 64,
+            normalizer_key="bounded_text_pdf",
+            normalizer_version=1,
+            text="not reached",
+        )
+    )
+    service = IntakeEnqueueService(
+        session,
+        _ProfileResolver(
+            TenantProfileResolver(PROJECT_ROOT / "examples").resolve("repair-service")
+        ),
+        document_normalizer=normalizer,
+    )
+
+    with pytest.raises(ValueError):
+        await service.enqueue_document(
+            replace(_document_command(uuid4()), tenant_slug="repair-service")
+        )
+
+    assert normalizer.calls == []
+    assert session.jobs == []
 
 
 @pytest.mark.asyncio

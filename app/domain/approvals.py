@@ -12,8 +12,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.api_keys import AuthenticatedOperator
 from app.db.models import Approval
-from app.domain.approval_repository import ApprovalRepository
+from app.domain.approval_repository import (
+    ApprovalCreationConflict,
+    ApprovalObservationIdentity,
+    ApprovalRepository,
+)
+from app.observability import (
+    Component,
+    EventLevel,
+    EventName,
+    NULL_OBSERVER,
+    ObservationContext,
+    ObservationEvent,
+    Observer,
+    OutcomeCode,
+    safe_emit,
+)
 from app.tools.models import PendingAction
+from app.tools.registry import (
+    ActionCapabilityUnavailable,
+    ActionRegistry,
+    BUILTIN_ACTION_REGISTRY,
+)
+from app.runtime.profiles import (
+    ResolvedTenantProfile,
+    TenantProfileUnavailableError,
+    resolve_persisted_profile,
+)
 
 
 class ApprovalNotFound(LookupError):
@@ -72,11 +97,17 @@ class ApprovalDecisionService:
         action_executor: ApprovalActionExecutor,
         *,
         clock: Callable[[], datetime] | None = None,
+        observer: Observer = NULL_OBSERVER,
+        request_id: UUID | None = None,
+        action_registry: ActionRegistry = BUILTIN_ACTION_REGISTRY,
     ) -> None:
         self.session = session
         self.repository = ApprovalRepository(session)
         self.action_executor = action_executor
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.observer = observer
+        self.request_id = request_id
+        self.action_registry = action_registry
 
     async def decide(
         self,
@@ -86,6 +117,12 @@ class ApprovalDecisionService:
     ) -> ApprovalDecisionResponse:
         now = self._now()
         expired_approval = False
+        response: ApprovalDecisionResponse | None = None
+        identity: ApprovalObservationIdentity | None = None
+        resolved_profile: ResolvedTenantProfile | None = None
+        decision_outcome: OutcomeCode | None = None
+        action_executed = False
+        decision_latency_ms: int | None = None
         async with self.session.begin():
             approval = await self.repository.get_for_tenant_for_update(
                 approval_id, operator.tenant_id
@@ -99,23 +136,41 @@ class ApprovalDecisionService:
                 or approval.expires_at is None
             ):
                 raise ApprovalDecisionConflict("legacy approval is not executable")
+            try:
+                identity = await self.repository.get_job_observation_identity(approval)
+                if identity is None:
+                    raise ApprovalCreationConflict("approval job is unavailable")
+                try:
+                    resolved_profile = resolve_persisted_profile(
+                        identity.tenant_config_snapshot,
+                        identity.tenant_config_sha256,
+                    )
+                except (TenantProfileUnavailableError, ValueError) as error:
+                    raise ApprovalDecisionConflict(
+                        "approval trusted profile is unavailable"
+                    ) from error
+            except ApprovalCreationConflict as error:
+                raise ApprovalDecisionConflict("approval job is unavailable") from error
+            decision_latency_ms = self._decision_latency_ms(approval, now)
 
             if approval.status in {"approved", "rejected", "expired"}:
                 if self._is_same_final_decision(approval, request.decision):
-                    return self._response(approval)
-                raise ApprovalDecisionConflict("approval already decided")
-
-            if approval.status != "pending":
+                    response = self._response(approval)
+                    decision_outcome = OutcomeCode.REUSED
+                else:
+                    raise ApprovalDecisionConflict("approval already decided")
+            elif approval.status != "pending":
                 raise ApprovalDecisionConflict("approval state is not decidable")
-
-            if approval.expires_at <= now:
+            elif approval.expires_at <= now:
                 self.repository.expire_locked(approval, now=now)
+                decision_outcome = OutcomeCode.EXPIRED
                 if request.decision == "reject":
-                    return self._response(approval)
-                # Commit the timeout transition before reporting the approve
-                # conflict. Raising inside this transaction would roll it back
-                # and leave a deadline-past row pending.
-                expired_approval = True
+                    response = self._response(approval)
+                else:
+                    # Commit the timeout transition before reporting the approve
+                    # conflict. Raising inside this transaction would roll it back
+                    # and leave a deadline-past row pending.
+                    expired_approval = True
             elif request.decision == "reject":
                 approval.status = "rejected"
                 approval.decided_at = now
@@ -132,10 +187,8 @@ class ApprovalDecisionService:
                     actor_ref=operator.actor_ref,
                     payload={},
                 )
-                return self._response(approval)
-
-            if expired_approval:
                 response = self._response(approval)
+                decision_outcome = OutcomeCode.REJECTED
             else:
                 try:
                     action = PendingAction.model_validate(approval.pending_action)
@@ -143,6 +196,16 @@ class ApprovalDecisionService:
                     raise ApprovalDecisionConflict("approval action is invalid") from error
                 if action.name != approval.action:
                     raise ApprovalDecisionConflict("approval action is invalid")
+                try:
+                    capability = self.action_registry.require(action.name)
+                except ActionCapabilityUnavailable as error:
+                    raise ApprovalDecisionConflict("approval action is invalid") from error
+                if action.version != capability.pending_action_version:
+                    raise ApprovalDecisionConflict("approval action is invalid")
+                try:
+                    capability.arguments_model.model_validate(action.arguments)
+                except ValidationError as error:
+                    raise ApprovalDecisionConflict("approval action is invalid") from error
                 execution_result = await self.action_executor.execute(
                     self.session,
                     approval,
@@ -176,11 +239,157 @@ class ApprovalDecisionService:
                         "executed": True,
                     },
                 )
-                return self._response(approval)
+                response = self._response(approval)
+                decision_outcome = OutcomeCode.APPROVED
+                action_executed = True
 
+        if identity is not None and decision_outcome is not None:
+            assert resolved_profile is not None
+            self._emit_decision(
+                approval=approval,
+                identity=identity,
+                profile=resolved_profile,
+                outcome=decision_outcome,
+                duration_ms=decision_latency_ms,
+            )
+            if decision_outcome is OutcomeCode.EXPIRED:
+                self._emit_expired(
+                    approval=approval,
+                    identity=identity,
+                    profile=resolved_profile,
+                    duration_ms=decision_latency_ms,
+                )
+            if action_executed:
+                self._emit_action_completed(
+                    approval=approval,
+                    identity=identity,
+                    profile=resolved_profile,
+                    duration_ms=decision_latency_ms,
+                )
         if expired_approval:
             raise ApprovalExpired("approval expired")
+        if response is not None:
+            return response
         raise ApprovalDecisionConflict("approval decision did not complete")
+
+    def _emit_decision(
+        self,
+        *,
+        approval: Approval,
+        identity: ApprovalObservationIdentity,
+        profile: ResolvedTenantProfile,
+        outcome: OutcomeCode,
+        duration_ms: int | None,
+    ) -> None:
+        self._emit_approval_event(
+            event=EventName.APPROVAL_DECIDED,
+            approval=approval,
+            identity=identity,
+            profile=profile,
+            outcome=outcome,
+            duration_ms=duration_ms,
+        )
+
+    def _emit_expired(
+        self,
+        *,
+        approval: Approval,
+        identity: ApprovalObservationIdentity,
+        profile: ResolvedTenantProfile,
+        duration_ms: int | None,
+    ) -> None:
+        self._emit_approval_event(
+            event=EventName.APPROVAL_EXPIRED,
+            approval=approval,
+            identity=identity,
+            profile=profile,
+            outcome=OutcomeCode.EXPIRED,
+            duration_ms=duration_ms,
+        )
+
+    def _emit_action_completed(
+        self,
+        *,
+        approval: Approval,
+        identity: ApprovalObservationIdentity,
+        profile: ResolvedTenantProfile,
+        duration_ms: int | None,
+    ) -> None:
+        self._emit_approval_event(
+            event=EventName.APPROVAL_ACTION_COMPLETED,
+            approval=approval,
+            identity=identity,
+            profile=profile,
+            outcome=OutcomeCode.EXECUTED,
+            duration_ms=duration_ms,
+        )
+
+    def _emit_approval_event(
+        self,
+        *,
+        event: EventName,
+        approval: Approval,
+        identity: ApprovalObservationIdentity,
+        profile: ResolvedTenantProfile,
+        outcome: OutcomeCode,
+        duration_ms: int | None,
+    ) -> None:
+        try:
+            self.action_registry.require(approval.action)
+        except ActionCapabilityUnavailable:
+            action_key = None
+            action_known = False
+        else:
+            action_key = approval.action
+            action_known = True
+        context = ObservationContext(
+            trace_id=identity.trace_id,
+            request_id=self.request_id,
+            tenant_id=approval.tenant_id,
+            job_id=approval.job_id,
+            approval_id=approval.id,
+            scenario_key=(
+                profile.compiled.scenario_key
+                if profile.compiled is not None
+                else None
+            ),
+            profile_fingerprint=(
+                profile.compiled.profile_fingerprint
+                if profile.compiled is not None
+                else None
+            ),
+        )
+        safe_emit(
+            self.observer,
+            ObservationEvent(
+                event=event,
+                level=EventLevel.INFO,
+                trace_id=context.trace_id,
+                request_id=context.request_id,
+                tenant_id=context.tenant_id,
+                job_id=context.job_id,
+                approval_id=context.approval_id,
+                component=Component.APPROVAL,
+                outcome=outcome,
+                duration_ms=duration_ms,
+                action_key=action_key,
+                action_known=action_known,
+                scenario_key=context.scenario_key,
+                profile_fingerprint=context.profile_fingerprint,
+            ),
+        )
+
+    @staticmethod
+    def _decision_latency_ms(approval: Approval, now: datetime) -> int | None:
+        if approval.created_at is None:
+            return None
+        created = approval.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        current = now
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        return max(0, int((current - created).total_seconds() * 1000))
 
     @staticmethod
     def _is_same_final_decision(

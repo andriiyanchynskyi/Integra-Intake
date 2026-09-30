@@ -1,18 +1,21 @@
-"""Strict contracts for the Phase-9 rate-confirmation boundary."""
+"""Strict, scenario-neutral contracts for bounded document intake."""
 
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictInt,
     StrictStr,
     field_validator,
     model_validator,
 )
+
+from app.tenants.identifiers import SafeIdentifier
 
 
 MAX_DOCUMENT_BYTES = 5 * 1024 * 1024
@@ -39,7 +42,7 @@ class _StrictDocumentModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
-class RateConfirmationDocumentInput(_StrictDocumentModel):
+class DocumentInput(_StrictDocumentModel):
     """Internal input; exactly one bounded plaintext/PDF payload is allowed."""
 
     channel: StrictStr = Field(min_length=1, max_length=100)
@@ -85,15 +88,16 @@ class RateConfirmationDocumentInput(_StrictDocumentModel):
         return self
 
 
-class NormalizedRateConfirmationDocument(_StrictDocumentModel):
-    """JSON-safe trusted snapshot; original bytes are never represented here."""
+class NormalizedDocument(_StrictDocumentModel):
+    """JSON-safe trusted document snapshot with an explicit capability binding."""
 
-    kind: Literal["rate_confirmation"] = "rate_confirmation"
+    snapshot_version: Literal[2] = 2
+    document_kind: SafeIdentifier
+    target_intake_type: SafeIdentifier
     media_type: DocumentMediaType
     sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
-    parser_version: Literal["rate_confirmation_document.v1"] = (
-        "rate_confirmation_document.v1"
-    )
+    normalizer_key: SafeIdentifier
+    normalizer_version: Annotated[StrictInt, Field(ge=1)]
     text: StrictStr | None = None
     extraction_error: DocumentExtractionError | None = None
 
@@ -136,13 +140,25 @@ class NormalizedRateConfirmationDocument(_StrictDocumentModel):
             raise ValueError("exactly one normalized text or extraction error is required")
         return self
 
+    @property
+    def kind(self) -> str:
+        """Compatibility spelling for callers that used the old snapshot field."""
+
+        return self.document_kind
+
+
+# Input compatibility remains an alias because its contract is already generic.
+RateConfirmationDocumentInput = DocumentInput
+
 
 __all__ = [
     "DocumentExtractionError",
+    "DocumentInput",
     "DocumentMediaType",
     "MAX_DOCUMENT_BYTES",
     "MAX_DOCUMENT_PAGES",
     "MAX_DOCUMENT_TEXT_CHARS",
-    "NormalizedRateConfirmationDocument",
+    "NormalizedDocument",
     "RateConfirmationDocumentInput",
+    "_StrictDocumentModel",
 ]

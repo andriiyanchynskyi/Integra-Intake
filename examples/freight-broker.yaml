@@ -1,4 +1,6 @@
+profile_version: 2
 slug: freight-broker
+scenario_key: freight_broker
 display_name: Freight broker
 intake_types:
   - name: load_request
@@ -29,13 +31,19 @@ fields:
   valid_until: {type: date_time, label: Quote valid until}
   invoice_number: {type: short_text, label: Invoice number}
 action_policy:
-  create_case: {allowed: true, requires_approval: false}
-  find_customer: {allowed: true, requires_approval: false}
-  update_case_fields: {allowed: true, requires_approval: false}
-  create_reply_draft: {allowed: true, requires_approval: false}
-  send_reply: {allowed: true, requires_approval: true}
-  close_case: {allowed: true, requires_approval: true}
-  flag_for_review: {allowed: true, requires_approval: false}
+  create_case: {allowed: true, requires_approval: false, execution: executable}
+  find_customer: {allowed: true, requires_approval: false, execution: executable}
+  update_case_fields: {allowed: true, requires_approval: false, execution: executable}
+  create_reply_draft: {allowed: true, requires_approval: false, execution: executable}
+  send_reply: {allowed: true, requires_approval: true, execution: policy_only}
+  close_case: {allowed: true, requires_approval: true, execution: policy_only}
+  flag_for_review: {allowed: true, requires_approval: false, execution: executable}
+documents:
+  rate_confirmation:
+    intake_type: rate_confirmation
+    normalizer: bounded_text_pdf
+    normalizer_version: 1
+    default_for_inbound: true
 routing:
   outcome_names: [urgent, awaiting_input, pending_approval, ready, rejected]
   always_approval_actions: [send_reply, close_case]

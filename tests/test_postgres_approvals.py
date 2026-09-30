@@ -11,7 +11,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth import AuthenticatedOperator
-from app.documents import DocumentMediaType, DocumentNormalizer, RateConfirmationDocumentInput
+from app.documents import DocumentInput, DocumentMediaType, DocumentNormalizer, NormalizedDocument
 from app.db.models import (
     AgentJob,
     Approval,
@@ -96,6 +96,9 @@ class _ApprovalSession:
                 )
             )
 
+        if "FROM idempotency_records" in query:
+            return _ScalarResult(None)
+
         assert "FROM approvals" in query
         tenant_id = params["tenant_id_1"]
         job_id = params["job_id_1"]
@@ -140,12 +143,34 @@ def _action() -> PendingAction:
     )
 
 
+def _approval_for_job(
+    job: AgentJob,
+    action: PendingAction,
+    *,
+    stored_action: str | None = None,
+) -> Approval:
+    return Approval(
+        id=uuid4(),
+        tenant_id=job.tenant_id,
+        job_id=job.id,
+        case_id=None,
+        action=stored_action or action.name,
+        status="pending",
+        decision={},
+        policy_reason="approval_required",
+        pending_action=action.model_dump(mode="json"),
+        tenant_config_sha256=job.tenant_config_sha256,
+        expires_at=DECISION_TIME + timedelta(hours=1),
+        execution_result=None,
+    )
+
+
 def _document_snapshot(
     *,
     text: str | None = "Summary: Approved case",
     content: bytes | None = None,
     media_type: DocumentMediaType = DocumentMediaType.TEXT,
-) -> tuple[dict[str, object], object]:
+) -> tuple[dict[str, object], NormalizedDocument]:
     payload: dict[str, object] = {
         "channel": "email",
         "subject": "Rate confirmation",
@@ -157,7 +182,11 @@ def _document_snapshot(
     if content is not None:
         payload["content"] = content
     normalized = DocumentNormalizer().normalize(
-        RateConfirmationDocumentInput.model_validate(payload)
+        DocumentInput.model_validate(payload),
+        document_kind="rate_confirmation",
+        target_intake_type="rate_confirmation",
+        normalizer_key="bounded_text_pdf",
+        normalizer_version=1,
     )
     return normalized.model_dump(mode="json"), normalized
 
@@ -207,6 +236,59 @@ def test_approval_source_reconstruction_preserves_safe_unreadable_error() -> Non
     assert source.document.extraction_error.value == "pdf_malformed"
     assert raw_content not in repr(source).encode("utf-8")
     assert "malformed-approval-document-secret" not in repr(source)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "stored_action"),
+    (
+        (PendingAction(name="future_action", arguments={}, known_fields={}), None),
+        (_action(), "update_case_fields"),
+        (_action().model_copy(update={"version": 2}), None),
+    ),
+    ids=["unknown_action", "mismatched_action", "pending_version"],
+)
+async def test_approval_command_registry_mismatch_fails_before_side_effect(
+    action: PendingAction,
+    stored_action: str | None,
+) -> None:
+    job = _job(status="awaiting_approval")
+    approval = _approval_for_job(job, action, stored_action=stored_action)
+    session = _ApprovalSession([job])
+
+    with pytest.raises(RuntimeError):
+        await PostgresApprovalActionExecutor().execute(
+            session,
+            approval,
+            action,
+            now=DECISION_TIME,
+        )
+
+    assert approval.case_id is None
+    assert not any("idempotency_records" in query for query in session.queries)
+
+
+@pytest.mark.asyncio
+async def test_approval_arguments_are_validated_by_registry_descriptor_before_side_effect() -> None:
+    job = _job(status="awaiting_approval")
+    action = PendingAction(
+        name="find_customer",
+        arguments={"unexpected": "not a lookup argument"},
+        known_fields={},
+    )
+    approval = _approval_for_job(job, action)
+    session = _ApprovalSession([job])
+
+    with pytest.raises(RuntimeError, match="approved action arguments are invalid"):
+        await PostgresApprovalActionExecutor().execute(
+            session,
+            approval,
+            action,
+            now=DECISION_TIME,
+        )
+
+    assert approval.case_id is None
+    assert not any("idempotency_records" in query for query in session.queries)
 
 
 @pytest.mark.asyncio

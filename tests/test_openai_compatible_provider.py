@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import traceback
+from uuid import UUID
 
 import httpx
 import pytest
@@ -15,6 +16,7 @@ from app.agent import (
 )
 from app.core.config import Settings
 from app.providers import OpenAICompatibleLLMClient, StructuredProposalValidationError
+from app.observability import EventName, ObservationContext, OutcomeCode, RecordingObserver
 
 
 VALID_PROPOSAL = {
@@ -150,6 +152,117 @@ def test_valid_structured_proposal_uses_openai_compatible_contract() -> None:
     assert proposal.tool_call is not None
     assert proposal.tool_call.arguments == {"customer_id": "cust-1"}
     assert proposal.confidence == 0.87
+
+
+def test_provider_success_event_contains_duration_and_validated_usage() -> None:
+    observer = RecordingObserver()
+    ticks = iter((0, 1_500_000))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        body = _provider_response(json.dumps(VALID_PROPOSAL))
+        body["usage"] = {
+            "prompt_tokens": 10,
+            "completion_tokens": 7,
+            "total_tokens": 17,
+        }
+        return httpx.Response(200, json=body)
+
+    with _client(httpx.MockTransport(handler)) as http_client:
+        OpenAICompatibleLLMClient(
+            base_url="https://provider.example/v1",
+            api_key="dummy-secret",
+            model="test-model",
+            client=http_client,
+            observer=observer,
+            context=ObservationContext(
+                trace_id=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+            ),
+            clock=lambda: next(ticks),
+        ).complete(_messages())
+
+    event = next(item for item in observer.events if item.event is EventName.PROVIDER_CALL_COMPLETED)
+    assert event.provider_call_index == 1
+    assert event.duration_ms == 1
+    assert event.outcome is OutcomeCode.SUCCESS
+    assert event.prompt_tokens == 10
+    assert event.completion_tokens == 7
+    assert event.total_tokens == 17
+
+
+def test_provider_validation_retry_emits_two_call_events_and_exhausted_failure() -> None:
+    observer = RecordingObserver()
+    responses = iter([_provider_response("{invalid"), _provider_response(json.dumps(VALID_PROPOSAL))])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json=next(responses))
+
+    with _client(httpx.MockTransport(handler)) as http_client:
+        OpenAICompatibleLLMClient(
+            base_url="https://provider.example/v1",
+            api_key="dummy-secret",
+            model="test-model",
+            client=http_client,
+            observer=observer,
+            context=ObservationContext(trace_id=UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")),
+        ).complete(_messages())
+
+    calls = [item for item in observer.events if item.event is EventName.PROVIDER_CALL_COMPLETED]
+    assert len(calls) == 2
+    assert calls[0].provider_call_index == 1
+    assert calls[0].outcome is OutcomeCode.INVALID_SCHEMA
+    assert calls[0].validation_retry is False
+    assert calls[1].provider_call_index == 2
+    assert calls[1].outcome is OutcomeCode.SUCCESS
+    assert calls[1].validation_retry is True
+
+    observer.events.clear()
+    responses = iter([_provider_response("{invalid"), _provider_response("{invalid")])
+    with _client(httpx.MockTransport(handler)) as http_client:
+        with pytest.raises(StructuredProposalValidationError):
+            OpenAICompatibleLLMClient(
+                base_url="https://provider.example/v1",
+                api_key="dummy-secret",
+                model="test-model",
+                client=http_client,
+                observer=observer,
+                context=ObservationContext(trace_id=UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")),
+            ).complete(_messages())
+    assert len([item for item in observer.events if item.event is EventName.PROVIDER_CALL_COMPLETED]) == 2
+    failures = [
+        item
+        for item in observer.events
+        if item.event is EventName.PROVIDER_STRUCTURED_OUTPUT_FAILED
+    ]
+    assert len(failures) == 1
+    assert failures[0].outcome is OutcomeCode.INVALID_SCHEMA
+    assert all("raw-invalid" not in item.model_dump_json() for item in failures)
+
+
+def test_provider_transport_failure_event_is_safe() -> None:
+    observer = RecordingObserver()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, request=request, text="provider-body-secret")
+
+    with _client(httpx.MockTransport(handler)) as http_client:
+        with pytest.raises(httpx.HTTPStatusError):
+            OpenAICompatibleLLMClient(
+                base_url="https://provider.example/v1",
+                api_key="dummy-secret",
+                model="test-model",
+                client=http_client,
+                observer=observer,
+                context=ObservationContext(trace_id=UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")),
+            ).complete(_messages())
+
+    event = next(item for item in observer.events if item.event is EventName.PROVIDER_CALL_COMPLETED)
+    assert event.outcome is OutcomeCode.HTTP_ERROR
+    assert event.status_code == 503
+    serialized = event.model_dump_json()
+    assert "provider-body-secret" not in serialized
+    assert "dummy-secret" not in serialized
 
 
 def test_leading_system_message_serializes_as_provider_system_message() -> None:

@@ -9,7 +9,7 @@ from app.agent.models import AgentProposal, ProposalPriority
 from app.documents import (
     DocumentMediaType,
     DocumentNormalizer,
-    RateConfirmationDocumentInput,
+    DocumentInput,
 )
 from app.policy import (
     PolicyEngine,
@@ -24,7 +24,9 @@ from app.tenants.config import RoutingDecision, RoutingStatus, TenantConfig
 @pytest.fixture
 def profile_data() -> dict[str, object]:
     return {
+        "profile_version": 2,
         "slug": "acme",
+        "scenario_key": "synthetic",
         "display_name": "Acme",
         "intake_types": [
             {
@@ -37,11 +39,28 @@ def profile_data() -> dict[str, object]:
             "summary": {"type": "short_text", "label": "Summary"},
         },
         "action_policy": {
-            "create_case": {"allowed": True, "requires_approval": False},
-            "find_customer": {"allowed": True, "requires_approval": False},
-            "approval_action": {"allowed": True, "requires_approval": True},
-            "send_reply": {"allowed": True, "requires_approval": False},
+            "create_case": {
+                "allowed": True,
+                "requires_approval": False,
+                "execution": "executable",
+            },
+            "find_customer": {
+                "allowed": True,
+                "requires_approval": False,
+                "execution": "executable",
+            },
+            "approval_action": {
+                "allowed": True,
+                "requires_approval": True,
+                "execution": "policy_only",
+            },
+            "send_reply": {
+                "allowed": True,
+                "requires_approval": False,
+                "execution": "policy_only",
+            },
         },
+        "documents": {},
         "routing": {
             "outcome_names": [
                 "urgent",
@@ -73,11 +92,30 @@ def document_tenant_config(profile_data: dict[str, object]) -> TenantConfig:
     return TenantConfig.model_validate(profile)
 
 
+@pytest.fixture
+def generic_document_tenant_config(profile_data: dict[str, object]) -> TenantConfig:
+    profile = deepcopy(profile_data)
+    profile["fields"]["document_id"] = {  # type: ignore[index]
+        "type": "short_text",
+        "label": "Document ID",
+    }
+    profile["intake_types"].append(  # type: ignore[union-attr]
+        {
+            "name": "document_request",
+            "description": "A synthetic document request",
+            "required_fields": ["document_id"],
+        }
+    )
+    return TenantConfig.model_validate(profile)
+
+
 def make_document(
     *,
     text: str | None = "Summary: Customer request",
     content: bytes | None = None,
     media_type: DocumentMediaType = DocumentMediaType.TEXT,
+    document_kind: str = "rate_confirmation",
+    target_intake_type: str = "rate_confirmation",
 ):
     payload: dict[str, object] = {
         "channel": "email",
@@ -90,7 +128,11 @@ def make_document(
     if content is not None:
         payload["content"] = content
     return DocumentNormalizer().normalize(
-        RateConfirmationDocumentInput.model_validate(payload)
+        DocumentInput.model_validate(payload),
+        document_kind=document_kind,
+        target_intake_type=target_intake_type,
+        normalizer_key="bounded_text_pdf",
+        normalizer_version=1,
     )
 
 
@@ -502,6 +544,34 @@ def test_unreadable_document_has_server_owned_awaiting_input_outcome(
         decision=RoutingDecision.DENY,
         reason="document_unreadable",
         missing=("summary",),
+    )
+
+
+def test_unreadable_document_derives_missing_fields_from_trusted_target(
+    generic_document_tenant_config: TenantConfig,
+) -> None:
+    unreadable = make_document(
+        document_kind="document_bundle",
+        target_intake_type="document_request",
+        media_type=DocumentMediaType.PDF,
+        text=None,
+        content=b"malformed-synthetic-document",
+    )
+
+    outcome = evaluate(
+        generic_document_tenant_config,
+        make_proposal(intake_type="request"),
+        action="create_case",
+        document=unreadable,
+        verified_present_fields=frozenset({"document_id"}),
+    )
+
+    assert_outcome(
+        outcome,
+        status=RoutingStatus.AWAITING_INPUT,
+        decision=RoutingDecision.DENY,
+        reason="document_unreadable",
+        missing=("document_id",),
     )
 
 

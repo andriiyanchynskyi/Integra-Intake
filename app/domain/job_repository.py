@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 class ClaimedJob:
     id: UUID
     tenant_id: UUID
+    trace_id: UUID
     status: str
     source_snapshot: dict[str, object]
     tenant_config_snapshot: dict[str, object]
@@ -30,6 +31,32 @@ class ClaimedJob:
     risk_signals: dict[str, object]
     attempt_count: int
     side_effect_committed_at: datetime | None
+    created_at: datetime
+    available_at: datetime
+    started_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class JobObservationIdentity:
+    """Immutable profile identity used when an idempotent job is reused."""
+
+    trace_id: UUID
+    tenant_config_snapshot: dict[str, object]
+    tenant_config_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseRecoveryObservation:
+    """Closed lifecycle data returned when a running lease is recovered."""
+
+    trace_id: UUID
+    tenant_id: UUID
+    job_id: UUID
+    attempt_count: int
+    status: str
+    error_code: str
+    tenant_config_snapshot: dict[str, object] = field(default_factory=dict)
+    tenant_config_sha256: str | None = None
 
 
 class JobRepository:
@@ -58,6 +85,7 @@ class JobRepository:
     ) -> AgentJob:
         job = AgentJob(
             tenant_id=command.tenant_id,
+            trace_id=command.trace_id,
             source_snapshot=self._source_snapshot(command.source),
             tenant_config_snapshot=deepcopy(profile.snapshot),
             tenant_config_sha256=profile.sha256,
@@ -67,6 +95,38 @@ class JobRepository:
         )
         self.session.add(job)
         return job
+
+    async def get_trace_id(
+        self, job_id: UUID, *, tenant_id: UUID
+    ) -> UUID | None:
+        statement = select(AgentJob.trace_id).where(
+            AgentJob.id == job_id,
+            AgentJob.tenant_id == tenant_id,
+        )
+        return (await self.session.execute(statement)).scalar_one_or_none()
+
+    async def get_observation_identity(
+        self, job_id: UUID, *, tenant_id: UUID
+    ) -> JobObservationIdentity | None:
+        statement = select(
+            AgentJob.trace_id,
+            AgentJob.tenant_config_snapshot,
+            AgentJob.tenant_config_sha256,
+        ).where(
+            AgentJob.id == job_id,
+            AgentJob.tenant_id == tenant_id,
+        )
+        row = (await self.session.execute(statement)).one_or_none()
+        if row is None:
+            return None
+        trace_id, snapshot, sha256 = row
+        if not isinstance(snapshot, dict) or not isinstance(sha256, str):
+            return None
+        return JobObservationIdentity(
+            trace_id=trace_id,
+            tenant_config_snapshot=deepcopy(snapshot),
+            tenant_config_sha256=sha256,
+        )
 
     @staticmethod
     def _source_snapshot(source: TrustedSource) -> dict[str, object]:
@@ -105,7 +165,7 @@ class JobRepository:
         now: datetime,
         max_retries: int,
         retry_delay: timedelta,
-    ) -> int:
+    ) -> tuple[LeaseRecoveryObservation, ...]:
         async with self.session.begin():
             statement = (
                 select(AgentJob)
@@ -117,9 +177,8 @@ class JobRepository:
                 .with_for_update(skip_locked=True)
             )
             jobs = (await self.session.execute(statement)).scalars().all()
-            recovered = 0
+            recovered: list[LeaseRecoveryObservation] = []
             for job in jobs:
-                recovered += 1
                 job.lease_expires_at = None
                 if job.side_effect_committed_at is not None:
                     job.status = "failed_uncertain"
@@ -133,7 +192,19 @@ class JobRepository:
                     job.status = "failed"
                     job.error_code = "retry_exhausted"
                     job.finished_at = now
-            return recovered
+                recovered.append(
+                    LeaseRecoveryObservation(
+                        trace_id=job.trace_id,
+                        tenant_id=job.tenant_id,
+                        job_id=job.id,
+                        attempt_count=job.attempt_count,
+                        status=job.status,
+                        error_code=job.error_code or "worker_error",
+                        tenant_config_snapshot=deepcopy(job.tenant_config_snapshot),
+                        tenant_config_sha256=job.tenant_config_sha256,
+                    )
+                )
+            return tuple(recovered)
 
     async def claim_next(
         self,
@@ -163,6 +234,7 @@ class JobRepository:
             return ClaimedJob(
                 id=job.id,
                 tenant_id=job.tenant_id,
+                trace_id=job.trace_id,
                 status=job.status,
                 source_snapshot=deepcopy(job.source_snapshot),
                 tenant_config_snapshot=deepcopy(job.tenant_config_snapshot),
@@ -170,6 +242,9 @@ class JobRepository:
                 risk_signals=deepcopy(job.risk_signals),
                 attempt_count=job.attempt_count,
                 side_effect_committed_at=job.side_effect_committed_at,
+                created_at=job.created_at,
+                available_at=job.available_at,
+                started_at=job.started_at,
             )
 
     async def mark_succeeded(

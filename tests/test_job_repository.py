@@ -27,6 +27,8 @@ def _job(
     return AgentJob(
         id=uuid4(),
         tenant_id=uuid4(),
+        trace_id=uuid4(),
+        created_at=now - timedelta(seconds=5),
         status=status,
         source_snapshot={"channel": "email", "subject": "Load", "body": "Need a truck"},
         tenant_config_snapshot={"display_name": "test"},
@@ -53,6 +55,16 @@ class _ScalarRows:
 class _Result:
     def __init__(self, rows: Iterable[AgentJob]) -> None:
         self._rows = list(rows)
+
+    def one_or_none(self) -> tuple[object, ...] | None:
+        if not self._rows:
+            return None
+        job = self._rows[0]
+        return (
+            job.trace_id,
+            job.tenant_config_snapshot,
+            job.tenant_config_sha256,
+        )
 
     def scalar_one_or_none(self) -> AgentJob | None:
         return self._rows[0] if self._rows else None
@@ -139,6 +151,10 @@ async def test_claim_next_claims_only_due_queued_job_and_leases_it() -> None:
 
     assert claimed is not None
     assert claimed.id == due.id
+    assert claimed.trace_id == due.trace_id
+    assert claimed.created_at == due.created_at
+    assert claimed.available_at == due.available_at
+    assert claimed.started_at == now
     assert due.status == "running"
     assert due.attempt_count == 1
     assert due.started_at == now
@@ -179,7 +195,10 @@ async def test_expired_unmarked_lease_is_requeued_with_bounded_delay() -> None:
         retry_delay=timedelta(seconds=2),
     )
 
-    assert recovered == 1
+    assert len(recovered) == 1
+    assert recovered[0].trace_id == expired.trace_id
+    assert recovered[0].status == "queued"
+    assert recovered[0].error_code == "lease_expired"
     assert expired.status == "queued"
     assert expired.available_at == now + timedelta(seconds=2)
     assert expired.lease_expires_at is None
@@ -227,3 +246,23 @@ async def test_expired_lease_at_retry_budget_is_failed() -> None:
     assert exhausted.status == "failed"
     assert exhausted.error_code == "retry_exhausted"
     assert exhausted.finished_at == now
+
+
+@pytest.mark.asyncio
+async def test_get_observation_identity_is_tenant_scoped_and_copies_profile_identity() -> None:
+    job = _job()
+    session = _Session([job])
+
+    identity = await JobRepository(session).get_observation_identity(
+        job.id,
+        tenant_id=job.tenant_id,
+    )
+
+    assert identity is not None
+    assert identity.trace_id == job.trace_id
+    assert identity.tenant_config_snapshot == job.tenant_config_snapshot
+    assert identity.tenant_config_snapshot is not job.tenant_config_snapshot
+    assert identity.tenant_config_sha256 == job.tenant_config_sha256
+    query = session.queries[-1]
+    assert "agent_jobs.tenant_id" in query
+    assert "agent_jobs.id" in query

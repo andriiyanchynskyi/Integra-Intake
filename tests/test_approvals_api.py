@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
+import hashlib
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 from sqlalchemy.dialects import postgresql
 
@@ -15,19 +19,32 @@ from app.db.models import ApiKey, Approval, ApprovalEvent, Tenant
 from app.db.session import get_db_session
 from app.main import app
 from app.tools.models import PendingAction
+from app.runtime.profiles import canonical_json_bytes
 
 
 TENANT_A = UUID("00000000-0000-0000-0000-000000000001")
 TENANT_B = UUID("00000000-0000-0000-0000-000000000002")
 CASE_ID = UUID("00000000-0000-0000-0000-000000000030")
+TRACE_ID = UUID("00000000-0000-0000-0000-000000000040")
 NOW = datetime(2026, 9, 23, 13, tzinfo=timezone.utc)
+REPAIR_PROFILE_SNAPSHOT = yaml.safe_load(
+    (Path(__file__).parents[1] / "examples" / "repair-service.yaml").read_text(
+        encoding="utf-8"
+    )
+)
+REPAIR_PROFILE_SHA256 = hashlib.sha256(
+    canonical_json_bytes(REPAIR_PROFILE_SNAPSHOT)
+).hexdigest()
 
 
 @dataclass
 class _Result:
-    value: ApiKey | Approval | None
+    value: object
 
-    def scalar_one_or_none(self) -> ApiKey | Approval | None:
+    def scalar_one_or_none(self) -> object:
+        return self.value
+
+    def one_or_none(self) -> object:
         return self.value
 
 
@@ -84,10 +101,15 @@ class _Database:
         tenant_id: UUID,
         *,
         expires_at: datetime = datetime(2099, 1, 1, tzinfo=timezone.utc),
+        action_name: str = "create_case",
+        stored_action: str | None = None,
+        action_version: int = 1,
+        arguments: dict[str, object] | None = None,
     ) -> Approval:
         action = PendingAction(
-            name="create_case",
-            arguments={"customer_id": None},
+            name=action_name,
+            version=action_version,
+            arguments=arguments or {"customer_id": None},
             known_fields={"summary": "Create a case"},
         )
         approval = Approval(
@@ -95,12 +117,12 @@ class _Database:
             tenant_id=tenant_id,
             case_id=None,
             job_id=uuid4(),
-            action=action.name,
+            action=stored_action or action.name,
             status="pending",
             decision={},
             policy_reason="approval_required",
             pending_action=action.model_dump(mode="json"),
-            tenant_config_sha256="a" * 64,
+            tenant_config_sha256=REPAIR_PROFILE_SHA256,
             expires_at=expires_at,
             execution_result=None,
         )
@@ -139,6 +161,29 @@ class _Session:
                 None,
             )
             return _Result(key)
+
+        if "FROM agent_jobs" in query:
+            job_id = params["id_1"]
+            tenant_id = params["tenant_id_1"]
+            approval = next(
+                (
+                    candidate
+                    for candidate in self.database.approvals
+                    if candidate.job_id == job_id and candidate.tenant_id == tenant_id
+                ),
+                None,
+            )
+            if approval is None:
+                return _Result(None)
+            if "tenant_config_snapshot" in query:
+                return _Result(
+                    (
+                        TRACE_ID,
+                        deepcopy(REPAIR_PROFILE_SNAPSHOT),
+                        REPAIR_PROFILE_SHA256,
+                    )
+                )
+            return _Result(TRACE_ID)
 
         assert "FROM approvals" in query
         approval_id = params["id_1"]
@@ -239,6 +284,45 @@ def test_operator_can_approve_repeat_idempotently_and_opposite_decision_conflict
         "approval_approved",
         "approved_action_executed",
     ]
+
+
+@pytest.mark.parametrize(
+    ("action_name", "stored_action", "action_version", "arguments"),
+    (
+        ("future_action", None, 1, {}),
+        ("create_case", "update_case_fields", 1, {"customer_id": None}),
+        ("create_case", None, 2, {"customer_id": None}),
+        ("create_case", None, 1, {"unexpected": True}),
+    ),
+    ids=["unknown_action", "mismatched_action", "pending_version", "invalid_arguments"],
+)
+def test_invalid_registry_approval_command_fails_before_side_effect(
+    client: TestClient,
+    database: _Database,
+    operator_key: str,
+    action_name: str,
+    stored_action: str | None,
+    action_version: int,
+    arguments: dict[str, object],
+) -> None:
+    approval = database.add_approval(
+        TENANT_A,
+        action_name=action_name,
+        stored_action=stored_action,
+        action_version=action_version,
+        arguments=arguments,
+    )
+
+    response = client.post(
+        f"/v1/approvals/{approval.id}/decide",
+        headers={"X-API-Key": operator_key},
+        json={"decision": "approve", "reason": "Reviewed by operations"},
+    )
+
+    assert response.status_code == 409
+    assert approval.status == "pending"
+    assert approval.case_id is None
+    assert _ActionExecutor.calls == 0
 
 
 def test_service_key_is_unauthorized_and_malformed_key_is_rejected(
