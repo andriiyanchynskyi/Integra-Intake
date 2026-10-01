@@ -15,11 +15,22 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import generate_api_key
+from app.core.config import settings
 from app.db.models import ApiKey, Tenant
 from app.db.session import async_session_factory
+from app.runtime.profiles import TenantProfileResolver, TenantProfileUnavailableError
 
 
 DEMO_TENANT_SLUG = "freight-broker"
+
+
+def resolve_profile_slug(profile: str) -> str:
+    """Validate and return the slug of one trusted checked-in profile."""
+
+    try:
+        return TenantProfileResolver(settings.tenant_profiles_directory).resolve(profile).config.slug
+    except TenantProfileUnavailableError as error:
+        raise ValueError("trusted tenant profile is unavailable") from error
 
 
 async def seed_demo_tenant(session: AsyncSession, slug: str = DEMO_TENANT_SLUG) -> str:
@@ -32,10 +43,16 @@ async def seed_demo_tenant(session: AsyncSession, slug: str = DEMO_TENANT_SLUG) 
             tenant = Tenant(slug=slug, name="Demo tenant", status="active")
             session.add(tenant)
             await session.flush()
+        else:
+            tenant.status = "active"
 
         active_keys = (
             await session.execute(
-                select(ApiKey).where(ApiKey.tenant_id == tenant.id, ApiKey.is_active.is_(True))
+                select(ApiKey).where(
+                    ApiKey.tenant_id == tenant.id,
+                    ApiKey.is_active.is_(True),
+                    ApiKey.principal_type == "service",
+                )
             )
         ).scalars().all()
         for active_key in active_keys:
@@ -65,6 +82,8 @@ async def seed_operator_key(
         ).scalar_one_or_none()
         if tenant is None:
             raise ValueError("tenant must be seeded before an operator key")
+        if tenant.status != "active":
+            raise ValueError("tenant must be active before an operator key")
         active_operator_keys = (
             await session.execute(
                 select(ApiKey).where(
@@ -96,19 +115,25 @@ async def main(
     output: Callable[[str], None] = print,
     *,
     operator_ref: str | None = None,
+    profile: str = DEMO_TENANT_SLUG,
 ) -> None:
+    slug = resolve_profile_slug(profile)
     async with async_session_factory() as session:
-        service_key = await seed_demo_tenant(session)
-        raw_key = (
-            await seed_operator_key(session, operator_ref)
-            if operator_ref is not None
-            else service_key
-        )
+        if operator_ref is None:
+            raw_key = await seed_demo_tenant(session, slug)
+        else:
+            raw_key = await seed_operator_key(session, operator_ref, slug)
     output(raw_key)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--operator-ref", help="provision an approval-decider key")
+    parser.add_argument(
+        "--profile",
+        default=DEMO_TENANT_SLUG,
+        choices=("freight-broker", "repair-service", "language-school"),
+        help="trusted tenant profile slug",
+    )
     arguments = parser.parse_args()
-    asyncio.run(main(operator_ref=arguments.operator_ref))
+    asyncio.run(main(operator_ref=arguments.operator_ref, profile=arguments.profile))

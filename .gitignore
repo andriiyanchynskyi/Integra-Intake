@@ -6,7 +6,10 @@ __pycache__/
 dist/
 *.log
 ROADMAP.md
-docs/
+docs/*
+!docs/runbooks/
+docs/runbooks/*
+!docs/runbooks/live-provider-demo.md
 # The deterministic freight eval corpus reuses these checked-in document
 # fixtures; keep the broad historical docs/ ignore rule elsewhere.
 !evals/fixtures/docs/

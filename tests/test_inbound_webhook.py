@@ -54,6 +54,7 @@ from app.inbound import (
 )
 from app.inbound.service import InboundIntakeService
 from app.main import app
+from app.api.inbound import router as inbound_router
 from app.policy import TrustedSource, TrustedToolRuntimeContext
 from app.runtime.factory import AgentRuntimeFactory
 from app.runtime.profiles import TenantProfileUnavailableError
@@ -713,8 +714,8 @@ def test_webhook_endpoint_accepts_body_only_message_and_uses_authenticated_tenan
 def test_inbound_webhook_enqueue_uses_a_fresh_db_session_after_auth_lookup() -> None:
     route = next(
         route
-        for route in app.routes
-        if isinstance(route, APIRoute) and route.path == "/v1/inbound/email/webhook"
+        for route in inbound_router.routes
+        if isinstance(route, APIRoute) and route.path == "/inbound/email/webhook"
     )
     auth_dependency = next(
         dependency

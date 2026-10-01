@@ -21,6 +21,7 @@ from app.agent import (
     StopReason,
     ToolCall,
     ToolData,
+    ToolExecutionDisposition,
     ToolExecutionResult,
 )
 from app.observability import EventName, ObservationContext, RecordingObserver
@@ -359,6 +360,25 @@ def test_executor_stopped_result_appends_data_once_and_preserves_response() -> N
     assert tool_messages[0].tool_result == {"draft_id": "draft-1"}
 
 
+def test_tool_execution_failure_returns_failed_run_without_backend_details() -> None:
+    tool_call = ToolCall(name="find_customer")
+    tool_proposal = _proposal(tool_call=tool_call)
+    tools = StoppingFakeToolExecutor(
+        ToolExecutionResult(
+            data={"outcome": "tool_execution_failed"},
+            disposition=ToolExecutionDisposition.FAILED,
+            final_response="tool_execution_failed",
+        )
+    )
+
+    result = AgentLoop(FakeLLM([tool_proposal]), tools).run([])
+
+    assert result.status is RunStatus.FAILED
+    assert result.reason is StopReason.TOOL_EXECUTION_FAILED
+    assert result.final_response == "tool_execution_failed"
+    assert tools.calls == [tool_call]
+
+
 def test_loop_isolates_initial_messages_from_mutating_llm() -> None:
     initial_payload = {"nested": {"items": ["caller"]}}
     initial = AgentMessage(role=MessageRole.USER, tool_result=initial_payload)
@@ -537,7 +557,7 @@ def test_self_referential_tool_data_is_rejected(payload_kind: str) -> None:
 
 
 def test_third_consecutive_request_for_same_tool_breaks_before_execution() -> None:
-    tool_call = ToolCall(name="unstable_tool")
+    tool_call = ToolCall(name="unstable_tool", arguments={"attempt": 1})
     llm = FakeLLM(
         [
             _proposal(rationale=f"Attempt {index}", tool_call=tool_call)
@@ -559,6 +579,25 @@ def test_third_consecutive_request_for_same_tool_breaks_before_execution() -> No
         MessageRole.TOOL,
         MessageRole.ASSISTANT,
     ]
+
+
+def test_same_tool_with_different_arguments_does_not_trigger_repetition_guard() -> None:
+    tool_calls = [
+        ToolCall(name="find_customer", arguments={"email": f"user{index}@example.test"})
+        for index in range(3)
+    ]
+    llm = FakeLLM(
+        [_proposal(rationale=f"Lookup {index}", tool_call=call) for index, call in enumerate(tool_calls)]
+        + [_proposal(rationale="Finished")]
+    )
+    tools = FakeToolExecutor({"find_customer": "ok"})
+
+    result = AgentLoop(llm, tools).run([])
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.reason is StopReason.FINAL
+    assert result.steps == 4
+    assert tools.calls == tool_calls
 
 
 def test_nonconsecutive_repeated_tool_requests_are_allowed() -> None:

@@ -29,6 +29,7 @@ from app.observability import (
 )
 from app.policy.models import RiskSignals, TrustedSource
 from app.domain.job_repository import JobRepository
+from app.domain.schemas import MAX_BODY_CHARS, MAX_CHANNEL_CHARS, MAX_SUBJECT_CHARS
 from app.runtime.profiles import (
     ResolvedTenantProfile,
     TenantProfileResolver,
@@ -39,9 +40,9 @@ from app.runtime.profiles import (
 class CreateIntakeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    channel: str = Field(min_length=1, max_length=100)
-    subject: str = Field(min_length=1, max_length=500)
-    body: str = Field(min_length=1)
+    channel: str = Field(min_length=1, max_length=MAX_CHANNEL_CHARS)
+    subject: str = Field(min_length=1, max_length=MAX_SUBJECT_CHARS)
+    body: str = Field(min_length=1, max_length=MAX_BODY_CHARS)
 
     @field_validator("channel", "subject", "body")
     @classmethod

@@ -58,6 +58,9 @@ Request JSON cannot select a tenant. Every repository operation includes the
 authenticated tenant ID, and cross-tenant case reads behave like missing
 resources (404).
 
+Service keys cannot act as operators, and operator keys cannot call service
+intake APIs. Keys for inactive tenants are rejected before route authorization.
+
 Each HTTP request receives a server request ID and provisional trace ID before
 authentication. A newly created intake job persists that trace; an idempotent
 duplicate reuses the existing job trace. Approval decisions use a fresh request
@@ -104,6 +107,7 @@ All tenant endpoints use X-API-Key unless noted otherwise.
 | POST /v1/cases | Creates a received case directly. Body: channel, subject, body, optional customer_id and extracted_fields. Returns 201. |
 | GET /v1/cases/{case_id} | Returns a case only when it belongs to the authenticated tenant. Returns 404 for an unknown or cross-tenant UUID. |
 | POST /v1/intake | Accepts channel, subject, and body with a required Idempotency-Key; queues one AgentJob and returns 202 with job_id and status="queued". |
+| GET /v1/jobs/{job_id} | Returns a tenant-scoped, read-only source-free job status/result projection. Unknown and cross-tenant UUIDs both return 404. |
 | POST /v1/inbound/email/webhook | Accepts a signed email-like JSON envelope, normalizes its optional attachment, and queues one job. Returns 202 with the same accepted response shape as /v1/intake. |
 | POST /v1/approvals/{approval_id}/decide | Requires an active operator API key with the approval_decider capability. Body: decision (approve or reject) and a non-blank reason. |
 
@@ -168,6 +172,10 @@ needs to authenticate its delivery and map it to the frozen internal
 InboundMessage(tenant_id, channel, from_addr, subject, body, attachments,
 provider_id) contract. It must not bypass the existing enqueue service.
 
+Ordinary POST bodies are limited to 1 MiB before JSON parsing. Direct intake
+and case body text is limited to 100,000 characters. Signed inbound webhook
+envelopes retain their 8 MiB limit; one attachment remains capped at 5 MiB.
+
 ## Agent and worker guarantees
 
 - AgentLoop is synchronous and provider-independent. FastAPI does not call
@@ -177,7 +185,11 @@ provider_id) contract. It must not bypass the existing enqueue service.
 - Proposals are validated structured data. Markdown parsing and LangChain are
   not part of the protocol.
 - PostgreSQL jobs use leases and bounded retry delays (0.5, 1, 2, 4 seconds
-  plus jitter, up to the configured retry limit).
+  plus jitter, up to the configured retry limit). One worker process handles
+  one job at a time. Multiple worker containers scale horizontally through
+  `SKIP LOCKED`, lease heartbeat, and tenant/attempt fencing.
+- Backend tool failures persist the stable `tool_execution_failed` code and
+  never produce a succeeded job.
 - Tenant profile routing and action policy are deterministic. LLM confidence,
   priority, and injection flags are informational inputs to policy, never
   permission to perform a side effect.
@@ -210,6 +222,14 @@ alembic upgrade head
 python scripts/seed_demo.py
 ~~~
 
+Choose a trusted profile explicitly when demonstrating another scenario:
+
+~~~powershell
+python scripts/seed_demo.py --profile freight-broker
+python scripts/seed_demo.py --profile repair-service
+python scripts/seed_demo.py --profile language-school
+~~~
+
 The command creates or reuses the demo tenant, deactivates older demo keys,
 and prints one new raw API key. Store it in a password manager or the current
 shell session. Do not commit it or expect the command to print it again.
@@ -231,6 +251,18 @@ not wait for an LLM call.
 
 Both entry points use JSON stdout events suitable for local inspection. No
 provider credential or source payload is required to run the service locally.
+
+For the opt-in provider smoke and complete recording sequence, see
+[the live provider demo runbook](docs/runbooks/live-provider-demo.md). Provider
+settings are optional and are passed to the worker process only; the API does
+not need `LLM_API_KEY`. Changing local `.env` values requires worker container
+recreation, not an image rebuild.
+
+Run the bounded body-intake smoke with:
+
+~~~powershell
+python scripts/live_provider_smoke.py --profile freight-broker --base-url http://localhost:8000
+~~~
 
 ### 5. Create a direct case
 
@@ -262,7 +294,6 @@ secrets out of source control and logs.
 | TENANT_PROFILES_DIRECTORY | examples | Directory containing validated tenant YAML profiles. |
 | WORKER_POLL_INTERVAL_SECONDS | 0.5 | Idle worker polling interval. |
 | WORKER_LEASE_SECONDS | 60 | Job lease duration. |
-| WORKER_CONCURRENCY | 1 | Worker concurrency setting. |
 | WORKER_MAX_RETRIES | 4 | Maximum retry policy for recoverable jobs. |
 | APPROVAL_TIMEOUT_SECONDS | 86400 | Approval deadline used by the runtime. |
 
@@ -285,7 +316,8 @@ typed proposals and local ports; they add no scenario-specific production
 parser or outbound delivery integration.
 PostgreSQL integration tests run only when an explicit reachable
 DATABASE_URL is supplied; otherwise they skip instead of pretending to be
-database evidence.
+database evidence. CI supplies a disposable PostgreSQL service and this
+variable, so migration/integration checks run there without provider secrets.
 
 ### Deterministic freight evals
 
@@ -309,6 +341,10 @@ Before handoff, also run:
 ~~~bash
 git diff --check
 ~~~
+
+The approval-status migration has one owner in the append-only chain. Recreate
+the disposable local PostgreSQL volume before validating a clean migration
+upgrade after schema-chain changes.
 
 ## Current boundaries
 

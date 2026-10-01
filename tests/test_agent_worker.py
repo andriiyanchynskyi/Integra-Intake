@@ -17,7 +17,7 @@ from app.agent.models import AgentMessage, AgentRunResult, MessageRole, RunStatu
 from app.core.config import Settings
 from app.documents import DocumentExtractionError
 from app.domain.approval_repository import ExpiredApprovalObservation
-from app.domain.job_repository import ClaimedJob, LeaseRecoveryObservation
+from app.domain.job_repository import ClaimedJob, JobLeaseLostError, LeaseRecoveryObservation
 from app.observability import EventName, OutcomeCode, RecordingObserver, WorkerErrorCode
 from app.runtime.preflight import TerminalPreflightResult
 from app.runtime.profiles import canonical_json_bytes
@@ -104,6 +104,8 @@ class _FakeRepository:
     instances: list["_FakeRepository"] = []
     next_claimed: ClaimedJob | None = None
     recovered: tuple[LeaseRecoveryObservation, ...] = ()
+    lease_owned = True
+    lease_lost_on_mark_succeeded = False
 
     def __init__(self, session: object) -> None:
         self.claimed = _FakeRepository.next_claimed
@@ -124,7 +126,13 @@ class _FakeRepository:
         result, self.claimed = self.claimed, None
         return result
 
+    async def renew_lease(self, *args: object, **kwargs: object) -> bool:
+        self.calls.append(("renew_lease", (args, kwargs)))
+        return type(self).lease_owned
+
     async def mark_succeeded(self, *args: object, **kwargs: object) -> None:
+        if type(self).lease_lost_on_mark_succeeded:
+            raise JobLeaseLostError("stale worker")
         if self.claimed is not None and self.claimed.status != "running":
             return
         self.calls.append(("mark_succeeded", (args, kwargs)))
@@ -230,7 +238,6 @@ def test_result_summary_keeps_only_safe_routing_fields_from_terminal_tool_data()
         "status",
         "reason",
         "steps",
-        "final_response",
         "routing_status",
         "routing_reason",
         "missing_required_fields",
@@ -239,7 +246,6 @@ def test_result_summary_keeps_only_safe_routing_fields_from_terminal_tool_data()
         "status": "completed",
         "reason": "executor_stopped",
         "steps": 2,
-        "final_response": "document_unreadable",
         "routing_status": "awaiting_input",
         "routing_reason": "document_unreadable",
         "missing_required_fields": ["origin", "valid_until"],
@@ -271,7 +277,6 @@ def test_result_summary_does_not_reuse_routing_data_before_none_tool_result() ->
         "status": "completed",
         "reason": "executor_stopped",
         "steps": 2,
-        "final_response": "tool_result_unavailable",
     }
 
 
@@ -315,7 +320,6 @@ async def test_persist_result_redacts_document_response_from_job_summary(
         "status": "completed",
         "reason": "executor_stopped",
         "steps": 2,
-        "final_response": None,
     }
     assert "secret document excerpt" not in repr(summary)
 
@@ -324,7 +328,6 @@ def _settings() -> Settings:
     return Settings(
         worker_poll_interval_seconds=0.001,
         worker_lease_seconds=60,
-        worker_concurrency=1,
         worker_max_retries=4,
     )
 
@@ -333,6 +336,8 @@ def _install_repository(monkeypatch: pytest.MonkeyPatch) -> None:
     _FakeRepository.instances.clear()
     _FakeRepository.next_claimed = None
     _FakeRepository.recovered = ()
+    _FakeRepository.lease_owned = True
+    _FakeRepository.lease_lost_on_mark_succeeded = False
     _FakeApprovalRepository.instances.clear()
     _FakeApprovalRepository.expired = ()
     _WORKER_CALLS.clear()
@@ -382,13 +387,93 @@ async def test_serve_once_runs_loop_through_injected_to_thread_seam(
     succeeded = [entry for entry in repository.calls if entry[0] == "mark_succeeded"]
     assert succeeded
     summary = succeeded[-1][1][0][1]  # type: ignore[index]
-    assert set(summary) == {"status", "reason", "steps", "final_response"}
+    assert set(summary) == {"status", "reason", "steps"}
     assert summary == {
         "status": "completed",
         "reason": "final",
         "steps": 2,
-        "final_response": "done",
     }
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_skips_terminal_persistence_and_emits_safe_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    claimed = _claimed()
+    _FakeRepository.next_claimed = claimed
+    _FakeRepository.lease_owned = False
+    runtime = _Runtime(
+        _result(
+            status=RunStatus.COMPLETED,
+            reason=StopReason.FINAL,
+            final_response="done",
+        )
+    )
+
+    async def heartbeat_wait(_interval: float, _stopped: asyncio.Event) -> bool:
+        return False
+
+    async def injected_to_thread(function: object, *args: object) -> object:
+        await asyncio.sleep(0)
+        return await asyncio.to_thread(function, *args)
+
+    observer = RecordingObserver()
+    worker = AgentWorker(
+        _SessionFactory(),
+        runtime_factory=_RuntimeFactory(runtime),
+        settings=_settings(),
+        observer=observer,
+        to_thread=injected_to_thread,
+        heartbeat_wait=heartbeat_wait,
+    )
+
+    assert await worker.serve_once() is True
+    all_calls = [entry for instance in _FakeRepository.instances for entry in instance.calls]
+    assert [entry for entry in all_calls if entry[0] == "renew_lease"]
+    assert not [entry for entry in all_calls if entry[0] == "mark_succeeded"]
+    finished = [
+        event for event in observer.events if event.event is EventName.WORKER_JOB_FINISHED
+    ]
+    assert finished[-1].outcome is OutcomeCode.LEASE_LOST
+    assert finished[-1].worker_error_code is WorkerErrorCode.LEASE_LOST
+
+
+@pytest.mark.asyncio
+async def test_stale_terminal_persistence_is_not_reported_as_generic_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    claimed = _claimed()
+    _FakeRepository.next_claimed = claimed
+    _FakeRepository.lease_lost_on_mark_succeeded = True
+    runtime = _Runtime(
+        _result(
+            status=RunStatus.COMPLETED,
+            reason=StopReason.FINAL,
+            final_response="done",
+        )
+    )
+    observer = RecordingObserver()
+    worker = AgentWorker(
+        _SessionFactory(),
+        runtime_factory=_RuntimeFactory(runtime),
+        settings=_settings(),
+        observer=observer,
+        to_thread=asyncio.to_thread,
+    )
+
+    assert await worker.serve_once() is True
+    finished = [
+        event for event in observer.events if event.event is EventName.WORKER_JOB_FINISHED
+    ]
+    assert finished[-1].outcome is OutcomeCode.LEASE_LOST
+    assert finished[-1].worker_error_code is WorkerErrorCode.LEASE_LOST
+    assert not [
+        event
+        for event in observer.events
+        if event.event is EventName.PERSISTENCE_OPERATION_FAILED
+    ]
 
 
 @pytest.mark.asyncio
@@ -424,7 +509,6 @@ async def test_terminal_unreadable_preflight_is_persisted_as_safe_success(
         "status": "completed",
         "reason": "executor_stopped",
         "steps": 0,
-        "final_response": "document_unreadable",
         "routing_status": "awaiting_input",
         "routing_reason": "document_unreadable",
         "missing_required_fields": ["required_field"],
@@ -683,6 +767,34 @@ async def test_completed_executor_stopped_is_succeeded_and_failed_result_is_fail
     failed = [entry for entry in failed_repo.calls if entry[0] == "mark_failed"]
     assert failed
     assert failed[-1][1][0][1] == "agent_failed"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_failure_persists_stable_error_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    _FakeRepository.next_claimed = _claimed()
+    runtime = _Runtime(
+        _result(
+            status=RunStatus.FAILED,
+            reason=StopReason.TOOL_EXECUTION_FAILED,
+            final_response="tool_execution_failed",
+        )
+    )
+    worker = AgentWorker(
+        _SessionFactory(),
+        runtime_factory=_RuntimeFactory(runtime),
+        settings=_settings(),
+        to_thread=asyncio.to_thread,
+    )
+
+    assert await worker.serve_once() is True
+
+    repository = _FakeRepository.instances[-1]
+    failed = [entry for entry in repository.calls if entry[0] == "mark_failed"]
+    assert failed
+    assert failed[-1][1][0][1] == "tool_execution_failed"  # type: ignore[index]
 
 
 @pytest.mark.asyncio

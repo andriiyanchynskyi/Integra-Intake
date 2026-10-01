@@ -150,6 +150,13 @@ class StopReason(str, Enum):
     REPEATED_TOOL = "repeated_tool"
     MAX_STEPS = "max_steps"
     EXECUTOR_STOPPED = "executor_stopped"
+    TOOL_EXECUTION_FAILED = "tool_execution_failed"
+
+
+class ToolExecutionDisposition(str, Enum):
+    CONTINUE = "continue"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,15 +173,33 @@ class ToolCall:
 
 @dataclass(frozen=True, slots=True)
 class ToolExecutionResult:
-    """Generic executor data and continuation control for the agent loop."""
+    """Generic executor data and typed terminal control for the agent loop."""
 
     data: ToolData = None
-    continue_run: bool = True
+    continue_run: bool | None = None
     final_response: str | None = None
+    disposition: ToolExecutionDisposition | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", _freeze_data(self.data))
-        if self.continue_run and self.final_response is not None:
+        disposition = self.disposition
+        if disposition is None:
+            disposition = (
+                ToolExecutionDisposition.COMPLETED
+                if self.continue_run is False
+                else ToolExecutionDisposition.CONTINUE
+            )
+        elif self.continue_run is not None and self.continue_run != (
+            disposition is ToolExecutionDisposition.CONTINUE
+        ):
+            raise ValueError("tool execution disposition conflicts with continue_run")
+        object.__setattr__(self, "disposition", disposition)
+        object.__setattr__(
+            self,
+            "continue_run",
+            disposition is ToolExecutionDisposition.CONTINUE,
+        )
+        if disposition is ToolExecutionDisposition.CONTINUE and self.final_response is not None:
             raise ValueError("continuing execution cannot set final_response")
 
 

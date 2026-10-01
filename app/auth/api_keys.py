@@ -96,7 +96,13 @@ async def _resolve_active_tenant(
     statement = (
         select(Tenant)
         .join(ApiKey, ApiKey.tenant_id == Tenant.id)
-        .where(ApiKey.key_hash == hash_api_key(raw_key), ApiKey.is_active.is_(True))
+        .where(
+            ApiKey.key_hash == hash_api_key(raw_key),
+            ApiKey.is_active.is_(True),
+            ApiKey.principal_type == "service",
+            ApiKey.capability == "none",
+            Tenant.status == "active",
+        )
     )
     return (await session.execute(statement)).scalar_one_or_none()
 

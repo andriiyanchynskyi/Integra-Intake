@@ -15,6 +15,7 @@ from app.agent.models import (
     StopReason,
     ToolData,
     ToolCall,
+    ToolExecutionDisposition,
     ToolExecutionResult,
 )
 from app.observability import (
@@ -72,7 +73,7 @@ class AgentLoop:
     def run(self, initial_messages: Sequence[AgentMessage]) -> AgentRunResult:
         messages = deepcopy(list(initial_messages))
         steps = 0
-        previous_action_key: str | None = None
+        previous_tool_call: ToolCall | None = None
         consecutive_tool_calls = 0
 
         while steps < self.max_steps:
@@ -125,10 +126,10 @@ class AgentLoop:
                     )
                 )
 
-            if tool_call.name == previous_action_key:
+            if tool_call == previous_tool_call:
                 consecutive_tool_calls += 1
             else:
-                previous_action_key = tool_call.name
+                previous_tool_call = deepcopy(tool_call)
                 consecutive_tool_calls = 1
 
             if consecutive_tool_calls == MAX_CONSECUTIVE_TOOL_CALLS:
@@ -163,15 +164,27 @@ class AgentLoop:
                 )
             )
 
-            if not execution.continue_run:
+            if execution.disposition is ToolExecutionDisposition.FAILED:
                 return self._finish_result(
                     AgentRunResult(
-                    status=RunStatus.COMPLETED,
-                    reason=StopReason.EXECUTOR_STOPPED,
-                    messages=tuple(deepcopy(messages)),
-                    steps=steps,
-                    final_response=execution.final_response,
-                    proposal=deepcopy(proposal),
+                        status=RunStatus.FAILED,
+                        reason=StopReason.TOOL_EXECUTION_FAILED,
+                        messages=tuple(deepcopy(messages)),
+                        steps=steps,
+                        final_response=execution.final_response,
+                        proposal=deepcopy(proposal),
+                    )
+                )
+
+            if execution.disposition is ToolExecutionDisposition.COMPLETED:
+                return self._finish_result(
+                    AgentRunResult(
+                        status=RunStatus.COMPLETED,
+                        reason=StopReason.EXECUTOR_STOPPED,
+                        messages=tuple(deepcopy(messages)),
+                        steps=steps,
+                        final_response=execution.final_response,
+                        proposal=deepcopy(proposal),
                     )
                 )
 

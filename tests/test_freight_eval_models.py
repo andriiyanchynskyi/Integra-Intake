@@ -694,16 +694,17 @@ def test_ci_workflow_always_writes_and_uploads_only_the_eval_report() -> None:
     assert "*" not in str(artifact_with["path"])
 
 
-def test_ci_workflow_has_no_secrets_provider_network_database_or_schedule() -> None:
+def test_ci_workflow_uses_only_local_postgres_without_secrets_or_provider() -> None:
     _, source = _load_ci_workflow()
     lowered = source.lower()
 
     assert not re.search(r"\$\{\{\s*secrets\.", source, flags=re.IGNORECASE)
+    assert "services:" in lowered
+    assert "postgres:16-alpine" in lowered
+    assert "database_url:" in lowered
+    assert "llm_api_key" not in lowered
     forbidden_fragments = (
-        "llm_api_key",
-        "database_url",
         "api_key",
-        "services:",
         "schedule:",
         "workflow_run:",
         "curl ",

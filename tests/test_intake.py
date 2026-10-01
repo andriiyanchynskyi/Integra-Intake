@@ -26,6 +26,11 @@ from app.domain.intake import (
     IntakeEnqueueService,
     canonical_intake_hash,
 )
+from app.domain.schemas import (
+    MAX_BODY_CHARS,
+    MAX_CHANNEL_CHARS,
+    MAX_SUBJECT_CHARS,
+)
 from app.documents import (
     DocumentMediaType,
     DocumentNormalizer,
@@ -260,6 +265,27 @@ def test_create_intake_request_rejects_blank_required_values(field: str) -> None
     payload = {"channel": "email", "subject": "Load", "body": "Need a truck"}
     payload[field] = " \t"
 
+    with pytest.raises(ValidationError):
+        CreateIntakeRequest(**payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "limit"),
+    [
+        ("channel", MAX_CHANNEL_CHARS),
+        ("subject", MAX_SUBJECT_CHARS),
+        ("body", MAX_BODY_CHARS),
+    ],
+)
+def test_create_intake_request_accepts_exact_field_limits_and_rejects_overflow(
+    field: str,
+    limit: int,
+) -> None:
+    payload = {"channel": "email", "subject": "Load", "body": "Need a truck"}
+    payload[field] = "x" * limit
+    CreateIntakeRequest(**payload)
+
+    payload[field] = "x" * (limit + 1)
     with pytest.raises(ValidationError):
         CreateIntakeRequest(**payload)
 

@@ -9,7 +9,13 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ValidationError
 
-from app.agent import AgentProposal, ToolCall, ToolData, ToolExecutionResult
+from app.agent import (
+    AgentProposal,
+    ToolCall,
+    ToolData,
+    ToolExecutionDisposition,
+    ToolExecutionResult,
+)
 from app.policy import (
     PolicyEngine,
     PolicyInput,
@@ -280,7 +286,7 @@ class PolicyGatedToolExecutor:
             # text to the transcript or let an implementation failure escape the loop.
             execution = ToolExecutionResult(
                 data={"outcome": "tool_execution_failed"},
-                continue_run=False,
+                disposition=ToolExecutionDisposition.FAILED,
                 final_response="tool_execution_failed",
             )
             self._emit_tool(

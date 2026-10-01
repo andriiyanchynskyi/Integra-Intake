@@ -19,7 +19,6 @@ class Settings(BaseSettings):
     tenant_profiles_directory: str = "examples"
     worker_poll_interval_seconds: float = Field(default=0.5, gt=0)
     worker_lease_seconds: int = Field(default=60, ge=1)
-    worker_concurrency: int = Field(default=1, ge=1)
     worker_max_retries: int = Field(default=4, ge=0)
     approval_timeout_seconds: int = Field(default=86_400, ge=1)
 

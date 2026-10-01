@@ -12,7 +12,8 @@ import pytest
 from sqlalchemy.dialects import postgresql
 
 from app.db.models import AgentJob
-from app.domain.job_repository import JobRepository
+from app.domain.job_repository import JobLeaseLostError, JobRepository
+from app.runtime.profiles import TenantProfileResolver
 
 
 def _job(
@@ -179,6 +180,95 @@ async def test_claim_next_does_not_claim_nonexpired_running_job() -> None:
     assert running.status == "running"
 
 
+class _ReadResult:
+    def __init__(self, row: tuple[object, ...] | None) -> None:
+        self.row = row
+
+    def one_or_none(self) -> tuple[object, ...] | None:
+        return self.row
+
+
+class _ReadSession:
+    def __init__(self, row: tuple[object, ...]) -> None:
+        self.row = row
+        self.queries: list[str] = []
+
+    async def execute(self, statement: object) -> _ReadResult:
+        compiled = statement.compile(dialect=postgresql.dialect())
+        self.queries.append(str(compiled))
+        return _ReadResult(self.row)
+
+
+class _TransitionResult:
+    def __init__(self, job: AgentJob | None) -> None:
+        self.job = job
+
+    def scalar_one_or_none(self) -> AgentJob | None:
+        return self.job
+
+
+class _TransitionSession:
+    """Session double that enforces the repository's ownership predicates."""
+
+    def __init__(self, job: AgentJob) -> None:
+        self.job = job
+        self.queries: list[str] = []
+
+    def begin(self) -> _Transaction:
+        return _Transaction()
+
+    async def execute(self, statement: object) -> _TransitionResult:
+        compiled = statement.compile(dialect=postgresql.dialect())
+        self.queries.append(str(compiled))
+        params = compiled.params
+        uuid_values = [value for value in params.values() if hasattr(value, "hex")]
+        attempt_values = [
+            value for value in params.values() if isinstance(value, int)
+        ]
+        job_id_matches = not uuid_values or uuid_values[0] == self.job.id
+        tenant_matches = len(uuid_values) < 2 or uuid_values[1] == self.job.tenant_id
+        attempt_matches = not attempt_values or attempt_values[-1] == self.job.attempt_count
+        status_matches = self.job.status == "running"
+        return _TransitionResult(
+            self.job
+            if job_id_matches and tenant_matches and attempt_matches and status_matches
+            else None
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_read_for_tenant_uses_job_and_tenant_predicates() -> None:
+    profile = TenantProfileResolver("examples").resolve("freight-broker")
+    now = datetime.now(timezone.utc)
+    tenant_id = uuid4()
+    job = AgentJob(
+        id=uuid4(),
+        tenant_id=tenant_id,
+        trace_id=uuid4(),
+        status="succeeded",
+        source_snapshot={"channel": "web", "subject": "Synthetic", "body": "Synthetic"},
+        tenant_config_snapshot=profile.snapshot,
+        tenant_config_sha256=profile.sha256,
+        risk_signals={},
+        attempt_count=1,
+        created_at=now,
+        started_at=now,
+        finished_at=now,
+        result={"routing_status": "ready"},
+        error_code=None,
+    )
+    approval_id = uuid4()
+    session = _ReadSession((job, approval_id, "pending"))
+
+    read = await JobRepository(session).get_read_for_tenant(job.id, tenant_id)
+
+    assert read is not None
+    assert read.job_id == job.id
+    assert read.tenant_config_snapshot == profile.snapshot
+    assert read.approval_id == approval_id
+    assert any("agent_jobs.id" in query and "agent_jobs.tenant_id" in query for query in session.queries)
+
+
 @pytest.mark.asyncio
 async def test_expired_unmarked_lease_is_requeued_with_bounded_delay() -> None:
     now = datetime(2026, 9, 21, tzinfo=timezone.utc)
@@ -266,3 +356,101 @@ async def test_get_observation_identity_is_tenant_scoped_and_copies_profile_iden
     query = session.queries[-1]
     assert "agent_jobs.tenant_id" in query
     assert "agent_jobs.id" in query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tenant_id", "attempt_count"),
+    [(uuid4(), 1), (None, 2)],
+)
+async def test_terminal_transition_rejects_stale_tenant_or_attempt(
+    tenant_id: object,
+    attempt_count: int,
+) -> None:
+    job = _job(status="running", attempt_count=1)
+    session = _TransitionSession(job)
+    repository = JobRepository(session)
+
+    with pytest.raises(JobLeaseLostError):
+        await repository.mark_succeeded(
+            job.id,
+            {"status": "completed"},
+            now=datetime.now(timezone.utc),
+            tenant_id=tenant_id if tenant_id is not None else job.tenant_id,
+            attempt_count=attempt_count,
+        )
+
+    assert job.status == "running"
+    assert job.result is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_transition_accepts_owned_running_attempt() -> None:
+    job = _job(status="running", attempt_count=2)
+    session = _TransitionSession(job)
+
+    await JobRepository(session).mark_succeeded(
+        job.id,
+        {"status": "completed"},
+        now=datetime.now(timezone.utc),
+        tenant_id=job.tenant_id,
+        attempt_count=job.attempt_count,
+    )
+
+    assert job.status == "succeeded"
+    assert job.result == {"status": "completed"}
+
+
+@pytest.mark.asyncio
+async def test_retry_and_side_effect_reads_require_owned_attempt() -> None:
+    job = _job(status="running", attempt_count=3)
+    session = _TransitionSession(job)
+    repository = JobRepository(session)
+
+    with pytest.raises(JobLeaseLostError):
+        await repository.schedule_retry(
+            job.id,
+            "provider_unavailable",
+            available_at=datetime.now(timezone.utc),
+            tenant_id=job.tenant_id,
+            attempt_count=2,
+        )
+    with pytest.raises(JobLeaseLostError):
+        await repository.get_side_effect_marker(
+            job.id,
+            tenant_id=job.tenant_id,
+            attempt_count=2,
+        )
+
+    assert job.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_renew_lease_only_extends_owned_running_attempt() -> None:
+    now = datetime.now(timezone.utc)
+    job = _job(status="running", attempt_count=4, lease_expires_at=now)
+    session = _TransitionSession(job)
+    repository = JobRepository(session)
+    lease_until = now + timedelta(minutes=1)
+
+    assert (
+        await repository.renew_lease(
+            job.id,
+            tenant_id=job.tenant_id,
+            attempt_count=job.attempt_count,
+            lease_until=lease_until,
+        )
+        is True
+    )
+    assert job.lease_expires_at == lease_until
+
+    assert (
+        await repository.renew_lease(
+            job.id,
+            tenant_id=job.tenant_id,
+            attempt_count=job.attempt_count - 1,
+            lease_until=lease_until + timedelta(minutes=1),
+        )
+        is False
+    )
+    assert job.lease_expires_at == lease_until

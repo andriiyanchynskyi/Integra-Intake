@@ -25,6 +25,12 @@ PHASE_TWO_TABLES = {
 PHASE_SEVEN_TABLES = PHASE_TWO_TABLES | {"agent_jobs"}
 PHASE_EIGHT_TABLES = PHASE_SEVEN_TABLES | {"approval_events"}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+APPROVAL_WORKFLOW_MIGRATION_PATH = (
+    PROJECT_ROOT / "alembic" / "versions" / "004_phase8_approval_workflow.py"
+)
+APPROVAL_STATUS_MIGRATION_PATH = (
+    PROJECT_ROOT / "alembic" / "versions" / "006_phase8_approval_status_check.py"
+)
 TRACE_MIGRATION_PATH = PROJECT_ROOT / "alembic" / "versions" / "007_phase12_job_trace_id.py"
 TENANT_SCOPED_TABLES = PHASE_EIGHT_TABLES - {"tenants"}
 JSONB_COLUMNS = {
@@ -42,6 +48,14 @@ JSONB_COLUMNS = {
     },
 }
 TIMESTAMPED_TABLES = PHASE_EIGHT_TABLES - {"case_events", "approval_events"}
+
+
+def test_approval_status_constraint_has_one_migration_owner() -> None:
+    workflow = APPROVAL_WORKFLOW_MIGRATION_PATH.read_text(encoding="utf-8")
+    status = APPROVAL_STATUS_MIGRATION_PATH.read_text(encoding="utf-8")
+
+    assert "ck_approvals_status" not in workflow
+    assert status.count('"ck_approvals_status"') == 2
 
 
 def test_orm_metadata_declares_tenant_isolation_contract() -> None:

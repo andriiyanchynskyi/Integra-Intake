@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.dialects import postgresql
 
@@ -124,7 +125,11 @@ class SeedSession:
                     for key in self.database.api_keys
                     if key.tenant_id == tenant_id
                     and key.is_active
-                    and (principal_type is None or key.principal_type == principal_type)
+                    and (
+                        principal_type is None
+                        or key.principal_type == principal_type
+                        or (principal_type == "service" and key.principal_type is None)
+                    )
                 ]
             )
 
@@ -204,6 +209,84 @@ async def test_seed_accepts_an_explicit_profile_slug_without_changing_rotation_c
     assert database.api_keys[0].key_hash == hash_api_key(raw_key)
     assert database.api_keys[0].prefix == raw_key[:11]
     assert raw_key not in database.api_keys[0].key_hash
+
+
+def test_seed_resolves_only_trusted_profile_slugs() -> None:
+    from scripts.seed_demo import resolve_profile_slug
+
+    assert resolve_profile_slug("freight-broker") == "freight-broker"
+    assert resolve_profile_slug("repair-service") == "repair-service"
+    assert resolve_profile_slug("language-school") == "language-school"
+    with pytest.raises(ValueError, match="trusted tenant profile"):
+        resolve_profile_slug("../secret")
+
+
+async def test_seed_main_profile_and_operator_path_preserve_service_key(monkeypatch) -> None:
+    database = SeedDatabase()
+    await seed_demo_tenant(database.session(), "repair-service")
+    printed: list[str] = []
+
+    class SessionContext:
+        async def __aenter__(self) -> SeedSession:
+            return database.session()
+
+        async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+            return None
+
+    monkeypatch.setattr(seed_demo, "async_session_factory", lambda: SessionContext())
+
+    await seed_demo.main(
+        printed.append,
+        operator_ref="demo-operator",
+        profile="repair-service",
+    )
+
+    assert len(printed) == 1
+    assert database.tenants[0].slug == "repair-service"
+    service_keys = [
+        key
+        for key in database.api_keys
+        if key.principal_type in {None, "service"}
+    ]
+    operator_keys = [key for key in database.api_keys if key.principal_type == "operator"]
+    assert len(service_keys) == 1
+    assert service_keys[0].is_active is True
+    assert operator_keys[0].is_active is True
+
+
+async def test_seed_service_rotation_does_not_deactivate_operator_key() -> None:
+    database = SeedDatabase()
+
+    await seed_demo_tenant(database.session())
+    await seed_operator_key(database.session(), "demo-operator")
+    await seed_demo_tenant(database.session())
+
+    service_keys = [
+        key for key in database.api_keys if key.principal_type in {None, "service"}
+    ]
+    operator_keys = [key for key in database.api_keys if key.principal_type == "operator"]
+    assert [key.is_active for key in service_keys] == [False, True]
+    assert len(operator_keys) == 1
+    assert operator_keys[0].is_active is True
+
+
+async def test_seed_reactivates_an_existing_demo_tenant_before_service_rotation() -> None:
+    database = SeedDatabase()
+    await seed_demo_tenant(database.session())
+    database.tenants[0].status = "inactive"
+
+    await seed_demo_tenant(database.session())
+
+    assert database.tenants[0].status == "active"
+
+
+async def test_seed_operator_key_rejects_an_inactive_tenant() -> None:
+    database = SeedDatabase()
+    await seed_demo_tenant(database.session())
+    database.tenants[0].status = "inactive"
+
+    with pytest.raises(ValueError, match="tenant must be active"):
+        await seed_operator_key(database.session(), "ops-alice")
 
 
 async def test_seed_operator_key_sets_actor_capability_rotates_only_operator_keys_and_hides_raw_values() -> None:

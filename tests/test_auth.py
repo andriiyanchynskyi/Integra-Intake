@@ -82,10 +82,20 @@ class StatementAwareSession:
         assert "FROM tenants JOIN api_keys ON api_keys.tenant_id = tenants.id" in query
         assert "api_keys.key_hash = %(key_hash_1)s" in query
         assert "api_keys.is_active IS true" in query
+        assert "api_keys.principal_type = %(principal_type_1)s" in query
+        assert "api_keys.capability = %(capability_1)s" in query
+        assert "tenants.status = %(status_1)s" in query
 
         key_hash = compiled.params["key_hash_1"]
         record = self.records.get(key_hash)
-        if record is None or not record.is_active or record.tenant.id != record.tenant_id:
+        if (
+            record is None
+            or not record.is_active
+            or record.tenant.id != record.tenant_id
+            or record.tenant.status != "active"
+            or record.principal_type != "service"
+            or record.capability != "none"
+        ):
             return ScalarResult(None)
         return ScalarResult(record.tenant)
 
@@ -324,6 +334,56 @@ def test_active_api_key_resolves_the_tenant_for_signed_inbound_webhook(
 
     assert response.status_code == 200
     assert response.json() == {"tenant_id": str(tenant.id)}
+
+
+def test_operator_key_cannot_authenticate_as_service(
+    client_factory, seeded_credentials
+) -> None:
+    _, record, raw_key = seeded_credentials
+    record.principal_type = "operator"
+    record.capability = "approval_decider"
+    record.actor_ref = "ops-alice"
+
+    response = client_factory({record.key_hash: record}).get(
+        "/tenant", headers={"X-API-Key": raw_key}
+    )
+
+    assert response.status_code == 401
+
+
+def test_inactive_tenant_service_key_is_rejected(
+    client_factory, seeded_credentials
+) -> None:
+    tenant, record, raw_key = seeded_credentials
+    tenant.status = "inactive"
+
+    response = client_factory({record.key_hash: record}).get(
+        "/tenant", headers={"X-API-Key": raw_key}
+    )
+
+    assert response.status_code == 401
+
+
+def test_operator_key_cannot_authenticate_signed_inbound_webhook(
+    client_factory, seeded_credentials
+) -> None:
+    _, record, raw_key = seeded_credentials
+    record.principal_type = "operator"
+    record.capability = "approval_decider"
+    record.actor_ref = "ops-alice"
+    body = b'{"provider_id":"message-1"}'
+
+    response = client_factory({record.key_hash: record}).post(
+        "/inbound-tenant",
+        content=body,
+        headers={
+            **_signed_webhook_headers(raw_key, body),
+            "content-type": "application/json",
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid inbound webhook"}
 
 
 @pytest.mark.parametrize(

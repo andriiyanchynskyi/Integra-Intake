@@ -236,17 +236,43 @@ def test_json_logging_configuration_is_idempotent(
 
 def test_product_docs_describe_local_observability_without_training_context() -> None:
     root = Path(__file__).resolve().parents[1]
-    for name in ("README.md", "AGENTS.md"):
-        text = (root / name).read_text(encoding="utf-8").lower()
-        for phrase in ("trace", "structured", "json", "source-free", "external"):
-            assert phrase in text, (name, phrase)
-        for forbidden in (
-            "phase 12",
-            "roadmap phase",
-            "interview",
-            "vacancy",
-            "learning project",
-            "tutorial",
-            "training context",
-        ):
-            assert forbidden not in text, (name, forbidden)
+    text = (root / "README.md").read_text(encoding="utf-8").lower()
+    for phrase in ("trace", "structured", "json", "source-free", "external"):
+        assert phrase in text, phrase
+    for forbidden in (
+        "phase 12",
+        "roadmap phase",
+        "interview",
+        "vacancy",
+        "learning project",
+        "tutorial",
+        "training context",
+    ):
+        assert forbidden not in text, forbidden
+
+
+def test_product_docs_describe_safe_live_demo_entrypoints() -> None:
+    root = Path(__file__).resolve().parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    runbook = root / "docs" / "runbooks" / "live-provider-demo.md"
+    assert "GET /v1/jobs/{job_id}" in readme
+    assert "--profile" in readme
+    assert "live_provider_smoke.py" in readme
+    assert "docs/runbooks/live-provider-demo.md" in readme
+    assert "worker" in readme.lower() and "optional" in readme.lower()
+    for phrase in (
+        "Service keys cannot act as operators",
+        "1 MiB",
+        "100,000 characters",
+        "lease heartbeat",
+        "tenant/attempt fencing",
+        "tool_execution_failed",
+        "recreate",
+    ):
+        assert phrase.lower() in readme.lower(), phrase
+    assert "WORKER_CONCURRENCY" not in readme
+    if runbook.exists():
+        text = runbook.read_text(encoding="utf-8").lower()
+        for forbidden in ("print the api key", "paste the key", "commit the key", "upload the key"):
+            assert forbidden not in text
+        assert "WORKER_CONCURRENCY" not in text

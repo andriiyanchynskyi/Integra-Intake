@@ -87,6 +87,7 @@ class OutcomeCode(str, Enum):
     CLAIMED = "claimed"
     STARTED = "started"
     RETRY_SCHEDULED = "retry_scheduled"
+    LEASE_LOST = "lease_lost"
     RECOVERED = "recovered"
     SUCCEEDED = "succeeded"
     FAILED_UNCERTAIN = "failed_uncertain"
@@ -113,6 +114,7 @@ class RouteName(str, Enum):
     HEALTH = "/health"
     CASES = "/v1/cases"
     CASE = "/v1/cases/{case_id}"
+    JOB = "/v1/jobs/{job_id}"
     INTAKE = "/v1/intake"
     INBOUND_EMAIL = "/v1/inbound/email/webhook"
     APPROVAL_DECIDE = "/v1/approvals/{approval_id}/decide"
@@ -150,6 +152,7 @@ class PersistenceOperation(str, Enum):
     ENQUEUE_JOB = "enqueue_job"
     CLAIM_JOB = "claim_job"
     RECOVER_LEASE = "recover_lease"
+    RENEW_LEASE = "renew_lease"
     SCHEDULE_RETRY = "schedule_retry"
     MARK_SUCCEEDED = "mark_succeeded"
     MARK_FAILED = "mark_failed"
@@ -160,6 +163,7 @@ class PersistenceOperation(str, Enum):
 
 class WorkerErrorCode(str, Enum):
     PROVIDER_UNAVAILABLE = "provider_unavailable"
+    TOOL_EXECUTION_FAILED = "tool_execution_failed"
     RETRY_EXHAUSTED = "retry_exhausted"
     SIDE_EFFECT_COMMITTED = "side_effect_committed"
     UNEXPECTED_AFTER_SIDE_EFFECT = "unexpected_after_side_effect"
@@ -169,6 +173,7 @@ class WorkerErrorCode(str, Enum):
     LEASE_EXPIRED = "lease_expired"
     LEASE_EXPIRED_AFTER_SIDE_EFFECT = "lease_expired_after_side_effect"
     PERSISTENCE_ERROR = "persistence_error"
+    LEASE_LOST = "lease_lost"
     CAPABILITY_UNAVAILABLE = "capability_unavailable"
     SNAPSHOT_INCOMPATIBLE = "snapshot_incompatible"
 

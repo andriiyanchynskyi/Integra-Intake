@@ -23,6 +23,7 @@ from app.core.config import Settings, settings
 from app.domain.approval_repository import ApprovalRepository, ExpiredApprovalObservation
 from app.domain.job_repository import (
     ClaimedJob,
+    JobLeaseLostError,
     JobRepository,
     LeaseRecoveryObservation,
 )
@@ -85,6 +86,7 @@ class AgentWorker:
         clock: Callable[[], datetime] | None = None,
         to_thread: Callable[..., Awaitable[Any]] | None = None,
         sleep: Callable[[float], Awaitable[Any]] | None = None,
+        heartbeat_wait: Callable[[float, asyncio.Event], Awaitable[bool]] | None = None,
         random_uniform: Callable[[float, float], float] | None = None,
         observer: Observer = NULL_OBSERVER,
         monotonic_clock: Callable[[], int] = time.perf_counter_ns,
@@ -101,6 +103,7 @@ class AgentWorker:
         self._monotonic_clock = monotonic_clock
         self._to_thread = to_thread or asyncio.to_thread
         self._sleep = sleep or asyncio.sleep
+        self._heartbeat_wait = heartbeat_wait or self._default_heartbeat_wait
         self._random_uniform = random_uniform or random.uniform
 
     @classmethod
@@ -186,11 +189,7 @@ class AgentWorker:
         finished = False
         try:
             try:
-                result = await self._to_thread(
-                    self._run_claimed_job,
-                    claimed,
-                    gateway,
-                )
+                result = await self._run_claimed_with_lease(claimed, gateway)
             except RetryableJobError as exc:
                 run_duration_ms = self._elapsed_ms(run_started_ns)
                 has_side_effect = exc.side_effect_committed or await self._has_side_effect(
@@ -227,6 +226,15 @@ class AgentWorker:
                         worker_error_code=self._worker_error_code(exc.error_code),
                     )
                 finished = True
+            except JobLeaseLostError:
+                self._emit_job_finished(
+                    claimed,
+                    outcome=OutcomeCode.LEASE_LOST,
+                    duration_ms=self._elapsed_ms(run_started_ns),
+                    worker_error_code=WorkerErrorCode.LEASE_LOST,
+                )
+                finished = True
+                return True
             except Exception:
                 run_duration_ms = self._elapsed_ms(run_started_ns)
                 has_side_effect = await self._has_side_effect(claimed)
@@ -284,6 +292,15 @@ class AgentWorker:
                     is OutcomeCode.FAILED_UNCERTAIN,
                 )
                 finished = True
+        except JobLeaseLostError:
+            self._emit_job_finished(
+                claimed,
+                outcome=OutcomeCode.LEASE_LOST,
+                duration_ms=self._elapsed_ms(run_started_ns),
+                worker_error_code=WorkerErrorCode.LEASE_LOST,
+            )
+            finished = True
+            return True
         except Exception:
             if not finished:
                 self._emit_job_finished(
@@ -302,6 +319,77 @@ class AgentWorker:
             claimed = await self.serve_once()
             if not claimed:
                 await self._sleep(self._poll_interval_seconds)
+
+    async def _run_claimed_with_lease(
+        self,
+        claimed: ClaimedJob,
+        gateway: WorkerAsyncGateway,
+    ) -> AgentRunResult | TerminalPreflightResult:
+        stopped = asyncio.Event()
+        heartbeat = asyncio.create_task(self._maintain_lease(claimed, stopped))
+        result: AgentRunResult | TerminalPreflightResult | None = None
+        run_error: BaseException | None = None
+        try:
+            result = await self._to_thread(
+                self._run_claimed_job,
+                claimed,
+                gateway,
+            )
+        except BaseException as error:
+            run_error = error
+        finally:
+            stopped.set()
+
+        lease_owned = await heartbeat
+        if not lease_owned:
+            raise JobLeaseLostError("job lease was lost during execution")
+        if run_error is not None:
+            raise run_error
+        if result is None:
+            raise RuntimeError("worker execution returned no result")
+        return result
+
+    async def _maintain_lease(
+        self,
+        claimed: ClaimedJob,
+        stopped: asyncio.Event,
+    ) -> bool:
+        interval = max(0.1, self._lease_seconds / 3)
+        while True:
+            if await self._heartbeat_wait(interval, stopped):
+                return True
+            try:
+                async with self._session_factory() as session:
+                    renewed = await JobRepository(session).renew_lease(
+                        claimed.id,
+                        tenant_id=claimed.tenant_id,
+                        attempt_count=claimed.attempt_count,
+                        lease_until=self._now()
+                        + timedelta(seconds=self._lease_seconds),
+                    )
+            except Exception:
+                self._emit_persistence_failure(
+                    trace_id=claimed.trace_id,
+                    tenant_id=claimed.tenant_id,
+                    job_id=claimed.id,
+                    operation=PersistenceOperation.RENEW_LEASE,
+                    tenant_config_snapshot=claimed.tenant_config_snapshot,
+                    tenant_config_sha256=claimed.tenant_config_sha256,
+                )
+                return False
+            if not renewed:
+                return False
+
+    @staticmethod
+    async def _default_heartbeat_wait(
+        interval: float,
+        stopped: asyncio.Event,
+    ) -> bool:
+        try:
+            await asyncio.wait_for(stopped.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     def _run_claimed_job(
         self,
@@ -341,7 +429,6 @@ class AgentWorker:
                             "status": "completed",
                             "reason": "executor_stopped",
                             "steps": 0,
-                            "final_response": "document_unreadable",
                             "routing_status": result.routing_status.value,
                             "routing_reason": result.reason,
                             "missing_required_fields": list(
@@ -361,6 +448,8 @@ class AgentWorker:
                     attempt_count=claimed.attempt_count,
                 )
                 return OutcomeCode.FAILED
+            except JobLeaseLostError:
+                raise
             except Exception:
                 self._emit_persistence_failure(
                     trace_id=claimed.trace_id,
@@ -395,6 +484,8 @@ class AgentWorker:
                             tenant_id=claimed.tenant_id,
                             attempt_count=claimed.attempt_count,
                         )
+                    except JobLeaseLostError:
+                        raise
                     except Exception:
                         self._emit_persistence_failure(
                             trace_id=claimed.trace_id,
@@ -410,11 +501,6 @@ class AgentWorker:
             repository = JobRepository(session)
             if result.status == RunStatus.COMPLETED:
                 summary = self._result_summary(result)
-                if "document" in claimed.source_snapshot:
-                    # Provider rationale can repeat source text. Keep the
-                    # durable document outcome to the server-owned routing
-                    # summary and retain the legacy key with a null value.
-                    summary["final_response"] = None
                 try:
                     await repository.mark_succeeded(
                         claimed.id,
@@ -423,6 +509,8 @@ class AgentWorker:
                         tenant_id=claimed.tenant_id,
                         attempt_count=claimed.attempt_count,
                     )
+                except JobLeaseLostError:
+                    raise
                 except Exception:
                     self._emit_persistence_failure(
                         trace_id=claimed.trace_id,
@@ -436,13 +524,20 @@ class AgentWorker:
                 return OutcomeCode.SUCCEEDED
             else:
                 try:
+                    error_code = (
+                        WorkerErrorCode.TOOL_EXECUTION_FAILED.value
+                        if result.reason is StopReason.TOOL_EXECUTION_FAILED
+                        else WorkerErrorCode.AGENT_FAILED.value
+                    )
                     await repository.mark_failed(
                         claimed.id,
-                        "agent_failed",
+                        error_code,
                         now=now,
                         tenant_id=claimed.tenant_id,
                         attempt_count=claimed.attempt_count,
                     )
+                except JobLeaseLostError:
+                    raise
                 except Exception:
                     self._emit_persistence_failure(
                         trace_id=claimed.trace_id,
@@ -472,6 +567,8 @@ class AgentWorker:
                     tenant_id=claimed.tenant_id,
                     attempt_count=claimed.attempt_count,
                 )
+            except JobLeaseLostError:
+                raise
             except Exception:
                 self._emit_persistence_failure(
                     trace_id=claimed.trace_id,
@@ -499,6 +596,8 @@ class AgentWorker:
                     tenant_id=claimed.tenant_id,
                     attempt_count=claimed.attempt_count,
                 )
+            except JobLeaseLostError:
+                raise
             except Exception:
                 self._emit_persistence_failure(
                     trace_id=claimed.trace_id,
@@ -525,6 +624,8 @@ class AgentWorker:
                     tenant_id=claimed.tenant_id,
                     attempt_count=claimed.attempt_count,
                 )
+            except JobLeaseLostError:
+                raise
             except Exception:
                 self._emit_persistence_failure(
                     trace_id=claimed.trace_id,
@@ -547,6 +648,7 @@ class AgentWorker:
             marker = await marker_reader(
                 claimed.id,
                 tenant_id=claimed.tenant_id,
+                attempt_count=claimed.attempt_count,
             )
             return marker is not None
 
@@ -827,7 +929,6 @@ class AgentWorker:
             "status": result.status.value,
             "reason": result.reason.value,
             "steps": result.steps,
-            "final_response": result.final_response,
         }
         for message in reversed(result.messages):
             if message.role.value != "tool":

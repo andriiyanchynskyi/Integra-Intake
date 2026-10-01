@@ -19,10 +19,11 @@ def test_health_returns_ok() -> None:
 
 def test_app_assembly_keeps_api_routes_separate_from_worker_and_provider_startup() -> None:
     """Importing FastAPI must not claim jobs or construct an LLM runtime."""
-    route_paths = {route.path for route in app.routes}
+    route_paths = set(app.openapi()["paths"])
     assert "/v1/cases" in route_paths
     assert "/v1/cases/{case_id}" in route_paths
     assert "/v1/intake" in route_paths
+    assert "/v1/jobs/{job_id}" in route_paths
 
     source = inspect.getsource(main_module)
     assert "app.workers" not in source

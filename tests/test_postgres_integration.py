@@ -261,7 +261,6 @@ async def test_postgres_phase7_intake_worker_is_idempotent_and_tenant_scoped(
         settings=Settings(
             worker_poll_interval_seconds=0.001,
             worker_lease_seconds=60,
-            worker_concurrency=1,
             worker_max_retries=4,
         ),
     )

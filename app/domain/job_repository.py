@@ -11,7 +11,8 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import AgentJob, IdempotencyRecord
+from app.db.models import AgentJob, Approval, IdempotencyRecord
+from app.domain.jobs import PersistedJobRead
 from app.policy.models import TrustedSource
 from app.runtime.profiles import ResolvedTenantProfile
 
@@ -59,6 +60,10 @@ class LeaseRecoveryObservation:
     tenant_config_sha256: str | None = None
 
 
+class JobLeaseLostError(RuntimeError):
+    """The worker no longer owns the running job attempt."""
+
+
 class JobRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
@@ -104,6 +109,50 @@ class JobRepository:
             AgentJob.tenant_id == tenant_id,
         )
         return (await self.session.execute(statement)).scalar_one_or_none()
+
+    async def get_read_for_tenant(
+        self,
+        job_id: UUID,
+        tenant_id: UUID,
+    ) -> PersistedJobRead | None:
+        """Read one job and its approval identity under the tenant predicate."""
+
+        statement = (
+            select(AgentJob, Approval.id, Approval.status)
+            .outerjoin(
+                Approval,
+                (Approval.job_id == AgentJob.id)
+                & (Approval.tenant_id == AgentJob.tenant_id),
+            )
+            .where(AgentJob.id == job_id, AgentJob.tenant_id == tenant_id)
+        )
+        row = (await self.session.execute(statement)).one_or_none()
+        if row is None:
+            return None
+        job, approval_id, approval_status = row
+        if (
+            not isinstance(job, AgentJob)
+            or not isinstance(job.source_snapshot, dict)
+            or not isinstance(job.tenant_config_snapshot, dict)
+            or not isinstance(job.tenant_config_sha256, str)
+            or not isinstance(job.created_at, datetime)
+        ):
+            return None
+        return PersistedJobRead(
+            job_id=job.id,
+            trace_id=job.trace_id,
+            status=job.status,
+            attempt_count=job.attempt_count,
+            result=deepcopy(job.result) if isinstance(job.result, dict) else None,
+            error_code=job.error_code,
+            tenant_config_snapshot=deepcopy(job.tenant_config_snapshot),
+            tenant_config_sha256=job.tenant_config_sha256,
+            approval_id=approval_id if isinstance(approval_id, UUID) else None,
+            approval_status=approval_status if isinstance(approval_status, str) else None,
+            created_at=job.created_at,
+            started_at=job.started_at,
+            finished_at=job.finished_at,
+        )
 
     async def get_observation_identity(
         self, job_id: UUID, *, tenant_id: UUID
@@ -247,14 +296,36 @@ class JobRepository:
                 started_at=job.started_at,
             )
 
+    async def renew_lease(
+        self,
+        job_id: UUID,
+        *,
+        tenant_id: UUID,
+        attempt_count: int,
+        lease_until: datetime,
+    ) -> bool:
+        """Extend a lease only when this worker still owns its attempt."""
+
+        async with self.session.begin():
+            job = await self._get_job(
+                job_id,
+                tenant_id,
+                for_update=True,
+                attempt_count=attempt_count,
+            )
+            if job is None or job.status != "running":
+                return False
+            job.lease_expires_at = lease_until
+            return True
+
     async def mark_succeeded(
         self,
         job_id: UUID,
         result: dict[str, object],
         *,
         now: datetime,
-        tenant_id: UUID | None = None,
-        attempt_count: int | None = None,
+        tenant_id: UUID,
+        attempt_count: int,
     ) -> None:
         await self._mark_terminal(
             job_id,
@@ -272,8 +343,8 @@ class JobRepository:
         error_code: str,
         *,
         now: datetime,
-        tenant_id: UUID | None = None,
-        attempt_count: int | None = None,
+        tenant_id: UUID,
+        attempt_count: int,
     ) -> None:
         await self._mark_terminal(
             job_id,
@@ -291,8 +362,8 @@ class JobRepository:
         error_code: str,
         *,
         now: datetime,
-        tenant_id: UUID | None = None,
-        attempt_count: int | None = None,
+        tenant_id: UUID,
+        attempt_count: int,
     ) -> None:
         await self._mark_terminal(
             job_id,
@@ -310,8 +381,8 @@ class JobRepository:
         error_code: str,
         *,
         available_at: datetime,
-        tenant_id: UUID | None = None,
-        attempt_count: int | None = None,
+        tenant_id: UUID,
+        attempt_count: int,
     ) -> None:
         async with self.session.begin():
             job = await self._get_job(
@@ -321,7 +392,9 @@ class JobRepository:
                 attempt_count=attempt_count,
             )
             if job is None or job.status != "running":
-                return
+                raise JobLeaseLostError(
+                    "job lease ownership changed before retry scheduling"
+                )
             job.status = "queued"
             job.error_code = error_code
             job.available_at = available_at
@@ -331,7 +404,8 @@ class JobRepository:
         self,
         job_id: UUID,
         *,
-        tenant_id: UUID | None = None,
+        tenant_id: UUID,
+        attempt_count: int,
     ) -> datetime | None:
         """Return the durable mutation marker for a tenant-owned job.
 
@@ -341,11 +415,17 @@ class JobRepository:
         provider output is reconstructed here.
         """
 
-        conditions = [AgentJob.id == job_id]
-        if tenant_id is not None:
-            conditions.append(AgentJob.tenant_id == tenant_id)
-        statement = select(AgentJob.side_effect_committed_at).where(*conditions)
-        return (await self.session.execute(statement)).scalar_one_or_none()
+        job = await self._get_job(
+            job_id,
+            tenant_id,
+            for_update=False,
+            attempt_count=attempt_count,
+        )
+        if job is None or job.status != "running":
+            raise JobLeaseLostError(
+                "job lease ownership changed before side-effect inspection"
+            )
+        return job.side_effect_committed_at
 
     async def _mark_terminal(
         self,
@@ -353,8 +433,8 @@ class JobRepository:
         *,
         status: str,
         now: datetime,
-        tenant_id: UUID | None,
-        attempt_count: int | None,
+        tenant_id: UUID,
+        attempt_count: int,
         result: dict[str, object] | None,
         error_code: str | None,
     ) -> None:
@@ -366,7 +446,9 @@ class JobRepository:
                 attempt_count=attempt_count,
             )
             if job is None or job.status != "running":
-                return
+                raise JobLeaseLostError(
+                    "job lease ownership changed before terminal transition"
+                )
             job.status = status
             job.finished_at = now
             job.lease_expires_at = None
@@ -376,17 +458,16 @@ class JobRepository:
     async def _get_job(
         self,
         job_id: UUID,
-        tenant_id: UUID | None,
+        tenant_id: UUID,
         *,
         for_update: bool,
-        attempt_count: int | None = None,
+        attempt_count: int,
     ) -> AgentJob | None:
-        conditions = [AgentJob.id == job_id]
-        if tenant_id is not None:
-            conditions.append(AgentJob.tenant_id == tenant_id)
-        if attempt_count is not None:
-            conditions.append(AgentJob.attempt_count == attempt_count)
-        statement = select(AgentJob).where(*conditions)
+        statement = select(AgentJob).where(
+            AgentJob.id == job_id,
+            AgentJob.tenant_id == tenant_id,
+            AgentJob.attempt_count == attempt_count,
+        )
         if for_update:
             statement = statement.with_for_update()
         return (await self.session.execute(statement)).scalar_one_or_none()

@@ -94,11 +94,6 @@ def upgrade() -> None:
         "job_id IS NULL OR (pending_action IS NOT NULL "
         "AND tenant_config_sha256 IS NOT NULL AND expires_at IS NOT NULL)",
     )
-    op.create_check_constraint(
-        "ck_approvals_status",
-        "approvals",
-        "status IN ('pending', 'approved', 'rejected', 'expired')",
-    )
     op.create_index(
         "ix_approvals_pending_expires_at",
         "approvals",
@@ -153,7 +148,6 @@ def downgrade() -> None:
     op.drop_constraint(
         "ck_approvals_phase8_payload_complete", "approvals", type_="check"
     )
-    op.drop_constraint("ck_approvals_status", "approvals", type_="check")
     op.drop_constraint(
         "fk_approvals_tenant_job", "approvals", type_="foreignkey"
     )

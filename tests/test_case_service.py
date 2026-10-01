@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from uuid import UUID, uuid4
@@ -10,7 +11,13 @@ from sqlalchemy.dialects import postgresql
 
 from app.db.models import CaseEvent, IntakeCase
 from app.domain.repositories import CaseRepository
-from app.domain.schemas import CreateCaseRequest
+from app.domain.schemas import (
+    MAX_BODY_CHARS,
+    MAX_CHANNEL_CHARS,
+    MAX_EXTRACTED_FIELDS_BYTES,
+    MAX_SUBJECT_CHARS,
+    CreateCaseRequest,
+)
 from app.domain.service import CaseService
 
 
@@ -138,6 +145,73 @@ def test_create_case_request_rejects_unrecognized_fields() -> None:
             customer_id=None,
             extracted_fields={},
             tenant_id=str(uuid4()),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "limit"),
+    [
+        ("channel", MAX_CHANNEL_CHARS),
+        ("subject", MAX_SUBJECT_CHARS),
+        ("body", MAX_BODY_CHARS),
+    ],
+)
+def test_create_case_request_accepts_exact_field_limits_and_rejects_overflow(
+    field: str,
+    limit: int,
+) -> None:
+    payload = {"channel": "email", "subject": "Load", "body": "Need a truck"}
+    payload[field] = "x" * limit
+    CreateCaseRequest(**payload)
+
+    payload[field] = "x" * (limit + 1)
+    with pytest.raises(ValidationError):
+        CreateCaseRequest(**payload)
+
+
+def _extracted_fields_with_json_bytes(size: int) -> dict[str, str]:
+    prefix = len(
+        json.dumps(
+            {"value": ""},
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    return {"value": "x" * (size - prefix)}
+
+
+def test_create_case_request_bounds_extracted_fields_by_deterministic_utf8_json() -> None:
+    exact = _extracted_fields_with_json_bytes(MAX_EXTRACTED_FIELDS_BYTES)
+    assert len(
+        json.dumps(
+            exact,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ) == MAX_EXTRACTED_FIELDS_BYTES
+    CreateCaseRequest(channel="email", subject="Load", body="Body", extracted_fields=exact)
+
+    oversized = _extracted_fields_with_json_bytes(MAX_EXTRACTED_FIELDS_BYTES + 1)
+    with pytest.raises(ValidationError):
+        CreateCaseRequest(
+            channel="email",
+            subject="Load",
+            body="Body",
+            extracted_fields=oversized,
+        )
+
+
+def test_create_case_request_rejects_non_finite_extracted_json() -> None:
+    with pytest.raises(ValidationError):
+        CreateCaseRequest(
+            channel="email",
+            subject="Load",
+            body="Body",
+            extracted_fields={"score": float("nan")},
         )
 
 

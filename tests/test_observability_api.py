@@ -65,6 +65,10 @@ def _build_observed_app(observer: RecordingObserver) -> FastAPI:
     async def case(case_id: UUID) -> dict[str, str]:
         return {"case_id": str(case_id)}
 
+    @observed.get("/v1/jobs/{job_id}")
+    async def job(job_id: UUID) -> dict[str, str]:
+        return {"job_id": str(job_id)}
+
     @observed.get("/boom")
     async def boom() -> None:
         raise RuntimeError("SOURCE_BODY_SECRET")
@@ -108,6 +112,24 @@ def test_valid_client_correlation_is_request_only_and_client_trace_is_ignored() 
     serialized = event.model_dump_json()
     assert "SOURCE_BODY_SECRET" not in serialized
     assert "?secret" not in serialized
+
+
+def test_job_polling_uses_closed_job_route_without_source_or_credentials() -> None:
+    observer = RecordingObserver()
+    client = TestClient(_build_observed_app(observer))
+
+    response = client.get(
+        "/v1/jobs/00000000-0000-0000-0000-000000000001",
+        headers={"Authorization": "Bearer SOURCE_CREDENTIAL"},
+    )
+
+    event = observer.events[-1]
+    assert response.status_code == 200
+    assert event.route is RouteName.JOB
+    assert event.method == "GET"
+    serialized = event.model_dump_json()
+    assert "SOURCE_CREDENTIAL" not in serialized
+    assert "source" not in serialized.lower()
 
 
 def test_invalid_or_oversized_client_correlation_is_not_echoed_or_logged() -> None:
