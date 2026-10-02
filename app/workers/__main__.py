@@ -1,4 +1,4 @@
-"""Process entry point for the Phase-7 worker."""
+"""Process entry point for the asynchronous agent worker."""
 
 from __future__ import annotations
 

@@ -207,7 +207,7 @@ class Approval(TimestampedModel, Base):
         CheckConstraint(
             "job_id IS NULL OR (pending_action IS NOT NULL "
             "AND tenant_config_sha256 IS NOT NULL AND expires_at IS NOT NULL)",
-            name="ck_approvals_phase8_payload_complete",
+            name="ck_approvals_payload_complete",
         ),
         CheckConstraint(
             "status IN ('pending', 'approved', 'rejected', 'expired')",

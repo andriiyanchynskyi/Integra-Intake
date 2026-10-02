@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -23,6 +24,7 @@ from app.db.models import (
 )
 from app.domain.approval_repository import ApprovalCreationConflict, ApprovalRepository
 from app.domain.approvals import ApprovalDecisionRequest, ApprovalDecisionService
+from app.runtime.profiles import TenantProfileResolver
 from app.tools.models import PendingAction
 from app.tools.postgres import PostgresApprovalActionExecutor
 
@@ -30,6 +32,9 @@ from app.tools.postgres import PostgresApprovalActionExecutor
 TENANT_A = UUID("00000000-0000-0000-0000-000000000001")
 TENANT_B = UUID("00000000-0000-0000-0000-000000000002")
 DECISION_TIME = datetime(2026, 9, 23, 13, tzinfo=timezone.utc)
+APPROVAL_PROFILE = TenantProfileResolver(
+    Path(__file__).resolve().parents[1] / "examples"
+).resolve("freight-broker")
 
 
 class _ScalarResult:
@@ -462,8 +467,8 @@ async def test_postgres_approval_approve_create_case_is_atomic_and_idempotent(
             "subject": "Approved load",
             "body": "Create this case",
         },
-        tenant_config_snapshot={"slug": "approval"},
-        tenant_config_sha256="b" * 64,
+        tenant_config_snapshot=APPROVAL_PROFILE.snapshot,
+        tenant_config_sha256=APPROVAL_PROFILE.sha256,
         risk_signals={},
         attempt_count=1,
         available_at=DECISION_TIME,

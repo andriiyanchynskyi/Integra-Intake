@@ -21,7 +21,12 @@ from app.db.session import async_session_factory
 from app.runtime.profiles import TenantProfileResolver, TenantProfileUnavailableError
 
 
-DEMO_TENANT_SLUG = "freight-broker"
+DEMO_PROFILE_SLUGS = (
+    "freight-broker",
+    "repair-service",
+    "language-school",
+)
+DEMO_TENANT_SLUG = DEMO_PROFILE_SLUGS[0]
 
 
 def resolve_profile_slug(profile: str) -> str:
@@ -132,7 +137,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--profile",
         default=DEMO_TENANT_SLUG,
-        choices=("freight-broker", "repair-service", "language-school"),
+        choices=DEMO_PROFILE_SLUGS,
         help="trusted tenant profile slug",
     )
     arguments = parser.parse_args()

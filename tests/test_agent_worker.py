@@ -1,4 +1,4 @@
-"""Offline orchestration tests for the isolated Phase-7 agent worker."""
+"""Offline orchestration tests for the isolated agent worker."""
 
 from __future__ import annotations
 

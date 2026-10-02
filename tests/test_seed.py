@@ -4,6 +4,7 @@ from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -14,8 +15,27 @@ from app.auth import hash_api_key
 from app.db.models import ApiKey, CaseEvent, IntakeCase, Tenant
 from app.db.session import get_db_session
 from app.main import app
+from scripts.live_provider_smoke import PROFILE_SCENARIOS
 import scripts.seed_demo as seed_demo
-from scripts.seed_demo import DEMO_TENANT_SLUG, seed_demo_tenant, seed_operator_key
+from scripts.seed_demo import (
+    DEMO_PROFILE_SLUGS,
+    DEMO_TENANT_SLUG,
+    resolve_profile_slug,
+    seed_demo_tenant,
+    seed_operator_key,
+)
+
+
+def test_demo_profile_choices_match_checked_in_yaml_and_smoke_scenarios() -> None:
+    root = Path(__file__).resolve().parents[1]
+    yaml_slugs = {
+        path.stem
+        for path in (root / "examples").glob("*.yaml")
+    }
+
+    assert set(DEMO_PROFILE_SLUGS) == yaml_slugs == set(PROFILE_SCENARIOS)
+    for slug in DEMO_PROFILE_SLUGS:
+        assert resolve_profile_slug(slug) == slug
 
 
 @dataclass
@@ -212,8 +232,6 @@ async def test_seed_accepts_an_explicit_profile_slug_without_changing_rotation_c
 
 
 def test_seed_resolves_only_trusted_profile_slugs() -> None:
-    from scripts.seed_demo import resolve_profile_slug
-
     assert resolve_profile_slug("freight-broker") == "freight-broker"
     assert resolve_profile_slug("repair-service") == "repair-service"
     assert resolve_profile_slug("language-school") == "language-school"

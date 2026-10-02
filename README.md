@@ -209,12 +209,18 @@ python -m venv .venv
 pip install -e ".[dev]"
 ~~~
 
-### 2. Start PostgreSQL and migrate
+### 2. Start PostgreSQL and apply the release schema
 
 ~~~bash
 docker compose up -d db
-alembic upgrade head
+docker compose run --rm api alembic upgrade head
+docker compose run --rm api alembic current
 ~~~
+
+The first release uses the `001_initial_schema` baseline. Start new databases
+from scratch; the baseline does not upgrade the old development revision
+chain. Keep `001_initial_schema` immutable. Future schema changes use new
+append-only revisions.
 
 ### 3. Provision the local demo tenant
 
@@ -276,7 +282,10 @@ curl -X POST http://localhost:8000/v1/cases \
 ### Full local stack
 
 ~~~bash
-docker compose up --build
+docker compose build api worker
+docker compose up -d db
+docker compose run --rm api alembic upgrade head
+docker compose up -d api worker
 ~~~
 
 ## Configuration
@@ -342,9 +351,9 @@ Before handoff, also run:
 git diff --check
 ~~~
 
-The approval-status migration has one owner in the append-only chain. Recreate
-the disposable local PostgreSQL volume before validating a clean migration
-upgrade after schema-chain changes.
+Release databases start from scratch with `001_initial_schema`. API and worker
+startup do not apply migrations. Recreate the disposable local PostgreSQL
+volume before validating a clean baseline upgrade after schema-chain changes.
 
 ## Current boundaries
 

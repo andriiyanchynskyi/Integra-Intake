@@ -13,26 +13,21 @@ from app.db.base import Base
 import app.db.models  # noqa: F401
 
 
-PHASE_TWO_TABLES = {
+FINAL_SCHEMA_TABLES = {
     "tenants",
     "api_keys",
     "customers",
     "intake_cases",
     "case_events",
+    "agent_jobs",
     "idempotency_records",
     "approvals",
+    "approval_events",
 }
-PHASE_SEVEN_TABLES = PHASE_TWO_TABLES | {"agent_jobs"}
-PHASE_EIGHT_TABLES = PHASE_SEVEN_TABLES | {"approval_events"}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APPROVAL_WORKFLOW_MIGRATION_PATH = (
-    PROJECT_ROOT / "alembic" / "versions" / "004_phase8_approval_workflow.py"
-)
-APPROVAL_STATUS_MIGRATION_PATH = (
-    PROJECT_ROOT / "alembic" / "versions" / "006_phase8_approval_status_check.py"
-)
-TRACE_MIGRATION_PATH = PROJECT_ROOT / "alembic" / "versions" / "007_phase12_job_trace_id.py"
-TENANT_SCOPED_TABLES = PHASE_EIGHT_TABLES - {"tenants"}
+VERSIONS_DIRECTORY = PROJECT_ROOT / "alembic" / "versions"
+INITIAL_SCHEMA_MIGRATION_PATH = VERSIONS_DIRECTORY / "001_initial_schema.py"
+TENANT_SCOPED_TABLES = FINAL_SCHEMA_TABLES - {"tenants"}
 JSONB_COLUMNS = {
     "customers": {"attributes"},
     "intake_cases": {"raw_payload", "extracted_fields"},
@@ -47,15 +42,24 @@ JSONB_COLUMNS = {
         "result",
     },
 }
-TIMESTAMPED_TABLES = PHASE_EIGHT_TABLES - {"case_events", "approval_events"}
+TIMESTAMPED_TABLES = FINAL_SCHEMA_TABLES - {"case_events", "approval_events"}
 
 
-def test_approval_status_constraint_has_one_migration_owner() -> None:
-    workflow = APPROVAL_WORKFLOW_MIGRATION_PATH.read_text(encoding="utf-8")
-    status = APPROVAL_STATUS_MIGRATION_PATH.read_text(encoding="utf-8")
+def test_release_uses_single_initial_schema_revision() -> None:
+    revision_files = sorted(
+        path.name
+        for path in VERSIONS_DIRECTORY.glob("*.py")
+        if path.name != "__init__.py"
+    )
 
-    assert "ck_approvals_status" not in workflow
-    assert status.count('"ck_approvals_status"') == 2
+    assert revision_files == ["001_initial_schema.py"]
+    source = INITIAL_SCHEMA_MIGRATION_PATH.read_text(encoding="utf-8")
+    assert 'revision: str = "001_initial_schema"' in source
+    assert "down_revision: Union[str, None] = None" in source
+    assert "phase" not in source.lower()
+    assert source.count('"ck_approvals_status"') == 1
+    assert source.count('"ck_approvals_payload_complete"') == 1
+    assert "ck_approvals_phase8_payload_complete" not in source
 
 
 def test_orm_metadata_declares_tenant_isolation_contract() -> None:
@@ -183,7 +187,7 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
     )
     assert any(
         isinstance(constraint, CheckConstraint)
-        and constraint.name == "ck_approvals_phase8_payload_complete"
+        and constraint.name == "ck_approvals_payload_complete"
         for constraint in approvals.constraints
     )
     assert {
@@ -229,18 +233,6 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
         )
 
 
-def test_phase12_trace_migration_is_append_only_and_backfills_before_not_null() -> None:
-    assert TRACE_MIGRATION_PATH.is_file()
-    source = TRACE_MIGRATION_PATH.read_text(encoding="utf-8")
-    assert 'revision: str = "007_phase12_job_trace_id"' in source
-    assert 'down_revision: Union[str, None] = "006_phase8_approval_status_check"' in source
-    assert 'sa.Column("trace_id", postgresql.UUID(as_uuid=True), nullable=True)' in source
-    assert "UPDATE agent_jobs SET trace_id = gen_random_uuid()" in source
-    assert '"trace_id",' in source and "nullable=False" in source
-    assert '"uq_agent_jobs_trace_id"' in source
-    assert 'op.drop_constraint("uq_agent_jobs_trace_id"' in source
-
-
 async def query_schema_contract(connection: AsyncConnection) -> None:
     tables = await connection.execute(
         text(
@@ -251,7 +243,7 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
             "'idempotency_records', 'approvals', 'agent_jobs', 'approval_events')"
         )
     )
-    assert set(tables.scalars()) == PHASE_EIGHT_TABLES
+    assert set(tables.scalars()) == FINAL_SCHEMA_TABLES
 
     columns = await connection.execute(
         text(
@@ -265,7 +257,7 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
         (row.table_name, row.column_name): row
         for row in columns
     }
-    for table_name in PHASE_EIGHT_TABLES:
+    for table_name in FINAL_SCHEMA_TABLES:
         assert column_map[(table_name, "id")].udt_name == "uuid"
     for table_name in TENANT_SCOPED_TABLES:
         assert column_map[(table_name, "tenant_id")].udt_name == "uuid"
@@ -352,7 +344,7 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
         )
     )
     primary_key_columns = {(row.table_name, row.column_name) for row in primary_keys}
-    assert {(table_name, "id") for table_name in PHASE_EIGHT_TABLES}.issubset(
+    assert {(table_name, "id") for table_name in FINAL_SCHEMA_TABLES}.issubset(
         primary_key_columns
     )
 
@@ -380,6 +372,9 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
     assert "UNIQUE (tenant_id, id)" in constraint_map["uq_approvals_tenant_id_id"]
     assert "UNIQUE (job_id)" in constraint_map["uq_approvals_job_id"]
     assert "UNIQUE (trace_id)" in constraint_map["uq_agent_jobs_trace_id"]
+    assert "ck_approvals_payload_complete" in constraint_map
+    assert "ck_approvals_status" in constraint_map
+    assert "ck_approvals_phase8_payload_complete" not in constraint_map
     assert any("UNIQUE (slug)" in definition for definition in constraint_map.values())
     for table_name, referenced_table, local_columns in (
         ("intake_cases", "customers", "tenant_id, customer_id"),
@@ -604,9 +599,9 @@ async def assert_tenant_boundaries(connection: AsyncConnection) -> None:
     )
 
 
-async def test_phase_two_migration_creates_tenant_domain_schema(
+async def test_initial_schema_creates_final_tenant_domain_schema(
     postgres_connection: AsyncConnection,
 ) -> None:
-    """Alembic creates the worker schema and rejects cross-tenant references."""
+    """The release baseline creates the final schema and tenant boundaries."""
     await query_schema_contract(postgres_connection)
     await assert_tenant_boundaries(postgres_connection)

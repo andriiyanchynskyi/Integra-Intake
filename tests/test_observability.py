@@ -271,8 +271,28 @@ def test_product_docs_describe_safe_live_demo_entrypoints() -> None:
     ):
         assert phrase.lower() in readme.lower(), phrase
     assert "WORKER_CONCURRENCY" not in readme
-    if runbook.exists():
-        text = runbook.read_text(encoding="utf-8").lower()
-        for forbidden in ("print the api key", "paste the key", "commit the key", "upload the key"):
-            assert forbidden not in text
-        assert "WORKER_CONCURRENCY" not in text
+    assert runbook.is_file()
+    text = runbook.read_text(encoding="utf-8")
+    for required in (
+        "docker compose down -v",
+        "docker compose up -d db",
+        "docker compose run --rm api alembic upgrade head",
+        "docker compose run --rm api alembic current",
+        "docker compose up -d worker",
+        "docker compose stop worker",
+        "python -m app.workers",
+        "--profile repair-service",
+        "--profile language-school",
+        "repair_service",
+        "language_school",
+        "documents: {}",
+    ):
+        assert required in text, required
+
+    assert text.index("docker compose run --rm api alembic upgrade head") < text.index(
+        "docker compose up -d worker"
+    )
+    lowered = text.lower()
+    for forbidden in ("print the api key", "paste the key", "commit the key", "upload the key"):
+        assert forbidden not in lowered
+    assert "WORKER_CONCURRENCY" not in text

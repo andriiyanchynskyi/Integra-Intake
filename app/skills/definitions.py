@@ -1,4 +1,4 @@
-"""Concrete Phase-6 skill definitions and their strict schemas."""
+"""Versioned skill definitions and their strict schemas."""
 
 from __future__ import annotations
 
