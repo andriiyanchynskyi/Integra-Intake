@@ -1,363 +1,248 @@
 # IntegraIntake
 
-IntegraIntake is a policy-governed, multi-tenant intake engine. It accepts
-structured case requests and one email-like inbound webhook, normalizes
-profile-bound bounded documents, queues tenant-scoped jobs, and runs a
-synchronous agent loop behind an asynchronous PostgreSQL worker.
+IntegraIntake is a policy-governed, multi-tenant intake service. It accepts
+direct cases, idempotent intake requests, and one signed email-like webhook,
+then processes queued jobs through a dedicated PostgreSQL worker.
 
-The service uses one provider-neutral signed webhook for email-like messages.
-It does not include IMAP, Gmail OAuth, a production email SaaS integration, or
-outbound delivery.
+Tenant profiles define supported fields, documents, and actions. A typed agent
+loop proposes work; server-owned policy and approval rules decide whether an
+action may run. Durable results and diagnostic events remain source-free.
 
-## Observability
+## Capabilities
 
-- `X-Trace-ID` is server-generated and follows accepted intake work into the
-  queued job and worker; `X-Correlation-ID` is optional, bounded, and untrusted.
-- The API and worker emit structured JSON events with safe IDs, closed
-  outcomes, request/queue/worker/provider/tool/document/approval durations,
-  agent stop reasons, policy and approval decisions, and provider token counts
-  only when the provider supplies them.
-- Events and logs are source-free: they never contain request or document content, credentials,
-  authorization or signature headers, proposals, tool payloads, exception text,
-  or a transcript.
-- The local-first scope has no external observability backend, trace table,
-  dashboard, alerting, or content-bearing transcript persistence. Existing
-  case and approval audit records remain the durable business history.
+- Tenant-scoped direct cases, idempotent queued intake, and safe job-status
+  reads through one FastAPI service.
+- A signed provider-neutral webhook with bounded text/PDF normalization and
+  duplicate-delivery handling.
+- Strict YAML tenant profiles for fields, routing, document capabilities, and
+  allowed actions.
+- A provider-independent `AgentLoop` with typed proposals, bounded execution,
+  and an isolated OpenAI-compatible adapter.
+- Deterministic policy, typed tools, and tenant-scoped human approvals for
+  controlled side effects.
+- PostgreSQL leases, structured source-free observability, and provider-free
+  regression suites for freight, repair, and language-school scenarios.
 
-## Data flow
+## Architecture
 
 ~~~text
-API key / signed webhook
-        |
-        v
-server-derived tenant
-        |
-        +--> POST /v1/cases       -> direct received case
-        |
-        +--> POST /v1/intake      -> idempotent AgentJob
-        |
-        +--> POST /v1/inbound/email/webhook
-                              -> strict InboundMessage
-                              -> profile-bound document normalization
-                              -> idempotent AgentJob
-                                      |
-                                      v
-                              PostgreSQL worker
-                                      |
-                                      v
-                              synchronous AgentLoop
-                                      |
-                                      v
-                         profile resolution -> deterministic preflight
-                                      |
-                         structured proposal -> policy/tools/approval
+X-API-Key or signed webhook
+        -> FastAPI authentication and validation
+        -> server-derived tenant
+                |
+                +-> direct case -> durable case record
+                |
+                +-> idempotent AgentJob -> PostgreSQL lease
+                                          -> worker runtime
+                                          -> profile preflight and AgentLoop
+                                          -> policy -> tool, approval, or result
 ~~~
 
-Authentication always supplies the tenant from a server-side API-key lookup.
-Request JSON cannot select a tenant. Every repository operation includes the
-authenticated tenant ID, and cross-tenant case reads behave like missing
-resources (404).
+| Component | Responsibility |
+| --- | --- |
+| `app/api/`, `app/auth/` | Authenticate service or operator credentials, validate requests, and derive tenant ownership. |
+| `app/domain/`, `app/db/` | Own transactions, tenant-scoped repositories, idempotency, jobs, approvals, and audit records. |
+| `app/workers/`, `app/runtime/` | Claim leased jobs, reconstruct trusted snapshots, and run agent work outside the HTTP request. |
+| `app/agent/`, `app/providers/` | Enforce the bounded typed loop and isolate OpenAI-compatible HTTP and schema validation. |
+| `app/policy/`, `app/tools/` | Decide whether proposed actions may run and execute registered tenant-scoped tools. |
+| `app/tenants/` | Load and compile trusted YAML profiles against registered actions and document normalizers. |
+| `app/observability/`, `evals/` | Emit source-free diagnostics and run deterministic provider-free scenario contracts. |
 
-Service keys cannot act as operators, and operator keys cannot call service
-intake APIs. Keys for inactive tenants are rejected before route authorization.
+### Design decisions
 
-Each HTTP request receives a server request ID and provisional trace ID before
-authentication. A newly created intake job persists that trace; an idempotent
-duplicate reuses the existing job trace. Approval decisions use a fresh request
-ID but resolve business events back to the original job trace.
+- **Tenant authority:** The server derives the tenant from `X-API-Key`, and every repository operation includes that tenant. Service keys cannot act as operators, and operator keys cannot call service intake APIs. The boundary prevents request-controlled ownership.
+- **Worker ownership:** FastAPI only accepts or reads work. The worker owns database sessions, provider access, retry state, and the synchronous `AgentLoop`. The process split keeps slow provider calls and session ownership outside HTTP requests.
+- **Model authority:** The model returns a strict `AgentProposal`; deterministic policy decides whether tools or approvals may proceed. Confidence and other model signals never grant permission, so server code retains side-effect authority.
+- **Bounded execution:** The loop allows at most eight steps and stops a third identical tool call. Jobs use `SKIP LOCKED`, lease heartbeat, and tenant/attempt fencing; backend failures persist `tool_execution_failed` instead of a false success. These limits prevent loops, duplicate execution, and stale worker writes.
+- **Content boundary:** Document bytes exist only during normalization. Durable results and diagnostic events omit source text, transcripts, credentials, proposal rationale, and tool payloads. Safe projections preserve operational evidence without copying customer content.
 
-## Implemented capabilities
+### Technology stack
 
-- FastAPI application with /health, OpenAPI, Docker Compose, PostgreSQL,
-  Alembic, and SQLAlchemy 2 async sessions.
-- Tenant-scoped API keys. Raw keys are printed once by the local seed command;
-  PostgreSQL stores only a SHA-256 digest and a display-safe prefix.
-- Strict YAML tenant profiles with safe loading, field catalogs, action policy,
-  scenario identity, capability-owned action/document bindings, and
-  deterministic routing. Policy precedence remains code-owned.
-- Direct case creation and retrieval through /v1/cases.
-- An idempotent PostgreSQL intake boundary through /v1/intake, leased worker
-  jobs, bounded retries, and safe durable error codes.
-- A provider-independent synchronous AgentLoop and an isolated
-  OpenAI-compatible adapter with strict AgentProposal validation and one
-  validation retry.
-- Tool and policy boundaries with typed structured outputs. confidence and
-  other model signals never authorize an action.
-- Human approval decisions with tenant-scoped operator credentials, expiry,
-  append-only approval events, and execute-once behavior.
-- Profile-bound normalization for bounded text/plain and application/pdf
-  documents. Normalized v2 snapshots contain extracted text or a typed
-  extraction error plus a SHA-256 digest; raw document bytes are not persisted
-  or sent to the model. Unreadable documents terminate in deterministic
-  preflight without provider, tool, or approval calls.
-- A signed email-like inbound webhook at
-  POST /v1/inbound/email/webhook. It accepts one bounded attachment and
-  reuses the existing intake/job flow.
-- Reusable provider-free eval contracts under `evals/core/`, with compact
-  repair and language-school suites. The freight corpus remains domain-owned
-  at exactly 40 core and 10 adversarial cases.
-
-## API
-
-All tenant endpoints use X-API-Key unless noted otherwise.
-
-| Endpoint | Contract |
-|---|---|
-| GET /health | Returns {"status":"ok","env":"..."}. No authentication. |
-| POST /v1/cases | Creates a received case directly. Body: channel, subject, body, optional customer_id and extracted_fields. Returns 201. |
-| GET /v1/cases/{case_id} | Returns a case only when it belongs to the authenticated tenant. Returns 404 for an unknown or cross-tenant UUID. |
-| POST /v1/intake | Accepts channel, subject, and body with a required Idempotency-Key; queues one AgentJob and returns 202 with job_id and status="queued". |
-| GET /v1/jobs/{job_id} | Returns a tenant-scoped, read-only source-free job status/result projection. Unknown and cross-tenant UUIDs both return 404. |
-| POST /v1/inbound/email/webhook | Accepts a signed email-like JSON envelope, normalizes its optional attachment, and queues one job. Returns 202 with the same accepted response shape as /v1/intake. |
-| POST /v1/approvals/{approval_id}/decide | Requires an active operator API key with the approval_decider capability. Body: decision (approve or reject) and a non-blank reason. |
-
-### Signed inbound webhook
-
-The inbound wire envelope is intentionally closed:
-
-~~~json
-{
-  "provider_id": "local-msg-0001",
-  "from_addr": "dispatcher@example.test",
-  "subject": "Rate confirmation",
-  "body": "Please review the attached confirmation.",
-  "attachments": [
-    {
-      "media_type": "text/plain",
-      "content_base64": "b3JpZ2luOiBDaGljYWdv..."
-    }
-  ]
-}
-~~~
-
-Required headers are X-API-Key, X-Inbound-Timestamp, and
-X-Inbound-Signature. The signature is
-v1=<hex HMAC-SHA256(api_key, "v1." + timestamp + "." + raw_body)> and the
-timestamp must be within five minutes of server time. Invalid signatures,
-expired timestamp replays, malformed JSON, unsupported media types, and
-oversized bodies return sanitized errors without exposing parser or
-authentication details. A duplicate delivery with the same provider ID is
-handled by idempotency and returns the existing job.
-
-The server supplies tenant_id and channel=email_webhook; neither can be
-provided by the payload. provider_id is namespaced as
-email_webhook:<provider_id> at the existing tenant-scoped idempotency
-boundary. Repeating the same provider delivery returns the existing job. The
-same ID with a changed body, sender, subject, or normalized document returns
-409.
-
-The adapter accepts at most one attachment. Supported media types are
-text/plain and application/pdf; each document is limited to 5 MiB, the
-webhook body to 8 MiB, and the text body to 100,000 characters. Attachment
-bytes exist only while the document normalizer runs. Jobs, transcripts, audit
-events, approvals, and model-facing snapshots contain no raw binary or
-base64; they retain only the bounded normalized document result and digest.
-
-### Local webhook sender
-
-scripts/send_inbound_webhook.py is a deterministic local sender. It uses the
-same signing helper as the adapter, accepts .txt or .pdf, and never writes
-the API key. It replaces a real provider for local checks:
-
-~~~powershell
-$env:INBOUND_WEBHOOK_API_KEY = $env:INTEGRA_DEMO_API_KEY
-python scripts/send_inbound_webhook.py --url http://localhost:8000/v1/inbound/email/webhook --provider-id local-msg-0001 --from-addr dispatcher@example.test --subject "Rate confirmation" --body "Please review the message."
-~~~
-
-Add `--attachment path/to/file.txt` or `--attachment path/to/file.pdf` to
-exercise document normalization with a local fixture.
-
-The adapter contract is provider-neutral: a future provider integration only
-needs to authenticate its delivery and map it to the frozen internal
-InboundMessage(tenant_id, channel, from_addr, subject, body, attachments,
-provider_id) contract. It must not bypass the existing enqueue service.
-
-Ordinary POST bodies are limited to 1 MiB before JSON parsing. Direct intake
-and case body text is limited to 100,000 characters. Signed inbound webhook
-envelopes retain their 8 MiB limit; one attachment remains capped at 5 MiB.
-
-## Agent and worker guarantees
-
-- AgentLoop is synchronous and provider-independent. FastAPI does not call
-  the loop inline; the worker owns the async event loop and SQLAlchemy sessions.
-- The loop enforces MAX_STEPS = 8 and stops after a third identical tool
-  call. Tool results preserve explicit None values in the typed transcript.
-- Proposals are validated structured data. Markdown parsing and LangChain are
-  not part of the protocol.
-- PostgreSQL jobs use leases and bounded retry delays (0.5, 1, 2, 4 seconds
-  plus jitter, up to the configured retry limit). One worker process handles
-  one job at a time. Multiple worker containers scale horizontally through
-  `SKIP LOCKED`, lease heartbeat, and tenant/attempt fencing.
-- Backend tool failures persist the stable `tool_execution_failed` code and
-  never produce a succeeded job.
-- Tenant profile routing and action policy are deterministic. LLM confidence,
-  priority, and injection flags are informational inputs to policy, never
-  permission to perform a side effect.
-- Profile compilation resolves only registered executable actions and exact
-  document-normalizer versions. Policy-only actions remain visible to policy
-  but are not executable capabilities.
+| Concern | Stack |
+| --- | --- |
+| API and validation | Python 3.12+, FastAPI, Uvicorn, Pydantic v2 |
+| Persistence | PostgreSQL 16, SQLAlchemy 2 async, asyncpg, Alembic |
+| Provider, profiles, and documents | httpx, strict JSON Schema, PyYAML, pypdf |
+| Testing and operations | pytest, pytest-asyncio, Docker Compose, structlog |
 
 ## Quick start
 
-### 1. Configure and install
+Commands below use PowerShell. You need Python 3.12 or newer, Docker Desktop,
+and a local virtual environment.
 
-~~~bash
-cp .env.example .env
+### 1. Install the project
+
+~~~powershell
+Copy-Item .env.example .env
 python -m venv .venv
-# Windows: .venv/Scripts/activate
-# Linux/macOS: source .venv/bin/activate
+.\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 ~~~
 
-### 2. Start PostgreSQL and apply the release schema
-
-~~~bash
-docker compose up -d db
-docker compose run --rm api alembic upgrade head
-docker compose run --rm api alembic current
-~~~
-
-The first release uses the `001_initial_schema` baseline. Start new databases
-from scratch; the baseline does not upgrade the old development revision
-chain. Keep `001_initial_schema` immutable. Future schema changes use new
-append-only revisions.
-
-### 3. Provision the local demo tenant
-
-~~~bash
-python scripts/seed_demo.py
-~~~
-
-Choose a trusted profile explicitly when demonstrating another scenario:
+### 2. Start the local stack
 
 ~~~powershell
-python scripts/seed_demo.py --profile freight-broker
-python scripts/seed_demo.py --profile repair-service
-python scripts/seed_demo.py --profile language-school
-~~~
-
-The command creates or reuses the demo tenant, deactivates older demo keys,
-and prints one new raw API key. Store it in a password manager or the current
-shell session. Do not commit it or expect the command to print it again.
-
-~~~bash
-export INTEGRA_DEMO_API_KEY='<printed-key>'
-# PowerShell: $env:INTEGRA_DEMO_API_KEY = '<printed-key>'
-~~~
-
-### 4. Run the API and worker
-
-~~~bash
-uvicorn app.main:app --reload
-python -m app.workers
-~~~
-
-The worker is a separate process. The API accepts work and returns; it does
-not wait for an LLM call.
-
-Both entry points use JSON stdout events suitable for local inspection. No
-provider credential or source payload is required to run the service locally.
-
-For the opt-in provider smoke and complete recording sequence, see
-[the live provider demo runbook](docs/runbooks/live-provider-demo.md). Provider
-settings are optional and are passed to the worker process only; the API does
-not need `LLM_API_KEY`. Changing local `.env` values requires worker container
-recreation, not an image rebuild.
-
-Run the bounded body-intake smoke with:
-
-~~~powershell
-python scripts/live_provider_smoke.py --profile freight-broker --base-url http://localhost:8000
-~~~
-
-### 5. Create a direct case
-
-~~~bash
-curl -X POST http://localhost:8000/v1/cases \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: $INTEGRA_DEMO_API_KEY" \
-  -d '{"channel":"email","subject":"Password reset","body":"Please reset my account password."}'
-~~~
-
-### Full local stack
-
-~~~bash
 docker compose build api worker
 docker compose up -d db
+docker compose ps db
 docker compose run --rm api alembic upgrade head
 docker compose up -d api worker
 ~~~
 
+Wait until `docker compose ps db` reports the database as healthy, then apply
+the migration. Check `http://localhost:8000/health` after the stack starts.
+The first release starts new databases from `001_initial_schema`; it cannot
+upgrade the retired development chain. Keep that baseline immutable and add
+append-only revisions for later schema changes. API and worker startup never
+applies migrations.
+
+### 3. Create a demo service key
+
+Use one checked-in profile: `freight-broker`, `repair-service`, or
+`language-school`.
+
+~~~powershell
+$env:INTEGRA_DEMO_API_KEY = (
+  python scripts/seed_demo.py --profile freight-broker
+).Trim()
+~~~
+
+The command creates or reactivates the tenant, deactivates its older service
+keys, and prints one new raw key. PostgreSQL stores only its SHA-256 digest and
+a display-safe prefix. Keep the raw key in the current shell or a password
+manager; the command cannot print it again.
+
+### 4. Run a live-provider smoke
+
+Set `LLM_API_KEY`, `LLM_BASE_URL`, and `OPENAI_MODEL` in `.env`. Recreate the
+worker so Compose passes the changed values into its process:
+
+~~~powershell
+docker compose up -d --force-recreate worker
+~~~
+
+Then run:
+
+~~~powershell
+python scripts/live_provider_smoke.py `
+  --profile freight-broker `
+  --base-url http://localhost:8000
+~~~
+
+The smoke submits synthetic intake and returns a source-free terminal job
+projection. The worker is the only Compose service that receives provider
+settings. Provider configuration is optional for the API, database, and direct
+case endpoint; a live-provider intake needs it.
+
+For a clean database reset, the host-worker alternative, all demo profiles,
+approval decisions, and expected evidence, use the
+[live provider demo runbook](docs/runbooks/live-provider-demo.md).
+
+## API
+
+All tenant endpoints require `X-API-Key` unless noted otherwise.
+
+| Endpoint | Contract |
+| --- | --- |
+| `GET /health` | Returns `{"status":"ok","env":"..."}`. No authentication. |
+| `POST /v1/cases` | Creates a received case directly. Body: `channel`, `subject`, `body`, optional `customer_id` and `extracted_fields`. Returns `201`. |
+| `GET /v1/cases/{case_id}` | Returns a case only for its tenant. Unknown and cross-tenant UUIDs return `404`. |
+| `POST /v1/intake` | Requires `Idempotency-Key`; accepts `channel`, `subject`, and `body`; queues one `AgentJob`; returns `202`. |
+| `GET /v1/jobs/{job_id}` | Returns a tenant-scoped, read-only, source-free job status and result projection. |
+| `POST /v1/inbound/email/webhook` | Verifies a signed email-like envelope, normalizes its optional attachment, and queues one job. Returns `202`. |
+| `POST /v1/approvals/{approval_id}/decide` | Requires an active operator key with `approval_decider`; accepts `approve` or `reject` and a non-blank reason. |
+
+### Signed inbound webhook
+
+`POST /v1/inbound/email/webhook` requires `X-API-Key`,
+`X-Inbound-Timestamp`, and `X-Inbound-Signature`. The signature format is
+`v1=<hex HMAC-SHA256(api_key, "v1." + timestamp + "." + raw_body)>`; the
+timestamp must be within five minutes of server time.
+
+The envelope carries `provider_id`, `from_addr`, `subject`, `body`, and an
+optional attachment. The server supplies `tenant_id` and `channel=email_webhook`.
+Duplicate provider IDs reuse the original job; a changed delivery with the
+same ID returns `409`.
+
+Ordinary POST bodies are limited to 1 MiB before JSON parsing. Intake and case
+body text is limited to 100,000 characters. Webhook envelopes are limited to
+8 MiB, one attachment to 5 MiB, and supported attachment types to `text/plain`
+and `application/pdf`.
+
+Use the deterministic local sender for a signed check:
+
+~~~powershell
+$env:INBOUND_WEBHOOK_API_KEY = $env:INTEGRA_DEMO_API_KEY
+python scripts/send_inbound_webhook.py `
+  --url http://localhost:8000/v1/inbound/email/webhook `
+  --provider-id local-msg-0001 `
+  --from-addr dispatcher@example.test `
+  --subject "Rate confirmation" `
+  --body "Please review the message."
+~~~
+
+Add `--attachment path/to/file.txt` or `--attachment path/to/file.pdf` to
+exercise document normalization. A provider integration must authenticate its
+delivery and map it through the existing enqueue and idempotency boundary.
+
+## Observability and privacy
+
+The server creates `X-Trace-ID` before authentication and persists it with a
+new intake job. Idempotent duplicates reuse that job trace. `X-Correlation-ID`
+is optional, bounded, and untrusted.
+
+The API and worker write structured JSON events with safe IDs, closed outcomes,
+durations, stop reasons, policy and approval decisions, and provider token
+counts when available. Logs and durable summaries are source-free: they omit
+request and document content, credentials, authorization and signature
+headers, proposals, tool payloads, exception text, and transcripts.
+
+The local scope has no external observability backend, trace table, dashboard,
+alerting, or transcript storage. Case and approval audit records remain the
+durable business history.
+
 ## Configuration
 
-Settings are loaded from .env and process environment variables. Keep
-secrets out of source control and logs.
+Settings load from `.env` and process environment variables. Keep secrets out
+of source control and logs.
 
 | Variable | Default | Purpose |
-|---|---|---|
-| DATABASE_URL | postgresql+asyncpg://integra:integra@localhost:5432/integra | Async PostgreSQL connection. |
-| LLM_API_KEY | empty | Provider credential, held as SecretStr. |
-| LLM_BASE_URL | https://api.openai.com/v1 | OpenAI-compatible API base. |
-| OPENAI_MODEL | gpt-5.4-mini-2026-03-17 | Structured-output model ID. |
-| APP_ENV | development | Value returned by /health. |
-| TENANT_PROFILES_DIRECTORY | examples | Directory containing validated tenant YAML profiles. |
-| WORKER_POLL_INTERVAL_SECONDS | 0.5 | Idle worker polling interval. |
-| WORKER_LEASE_SECONDS | 60 | Job lease duration. |
-| WORKER_MAX_RETRIES | 4 | Maximum retry policy for recoverable jobs. |
-| APPROVAL_TIMEOUT_SECONDS | 86400 | Approval deadline used by the runtime. |
+| --- | --- | --- |
+| `DATABASE_URL` | `postgresql+asyncpg://integra:integra@localhost:5432/integra` | Async PostgreSQL connection. |
+| `LLM_API_KEY` | empty | Provider credential, held as `SecretStr`. |
+| `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base. |
+| `OPENAI_MODEL` | `gpt-5.4-mini-2026-03-17` | Structured-output model ID. |
+| `APP_ENV` | `development` | Value returned by `/health`. |
+| `TENANT_PROFILES_DIRECTORY` | `examples` | Directory with validated tenant YAML. |
+| `WORKER_POLL_INTERVAL_SECONDS` | `0.5` | Idle worker polling interval. |
+| `WORKER_LEASE_SECONDS` | `60` | Job lease duration. |
+| `WORKER_MAX_RETRIES` | `4` | Retry limit for recoverable jobs. |
+| `APPROVAL_TIMEOUT_SECONDS` | `86400` | Approval deadline in seconds. |
 
 ## Testing
 
-Run the deterministic suite without a provider API or email credentials:
+Run the provider-free checks:
 
 ~~~bash
 pytest -q
-~~~
-
-Unit and API tests use fakes, dependency overrides, and httpx transports.
-Webhook tests cover signing, timestamp expiry, replay rejection, strict
-payload validation, limits, duplicate delivery, idempotency conflicts,
-tenant isolation, attachment privacy, normalization, and worker hand-off.
-Universal scenario contract tests cover the repair and language-school
-matrices, fixed trace/scenario identity, capability extension seams, and
-source-free seven-key result projections. Those suites use only synthetic
-typed proposals and local ports; they add no scenario-specific production
-parser or outbound delivery integration.
-PostgreSQL integration tests run only when an explicit reachable
-DATABASE_URL is supplied; otherwise they skip instead of pretending to be
-database evidence. CI supplies a disposable PostgreSQL service and this
-variable, so migration/integration checks run there without provider secrets.
-
-### Deterministic freight evals
-
-Run the provider-free freight corpus with:
-
-~~~bash
 pytest evals/test_freight.py -q
-~~~
-
-The version-controlled dataset contains 40 core and 10 adversarial cases. Each
-case runs once (`k=1`) against scripted typed `AgentProposal` values and the
-current document extraction-error, signed webhook verification/mapping, loop,
-policy, tool, approval, idempotency, and tenant-isolation seams. The standard
-CI gate requires 100% pass rate; it does
-not measure live-model extraction, classification, or injection-detection
-quality. An optional `--freight-eval-report PATH` writes a sanitized JSON
-artifact containing only counts, case IDs, and mismatch codes.
-
-Before handoff, also run:
-
-~~~bash
 git diff --check
 ~~~
 
-Release databases start from scratch with `001_initial_schema`. API and worker
-startup do not apply migrations. Recreate the disposable local PostgreSQL
-volume before validating a clean baseline upgrade after schema-chain changes.
+Unit and API tests use fakes, dependency overrides, and `httpx` transports.
+PostgreSQL integration tests require a reachable `DATABASE_URL`; a skipped test
+does not prove database behavior. CI supplies disposable PostgreSQL without
+provider credentials.
 
-## Current boundaries
+The version-controlled freight corpus contains 40 core and 10 adversarial
+cases. Each case runs once (`k=1`) with scripted typed `AgentProposal` values.
+The CI gate requires a 100% pass rate. It does not measure live-model
+extraction, classification, or injection-detection quality. An optional
+`--freight-eval-report PATH` writes only counts, case IDs, and mismatch codes.
 
-The service includes local structured observability but does not include an
-external trace/metrics backend, dashboards, alerts, MCP, Linux/systemd
-operations, real email-provider OAuth or IMAP, outbound delivery, TMS/Odoo,
-cloud object storage, or production SaaS integrations.
+## Scope
+
+IntegraIntake provides local structured observability and deterministic evals.
+It excludes external trace or metrics backends, dashboards, alerts, MCP,
+real email-provider OAuth or IMAP, outbound delivery, TMS/Odoo, cloud object
+storage, and production SaaS integrations.

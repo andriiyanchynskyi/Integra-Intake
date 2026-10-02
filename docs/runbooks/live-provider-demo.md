@@ -143,6 +143,36 @@ approval identity, timestamps, and stable error codes. `succeeded` and
 `awaiting_approval` are valid live outcomes. Provider output can vary, so use
 the safe lifecycle and identity fields as the check.
 
+### What an ideal verification proves
+
+An ideal verification proves the governed path from a clean database to a
+durable, source-free result. It does not depend on one model phrase or one
+classification. A model can produce plausible text while the wrong schema,
+tenant, profile, worker, policy, or persistence boundary handles the job.
+
+Use the evidence below to explain each step to another operator:
+
+| Check | Evidence to capture | Why the check matters |
+| --- | --- | --- |
+| Clean release state | `alembic current` reports `001_initial_schema (head)` after a fresh database reset. | The demo cannot rely on retained tables, old revisions, or manual schema changes. |
+| API readiness | `/health` responds after the migration completes. | The API connects to the database that received the release schema. |
+| Tenant and profile identity | The seed command uses the selected profile, and the job result reports its expected `scenario_key`. | The server derives tenant access from the API key and applies the checked-in profile rather than request-supplied ownership. |
+| Worker ownership | One selected worker claims the job and emits source-free lifecycle events for the same trace. | Provider access, leases, and result persistence remain in the worker boundary. |
+| End-to-end job lifecycle | The smoke result contains a `job_id`, `trace_id`, terminal status, routing fields, and any approval identity. | Another operator can connect the accepted request, worker execution, and durable result without reading source content. |
+| Policy and approval gate | An `awaiting_approval` job has no executed side effect before an authorized operator decides it. | Server policy, not model confidence, controls high-impact actions. |
+| Privacy boundary | Commands, logs, and captured output contain no API keys, source text, documents, transcripts, proposal rationale, or tool payloads. | The demo can be shared as diagnostic evidence without exposing customer data or credentials. |
+
+A good result can be `succeeded`, `awaiting_approval`, or a stable expected
+failure. `succeeded` proves that the permitted path reached a durable result.
+`awaiting_approval` proves that the policy gate stopped execution before the
+side effect. A stable failure such as `provider_unavailable` proves that the
+system records a bounded failure without leaking provider or source details.
+
+Record the profile slug, `scenario_key`, `job_id`, `trace_id`, terminal status,
+routing outcome, approval ID when present, and stable error code when present.
+Those fields let another person repeat the run and compare outcomes. Do not
+record the request body, document text, credentials, or provider response.
+
 ## 9. Run the repair-service scenario
 
 Keep the same API, database, and worker. Replace the service key and run only
