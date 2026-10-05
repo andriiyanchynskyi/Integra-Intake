@@ -6,6 +6,7 @@ from uuid import UUID
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from app.agent import (
     AgentMessage,
@@ -42,6 +43,24 @@ def _provider_response(content: str) -> dict[str, object]:
 
 def _messages() -> list[AgentMessage]:
     return [AgentMessage(role=MessageRole.USER, content="Route this shipment")]
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+)
+def test_settings_accept_supported_reasoning_effort(value: str) -> None:
+    assert Settings(llm_reasoning_effort=value).llm_reasoning_effort == value
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_settings_treat_empty_reasoning_effort_as_unset(value: str) -> None:
+    assert Settings(llm_reasoning_effort=value).llm_reasoning_effort is None
+
+
+def test_settings_reject_unknown_reasoning_effort() -> None:
+    with pytest.raises(ValidationError):
+        Settings(llm_reasoning_effort="very_high")
 
 
 def _client(
@@ -85,6 +104,7 @@ def test_valid_structured_proposal_uses_openai_compatible_contract() -> None:
         requests.append(request)
         payload = json.loads(request.content)
         assert payload["model"] == "test-model"
+        assert "reasoning_effort" not in payload
         assert payload["response_format"]["type"] == "json_schema"
         assert payload["response_format"]["json_schema"]["strict"] is True
         schema = payload["response_format"]["json_schema"]["schema"]
@@ -152,6 +172,31 @@ def test_valid_structured_proposal_uses_openai_compatible_contract() -> None:
     assert proposal.tool_call is not None
     assert proposal.tool_call.arguments == {"customer_id": "cust-1"}
     assert proposal.confidence == 0.87
+
+
+def test_configured_reasoning_effort_is_sent_on_validation_retry() -> None:
+    requests: list[dict[str, object]] = []
+    responses = iter(
+        [
+            _provider_response("{invalid"),
+            _provider_response(json.dumps(VALID_PROPOSAL)),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=next(responses))
+
+    with _client(httpx.MockTransport(handler)) as http_client:
+        OpenAICompatibleLLMClient(
+            base_url="https://provider.example/v1",
+            api_key="dummy-secret",
+            model="test-model",
+            reasoning_effort="low",
+            client=http_client,
+        ).complete(_messages())
+
+    assert [request["reasoning_effort"] for request in requests] == ["low", "low"]
 
 
 def test_provider_success_event_contains_duration_and_validated_usage() -> None:

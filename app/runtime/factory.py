@@ -261,6 +261,7 @@ class AgentRuntimeFactory:
             base_url=self._settings.llm_base_url,
             api_key=self._settings.llm_api_key.get_secret_value(),
             model=self._settings.openai_model,
+            reasoning_effort=self._settings.llm_reasoning_effort,
             client=client,
             observer=observer or self._observer,
             context=context,

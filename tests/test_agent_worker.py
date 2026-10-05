@@ -11,6 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+import httpx
 import yaml
 
 from app.agent.models import AgentMessage, AgentRunResult, MessageRole, RunStatus, StopReason
@@ -61,6 +62,20 @@ def _repair_claimed(
         _claimed(side_effect_committed_at=side_effect_committed_at),
         tenant_config_snapshot=_REPAIR_PROFILE_SNAPSHOT,
         tenant_config_sha256=_REPAIR_PROFILE_SHA256,
+    )
+
+
+def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://provider.example/v1/chat/completions")
+    response = httpx.Response(
+        status_code,
+        request=request,
+        text="provider-body-secret",
+    )
+    return httpx.HTTPStatusError(
+        "provider request failed",
+        request=request,
+        response=response,
     )
 
 
@@ -795,6 +810,80 @@ async def test_tool_execution_failure_persists_stable_error_code(
     failed = [entry for entry in repository.calls if entry[0] == "mark_failed"]
     assert failed
     assert failed[-1][1][0][1] == "tool_execution_failed"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_provider_client_error_is_non_retryable_and_source_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    claimed = _claimed()
+    _FakeRepository.next_claimed = claimed
+    observer = RecordingObserver()
+    worker = AgentWorker(
+        _SessionFactory(),
+        runtime_factory=_RuntimeFactory(_Runtime(_http_status_error(400))),
+        settings=_settings(),
+        observer=observer,
+        to_thread=asyncio.to_thread,
+    )
+
+    assert await worker.serve_once() is True
+
+    repository = _FakeRepository.instances[-1]
+    failed = [entry for entry in repository.calls if entry[0] == "mark_failed"]
+    assert failed[-1][1][0][1] == "provider_request_rejected"  # type: ignore[index]
+    assert not [entry for entry in repository.calls if entry[0] == "schedule_retry"]
+    rendered = "".join(event.model_dump_json() for event in observer.events)
+    assert "provider-body-secret" not in rendered
+
+
+@pytest.mark.parametrize("status_code", [408, 429, 500, 503])
+@pytest.mark.asyncio
+async def test_transient_provider_http_error_is_scheduled_for_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    _install_repository(monkeypatch)
+    _FakeRepository.next_claimed = _claimed()
+    worker = AgentWorker(
+        _SessionFactory(),
+        runtime_factory=_RuntimeFactory(_Runtime(_http_status_error(status_code))),
+        settings=_settings(),
+        random_uniform=lambda _lower, _upper: 0.0,
+        to_thread=asyncio.to_thread,
+    )
+
+    assert await worker.serve_once() is True
+    repository = _FakeRepository.instances[-1]
+    retry = [entry for entry in repository.calls if entry[0] == "schedule_retry"]
+    assert retry[-1][1][0][1] == "provider_unavailable"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_provider_rejection_after_side_effect_is_failed_uncertain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    _FakeRepository.next_claimed = _claimed(
+        side_effect_committed_at=datetime.now(timezone.utc)
+    )
+    worker = AgentWorker(
+        _SessionFactory(),
+        runtime_factory=_RuntimeFactory(_Runtime(_http_status_error(400))),
+        settings=_settings(),
+        to_thread=asyncio.to_thread,
+    )
+
+    assert await worker.serve_once() is True
+    repository = _FakeRepository.instances[-1]
+    uncertain = [
+        entry
+        for entry in repository.calls
+        if entry[0] == "mark_failed_uncertain"
+    ]
+    assert uncertain[-1][1][0][1] == "unexpected_after_side_effect"  # type: ignore[index]
+    assert not [entry for entry in repository.calls if entry[0] == "schedule_retry"]
 
 
 @pytest.mark.asyncio

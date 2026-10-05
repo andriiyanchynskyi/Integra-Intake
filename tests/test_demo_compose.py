@@ -14,7 +14,9 @@ def test_compose_passes_optional_provider_settings_only_to_worker() -> None:
     assert worker_environment["LLM_API_KEY"] == "${LLM_API_KEY:-}"
     assert worker_environment["LLM_BASE_URL"] == "${LLM_BASE_URL:-https://api.openai.com/v1}"
     assert worker_environment["OPENAI_MODEL"] == "${OPENAI_MODEL:-gpt-5.4-mini-2026-03-17}"
+    assert worker_environment["LLM_REASONING_EFFORT"] == "${LLM_REASONING_EFFORT:-}"
     assert "LLM_API_KEY" not in api_environment
     assert "LLM_BASE_URL" not in api_environment
     assert "OPENAI_MODEL" not in api_environment
+    assert "LLM_REASONING_EFFORT" not in api_environment
     assert "WORKER_CONCURRENCY" not in worker_environment

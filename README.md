@@ -114,7 +114,9 @@ manager; the command cannot print it again.
 
 ### 4. Run a live-provider smoke
 
-Set `LLM_API_KEY`, `LLM_BASE_URL`, and `OPENAI_MODEL` in `.env`. Recreate the
+Set `LLM_API_KEY`, `LLM_BASE_URL`, and `OPENAI_MODEL` in `.env`. Leave
+`LLM_REASONING_EFFORT` empty to use the selected model's provider default.
+Recreate the
 worker so Compose passes the changed values into its process:
 
 ~~~powershell
@@ -212,6 +214,7 @@ of source control and logs.
 | `LLM_API_KEY` | empty | Provider credential, held as `SecretStr`. |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base. |
 | `OPENAI_MODEL` | `gpt-5.4-mini-2026-03-17` | Structured-output model ID. |
+| `LLM_REASONING_EFFORT` | empty | Optional provider reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Unsupported model/value combinations fail the job with `provider_request_rejected`. |
 | `APP_ENV` | `development` | Value returned by `/health`. |
 | `TENANT_PROFILES_DIRECTORY` | `examples` | Directory with validated tenant YAML. |
 | `WORKER_POLL_INTERVAL_SECONDS` | `0.5` | Idle worker polling interval. |

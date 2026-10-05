@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import pytest
 
+from app.core.config import Settings
 from app.documents import (
     DocumentMediaType,
     DocumentNormalizer,
@@ -318,7 +319,12 @@ def test_agent_runtime_factory_binds_trace_to_default_provider(
     observer = RecordingObserver()
     job = _claimed_job()
     owner_loop = asyncio.new_event_loop()
-    runtime = AgentRuntimeFactory(object(), observer=observer).build(
+    runtime_settings = Settings(llm_reasoning_effort="high")
+    runtime = AgentRuntimeFactory(
+        object(),
+        runtime_settings=runtime_settings,
+        observer=observer,
+    ).build(
         job,
         WorkerAsyncGateway(owner_loop),
     )
@@ -328,6 +334,7 @@ def test_agent_runtime_factory_binds_trace_to_default_provider(
         assert provider.kwargs["context"].trace_id == job.trace_id
         assert provider.kwargs["context"].tenant_id == job.tenant_id
         assert provider.kwargs["context"].job_id == job.id
+        assert provider.kwargs["reasoning_effort"] == "high"
     finally:
         runtime.close()
         owner_loop.close()

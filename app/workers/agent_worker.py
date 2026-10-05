@@ -69,6 +69,10 @@ class RetryableJobError(RuntimeError):
         self.side_effect_committed = side_effect_committed
 
 
+class ProviderRequestRejectedError(RuntimeError):
+    """A provider rejected a request and retrying it unchanged cannot help."""
+
+
 # A descriptive alias keeps callers that use the runtime terminology stable.
 WorkerRetryableError = RetryableJobError
 
@@ -224,6 +228,33 @@ class AgentWorker:
                         outcome=OutcomeCode.RETRY_SCHEDULED,
                         duration_ms=run_duration_ms,
                         worker_error_code=self._worker_error_code(exc.error_code),
+                    )
+                finished = True
+            except ProviderRequestRejectedError:
+                run_duration_ms = self._elapsed_ms(run_started_ns)
+                has_side_effect = await self._has_side_effect(claimed)
+                if has_side_effect:
+                    await self._mark_failed_uncertain(
+                        claimed,
+                        "unexpected_after_side_effect",
+                    )
+                    self._emit_job_finished(
+                        claimed,
+                        outcome=OutcomeCode.FAILED_UNCERTAIN,
+                        duration_ms=run_duration_ms,
+                        worker_error_code=WorkerErrorCode.UNEXPECTED_AFTER_SIDE_EFFECT,
+                        side_effect_committed=True,
+                    )
+                else:
+                    await self._mark_failed(
+                        claimed,
+                        "provider_request_rejected",
+                    )
+                    self._emit_job_finished(
+                        claimed,
+                        outcome=OutcomeCode.FAILED,
+                        duration_ms=run_duration_ms,
+                        worker_error_code=WorkerErrorCode.PROVIDER_REQUEST_REJECTED,
                     )
                 finished = True
             except JobLeaseLostError:
@@ -410,7 +441,9 @@ class AgentWorker:
                     raise RetryableJobError(
                         error_code="provider_unavailable"
                     ) from error
-                raise
+                raise ProviderRequestRejectedError(
+                    "provider rejected request"
+                ) from error
         finally:
             runtime.close()
 

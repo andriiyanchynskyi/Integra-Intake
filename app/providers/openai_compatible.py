@@ -156,6 +156,7 @@ class OpenAICompatibleLLMClient:
         api_key: str,
         model: str,
         client: httpx.Client,
+        reasoning_effort: str | None = None,
         observer: Observer = NULL_OBSERVER,
         context: ObservationContext | None = None,
         clock: Callable[[], int] = time.perf_counter_ns,
@@ -163,6 +164,7 @@ class OpenAICompatibleLLMClient:
         self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
         self._api_key = api_key
         self._model = model
+        self._reasoning_effort = reasoning_effort
         self._client = client
         self._observer = observer
         self._context = context or ObservationContext(trace_id=uuid4())
@@ -300,6 +302,8 @@ class OpenAICompatibleLLMClient:
                 },
             },
         }
+        if self._reasoning_effort is not None:
+            payload["reasoning_effort"] = self._reasoning_effort
         response = self._client.post(
             self._endpoint,
             headers={"Authorization": f"Bearer {self._api_key}"},

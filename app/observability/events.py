@@ -163,6 +163,7 @@ class PersistenceOperation(str, Enum):
 
 class WorkerErrorCode(str, Enum):
     PROVIDER_UNAVAILABLE = "provider_unavailable"
+    PROVIDER_REQUEST_REJECTED = "provider_request_rejected"
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
     RETRY_EXHAUSTED = "retry_exhausted"
     SIDE_EFFECT_COMMITTED = "side_effect_committed"

@@ -26,7 +26,14 @@ def freight_profile():
     return TenantProfileResolver(PROJECT_ROOT / "examples").resolve("freight-broker")
 
 
-def _row(profile, *, status: str = "succeeded", approval_id=None, approval_status=None):
+def _row(
+    profile,
+    *,
+    status: str = "succeeded",
+    approval_id=None,
+    approval_status=None,
+    error_code: str | None = None,
+):
     from app.domain.jobs import PersistedJobRead
 
     return PersistedJobRead(
@@ -44,7 +51,7 @@ def _row(profile, *, status: str = "succeeded", approval_id=None, approval_statu
             "missing_required_fields": ["contact", "contact"],
             "tool_result": {"body": "secret"},
         },
-        error_code=None,
+        error_code=error_code,
         tenant_config_snapshot=profile.snapshot,
         tenant_config_sha256=profile.sha256,
         approval_id=approval_id,
@@ -124,6 +131,20 @@ def test_project_job_read_verifies_profile_hash_before_projection(freight_profil
 
     with pytest.raises(RuntimeError, match="profile"):
         project_job_read(row)
+
+
+def test_project_job_read_exposes_provider_request_rejected(freight_profile) -> None:
+    from app.domain.jobs import project_job_read
+
+    row = _row(
+        freight_profile,
+        status="failed",
+        error_code="provider_request_rejected",
+    )
+
+    safe = project_job_read(row)
+
+    assert safe.error_code == "provider_request_rejected"
 
 
 def test_job_api_returns_only_safe_own_tenant_projection(monkeypatch, freight_profile) -> None:
