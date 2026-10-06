@@ -42,6 +42,20 @@ def _canonical_json(value: object) -> str:
     )
 
 
+def _strict_json_schema(schema: dict[str, object]) -> dict[str, object]:
+    for value in schema.values():
+        if isinstance(value, dict):
+            _strict_json_schema(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    _strict_json_schema(item)
+    properties = schema.get("properties")
+    if schema.get("type") == "object" and isinstance(properties, dict):
+        schema["required"] = list(properties)
+    return schema
+
+
 def _validation_feedback(error: Exception) -> str:
     if isinstance(error, ValidationError):
         details = error.errors(include_input=False, include_url=False)
@@ -298,7 +312,9 @@ class OpenAICompatibleLLMClient:
                 "json_schema": {
                     "name": "agent_proposal",
                     "strict": True,
-                    "schema": AgentProposal.model_json_schema(),
+                    "schema": _strict_json_schema(
+                        AgentProposal.model_json_schema()
+                    ),
                 },
             },
         }

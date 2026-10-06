@@ -123,13 +123,16 @@ def test_valid_structured_proposal_uses_openai_compatible_contract() -> None:
         fields_schema = _resolve_schema_ref(
             schema["properties"]["fields"]["items"], schema
         )
-        assert set(fields_schema["required"]) == {"name", "value"}
+        assert set(fields_schema["required"]) == {
+            "name",
+            "value",
+            "source_excerpt",
+        }
         assert set(fields_schema["properties"]) == {
             "name",
             "value",
             "source_excerpt",
         }
-        assert "source_excerpt" not in fields_schema["required"]
         tool_calls_schema = _resolve_schema_ref(
             schema["properties"]["tool_calls"]["items"], schema
         )
