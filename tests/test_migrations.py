@@ -81,15 +81,49 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
     assert api_keys.c.capability.nullable is False
     assert str(api_keys.c.capability.server_default.arg) == "none"
     assert api_keys.c.actor_ref.nullable is True
+    assert {
+        constraint.name
+        for constraint in tenants.constraints
+        if isinstance(constraint, CheckConstraint)
+    } == {"ck_tenants_status"}
+    assert {
+        constraint.name
+        for constraint in api_keys.constraints
+        if isinstance(constraint, CheckConstraint)
+    } == {"ck_api_keys_capability", "ck_api_keys_principal_type"}
 
     customers = Base.metadata.tables["customers"]
     assert customers.c.phone.nullable is True
+    customer_unique_constraints = {
+        constraint.name: tuple(column.name for column in constraint.columns)
+        for constraint in customers.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert customer_unique_constraints["uq_customers_tenant_id_email"] == (
+        "tenant_id",
+        "email",
+    )
+    assert customer_unique_constraints["uq_customers_tenant_id_external_id"] == (
+        "tenant_id",
+        "external_id",
+    )
+    assert "ix_customers_tenant_id_id" not in {
+        index.name for index in customers.indexes
+    }
 
     intake_cases = Base.metadata.tables["intake_cases"]
     assert str(intake_cases.c.status.server_default.arg) == "received"
     assert intake_cases.c.channel.nullable is False
     assert intake_cases.c.subject.nullable is False
     assert intake_cases.c.body.nullable is False
+    assert any(
+        isinstance(constraint, CheckConstraint)
+        and constraint.name == "ck_intake_cases_status"
+        for constraint in intake_cases.constraints
+    )
+    assert "ix_intake_cases_tenant_id_id" not in {
+        index.name for index in intake_cases.indexes
+    }
 
     case_events = Base.metadata.tables["case_events"]
     assert case_events.c.actor.nullable is True
@@ -131,6 +165,11 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
         assert agent_jobs.c[name].nullable is True
     assert agent_jobs.c.created_at.nullable is False
     assert agent_jobs.c.updated_at.nullable is False
+    assert any(
+        isinstance(constraint, CheckConstraint)
+        and constraint.name == "ck_agent_jobs_status"
+        for constraint in agent_jobs.constraints
+    )
 
     assert any(
         isinstance(constraint, UniqueConstraint)
@@ -148,8 +187,7 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
         index.name: tuple(column.name for column in index.columns)
         for index in agent_jobs.indexes
     } == {
-        "ix_agent_jobs_tenant_id_id": ("tenant_id", "id"),
-        "ix_agent_jobs_status_available_at": ("status", "available_at"),
+        "ix_agent_jobs_status_available_at": ("status", "available_at", "id"),
         "ix_agent_jobs_running_lease": ("status", "lease_expires_at"),
     }
 
@@ -194,9 +232,20 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
         index.name: tuple(column.name for column in index.columns)
         for index in approvals.indexes
     }["ix_approvals_pending_expires_at"] == (
-        "tenant_id",
         "status",
         "expires_at",
+        "id",
+    )
+    assert "ix_approvals_tenant_id_id" not in {
+        index.name for index in approvals.indexes
+    }
+
+    assert any(
+        isinstance(constraint, UniqueConstraint)
+        and constraint.name == "uq_idempotency_records_tenant_id_job_id"
+        and tuple(column.name for column in constraint.columns)
+        == ("tenant_id", "job_id")
+        for constraint in idempotency_records.constraints
     )
 
     approval_events = Base.metadata.tables["approval_events"]
@@ -355,9 +404,19 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
         )
     )
     index_map = {(row.tablename, row.indexname): row.indexdef for row in indexes}
-    for table_name in TENANT_SCOPED_TABLES:
+    for table_name in (
+        "api_keys",
+        "case_events",
+        "idempotency_records",
+        "approval_events",
+    ):
         assert f"(tenant_id, id)" in index_map[(table_name, f"ix_{table_name}_tenant_id_id")]
-    assert "(tenant_id, status, expires_at)" in index_map[
+    for table_name in ("customers", "intake_cases", "agent_jobs", "approvals"):
+        assert (table_name, f"ix_{table_name}_tenant_id_id") not in index_map
+    assert "(status, available_at, id)" in index_map[
+        ("agent_jobs", "ix_agent_jobs_status_available_at")
+    ]
+    assert "(status, expires_at, id)" in index_map[
         ("approvals", "ix_approvals_pending_expires_at")
     ]
 
@@ -369,11 +428,28 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
     )
     constraint_map = {row.conname: row.definition for row in constraints}
     assert "UNIQUE (tenant_id, key)" in constraint_map["uq_idempotency_records_tenant_id_key"]
+    assert "UNIQUE (tenant_id, job_id)" in constraint_map[
+        "uq_idempotency_records_tenant_id_job_id"
+    ]
+    assert "UNIQUE (tenant_id, email)" in constraint_map[
+        "uq_customers_tenant_id_email"
+    ]
+    assert "UNIQUE (tenant_id, external_id)" in constraint_map[
+        "uq_customers_tenant_id_external_id"
+    ]
     assert "UNIQUE (tenant_id, id)" in constraint_map["uq_approvals_tenant_id_id"]
     assert "UNIQUE (job_id)" in constraint_map["uq_approvals_job_id"]
     assert "UNIQUE (trace_id)" in constraint_map["uq_agent_jobs_trace_id"]
     assert "ck_approvals_payload_complete" in constraint_map
     assert "ck_approvals_status" in constraint_map
+    for constraint_name in (
+        "ck_tenants_status",
+        "ck_api_keys_principal_type",
+        "ck_api_keys_capability",
+        "ck_intake_cases_status",
+        "ck_agent_jobs_status",
+    ):
+        assert constraint_name in constraint_map
     assert "ck_approvals_phase8_payload_complete" not in constraint_map
     assert any("UNIQUE (slug)" in definition for definition in constraint_map.values())
     for table_name, referenced_table, local_columns in (
@@ -488,6 +564,137 @@ async def assert_tenant_boundaries(connection: AsyncConnection) -> None:
             "key": "cross-tenant-key",
             "request_hash": "a" * 64,
             "case_id": case_b,
+        },
+    )
+    customer_a = uuid4()
+    await connection.execute(
+        text(
+            "INSERT INTO customers (id, tenant_id, email, external_id) "
+            "VALUES (:id, :tenant_id, :email, :external_id)"
+        ),
+        {
+            "id": customer_a,
+            "tenant_id": tenant_a,
+            "email": "shared@example.test",
+            "external_id": "customer-a",
+        },
+    )
+    await connection.execute(
+        text(
+            "INSERT INTO customers (id, tenant_id, email, external_id) "
+            "VALUES (:id, :tenant_id, :email, :external_id)"
+        ),
+        {
+            "id": uuid4(),
+            "tenant_id": tenant_b,
+            "email": "shared@example.test",
+            "external_id": "customer-a",
+        },
+    )
+    await assert_integrity_error(
+        connection,
+        "INSERT INTO customers (id, tenant_id, email) "
+        "VALUES (:id, :tenant_id, :email)",
+        {
+            "id": uuid4(),
+            "tenant_id": tenant_a,
+            "email": "shared@example.test",
+        },
+    )
+    await assert_integrity_error(
+        connection,
+        "INSERT INTO customers (id, tenant_id, external_id) "
+        "VALUES (:id, :tenant_id, :external_id)",
+        {
+            "id": uuid4(),
+            "tenant_id": tenant_a,
+            "external_id": "customer-a",
+        },
+    )
+    await connection.execute(
+        text("INSERT INTO customers (id, tenant_id) VALUES (:id, :tenant_id)"),
+        [
+            {"id": uuid4(), "tenant_id": tenant_a},
+            {"id": uuid4(), "tenant_id": tenant_a},
+        ],
+    )
+    await assert_integrity_error(
+        connection,
+        "INSERT INTO idempotency_records "
+        "(id, tenant_id, key, request_hash, job_id) "
+        "VALUES (:id, :tenant_id, :key, :request_hash, :job_id)",
+        {
+            "id": uuid4(),
+            "tenant_id": tenant_b,
+            "key": "duplicate-job-key",
+            "request_hash": "f" * 64,
+            "job_id": agent_job_b,
+        },
+    )
+    await assert_integrity_error(
+        connection,
+        "INSERT INTO tenants (id, slug, name, status) "
+        "VALUES (:id, :slug, :name, :status)",
+        {
+            "id": uuid4(),
+            "slug": "invalid-status",
+            "name": "Invalid Status",
+            "status": "unknown",
+        },
+    )
+    await assert_integrity_error(
+        connection,
+        "INSERT INTO api_keys "
+        "(id, tenant_id, prefix, key_hash, principal_type) "
+        "VALUES (:id, :tenant_id, :prefix, :key_hash, :principal_type)",
+        {
+            "id": uuid4(),
+            "tenant_id": tenant_a,
+            "prefix": "ik_invalid",
+            "key_hash": "1" * 64,
+            "principal_type": "unknown",
+        },
+    )
+    await assert_integrity_error(
+        connection,
+        "INSERT INTO api_keys "
+        "(id, tenant_id, prefix, key_hash, capability) "
+        "VALUES (:id, :tenant_id, :prefix, :key_hash, :capability)",
+        {
+            "id": uuid4(),
+            "tenant_id": tenant_a,
+            "prefix": "ik_invalid",
+            "key_hash": "2" * 64,
+            "capability": "unknown",
+        },
+    )
+    await assert_integrity_error(
+        connection,
+        "INSERT INTO intake_cases "
+        "(id, tenant_id, status, channel, subject, body) "
+        "VALUES (:id, :tenant_id, :status, :channel, :subject, :body)",
+        {
+            "id": uuid4(),
+            "tenant_id": tenant_a,
+            "status": "unknown",
+            "channel": "email",
+            "subject": "Invalid status",
+            "body": "Body",
+        },
+    )
+    await assert_integrity_error(
+        connection,
+        "INSERT INTO agent_jobs "
+        "(id, tenant_id, trace_id, status, source_snapshot, "
+        "tenant_config_snapshot, tenant_config_sha256) "
+        "VALUES (:id, :tenant_id, :trace_id, :status, '{}'::jsonb, "
+        "'{}'::jsonb, :sha256)",
+        {
+            "id": uuid4(),
+            "tenant_id": tenant_a,
+            "trace_id": uuid4(),
+            "status": "unknown",
+            "sha256": "c" * 64,
         },
     )
     await assert_integrity_error(

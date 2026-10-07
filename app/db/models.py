@@ -30,6 +30,12 @@ class TimestampedModel:
 
 class Tenant(TimestampedModel, Base):
     __tablename__ = "tenants"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'inactive')",
+            name="ck_tenants_status",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
     slug: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
@@ -41,7 +47,17 @@ class Tenant(TimestampedModel, Base):
 
 class ApiKey(TimestampedModel, Base):
     __tablename__ = "api_keys"
-    __table_args__ = (Index("ix_api_keys_tenant_id_id", "tenant_id", "id"),)
+    __table_args__ = (
+        CheckConstraint(
+            "principal_type IN ('service', 'operator')",
+            name="ck_api_keys_principal_type",
+        ),
+        CheckConstraint(
+            "capability IN ('none', 'approval_decider')",
+            name="ck_api_keys_capability",
+        ),
+        Index("ix_api_keys_tenant_id_id", "tenant_id", "id"),
+    )
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
     tenant_id: Mapped[UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
@@ -61,7 +77,14 @@ class Customer(TimestampedModel, Base):
     __tablename__ = "customers"
     __table_args__ = (
         UniqueConstraint("tenant_id", "id", name="uq_customers_tenant_id_id"),
-        Index("ix_customers_tenant_id_id", "tenant_id", "id"),
+        UniqueConstraint(
+            "tenant_id", "email", name="uq_customers_tenant_id_email"
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "external_id",
+            name="uq_customers_tenant_id_external_id",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -82,7 +105,10 @@ class IntakeCase(TimestampedModel, Base):
             ["customers.tenant_id", "customers.id"],
             name="fk_intake_cases_tenant_customer",
         ),
-        Index("ix_intake_cases_tenant_id_id", "tenant_id", "id"),
+        CheckConstraint(
+            "status IN ('received')",
+            name="ck_intake_cases_status",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -126,8 +152,17 @@ class AgentJob(TimestampedModel, Base):
     __table_args__ = (
         UniqueConstraint("tenant_id", "id", name="uq_agent_jobs_tenant_id_id"),
         UniqueConstraint("trace_id", name="uq_agent_jobs_trace_id"),
-        Index("ix_agent_jobs_tenant_id_id", "tenant_id", "id"),
-        Index("ix_agent_jobs_status_available_at", "status", "available_at"),
+        CheckConstraint(
+            "status IN ('queued', 'running', 'awaiting_approval', "
+            "'succeeded', 'failed', 'failed_uncertain')",
+            name="ck_agent_jobs_status",
+        ),
+        Index(
+            "ix_agent_jobs_status_available_at",
+            "status",
+            "available_at",
+            "id",
+        ),
         Index("ix_agent_jobs_running_lease", "status", "lease_expires_at"),
     )
 
@@ -167,6 +202,11 @@ class IdempotencyRecord(TimestampedModel, Base):
     __tablename__ = "idempotency_records"
     __table_args__ = (
         UniqueConstraint("tenant_id", "key", name="uq_idempotency_records_tenant_id_key"),
+        UniqueConstraint(
+            "tenant_id",
+            "job_id",
+            name="uq_idempotency_records_tenant_id_job_id",
+        ),
         ForeignKeyConstraint(
             ["tenant_id", "case_id"],
             ["intake_cases.tenant_id", "intake_cases.id"],
@@ -213,12 +253,11 @@ class Approval(TimestampedModel, Base):
             "status IN ('pending', 'approved', 'rejected', 'expired')",
             name="ck_approvals_status",
         ),
-        Index("ix_approvals_tenant_id_id", "tenant_id", "id"),
         Index(
             "ix_approvals_pending_expires_at",
-            "tenant_id",
             "status",
             "expires_at",
+            "id",
         ),
     )
 

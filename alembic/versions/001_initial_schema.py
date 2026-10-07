@@ -52,6 +52,10 @@ def upgrade() -> None:
             nullable=False,
         ),
         *timestamps(),
+        sa.CheckConstraint(
+            "status IN ('active', 'inactive')",
+            name="ck_tenants_status",
+        ),
     )
 
     op.create_table(
@@ -85,6 +89,14 @@ def upgrade() -> None:
         ),
         sa.Column("actor_ref", sa.String(255)),
         *timestamps(),
+        sa.CheckConstraint(
+            "principal_type IN ('service', 'operator')",
+            name="ck_api_keys_principal_type",
+        ),
+        sa.CheckConstraint(
+            "capability IN ('none', 'approval_decider')",
+            name="ck_api_keys_capability",
+        ),
     )
     op.create_index("ix_api_keys_tenant_id_id", "api_keys", ["tenant_id", "id"])
 
@@ -109,8 +121,17 @@ def upgrade() -> None:
         ),
         *timestamps(),
         sa.UniqueConstraint("tenant_id", "id", name="uq_customers_tenant_id_id"),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "email",
+            name="uq_customers_tenant_id_email",
+        ),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "external_id",
+            name="uq_customers_tenant_id_external_id",
+        ),
     )
-    op.create_index("ix_customers_tenant_id_id", "customers", ["tenant_id", "id"])
 
     op.create_table(
         "intake_cases",
@@ -151,11 +172,10 @@ def upgrade() -> None:
             ["customers.tenant_id", "customers.id"],
             name="fk_intake_cases_tenant_customer",
         ),
-    )
-    op.create_index(
-        "ix_intake_cases_tenant_id_id",
-        "intake_cases",
-        ["tenant_id", "id"],
+        sa.CheckConstraint(
+            "status IN ('received')",
+            name="ck_intake_cases_status",
+        ),
     )
 
     op.create_table(
@@ -240,16 +260,16 @@ def upgrade() -> None:
         *timestamps(),
         sa.UniqueConstraint("tenant_id", "id", name="uq_agent_jobs_tenant_id_id"),
         sa.UniqueConstraint("trace_id", name="uq_agent_jobs_trace_id"),
-    )
-    op.create_index(
-        "ix_agent_jobs_tenant_id_id",
-        "agent_jobs",
-        ["tenant_id", "id"],
+        sa.CheckConstraint(
+            "status IN ('queued', 'running', 'awaiting_approval', "
+            "'succeeded', 'failed', 'failed_uncertain')",
+            name="ck_agent_jobs_status",
+        ),
     )
     op.create_index(
         "ix_agent_jobs_status_available_at",
         "agent_jobs",
-        ["status", "available_at"],
+        ["status", "available_at", "id"],
     )
     op.create_index(
         "ix_agent_jobs_running_lease",
@@ -281,6 +301,11 @@ def upgrade() -> None:
             "tenant_id",
             "key",
             name="uq_idempotency_records_tenant_id_key",
+        ),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "job_id",
+            name="uq_idempotency_records_tenant_id_job_id",
         ),
         sa.ForeignKeyConstraint(
             ["tenant_id", "case_id"],
@@ -355,11 +380,10 @@ def upgrade() -> None:
             name="ck_approvals_status",
         ),
     )
-    op.create_index("ix_approvals_tenant_id_id", "approvals", ["tenant_id", "id"])
     op.create_index(
         "ix_approvals_pending_expires_at",
         "approvals",
-        ["tenant_id", "status", "expires_at"],
+        ["status", "expires_at", "id"],
     )
 
     op.create_table(
