@@ -49,6 +49,19 @@ def _row(
             "routing_status": "ready",
             "routing_reason": "complete",
             "missing_required_fields": ["contact", "contact"],
+            "execution_path": [
+                {
+                    "step": 1,
+                    "action_key": "create_case",
+                    "action_known": True,
+                    "policy_decision": "allow",
+                    "routing_status": "ready",
+                    "policy_reason": "action_allowed",
+                    "missing_required_fields": [],
+                    "tool_outcome": "executed",
+                    "side_effect_committed": True,
+                }
+            ],
             "tool_result": {"body": "secret"},
         },
         error_code=error_code,
@@ -73,6 +86,21 @@ def test_project_job_read_is_an_allowlisted_source_free_projection(freight_profi
         "scenario_key": "freight_broker",
         "status": "succeeded",
         "attempt_count": 2,
+        "agent_steps": 1,
+        "stop_reason": "final",
+        "execution_path": [
+            {
+                "step": 1,
+                "action_key": "create_case",
+                "action_known": True,
+                "policy_decision": "allow",
+                "routing_status": "ready",
+                "policy_reason": "action_allowed",
+                "missing_required_fields": [],
+                "tool_outcome": "executed",
+                "side_effect_committed": True,
+            }
+        ],
         "routing_status": "ready",
         "routing_reason": "complete",
         "missing_required_fields": ["contact"],
@@ -86,6 +114,47 @@ def test_project_job_read_is_an_allowlisted_source_free_projection(freight_profi
     assert "secret" not in rendered
     assert "final_response" not in rendered
     assert "tool_result" not in rendered
+
+
+def test_project_job_read_keeps_historical_results_without_execution_evidence(
+    freight_profile,
+) -> None:
+    from app.domain.jobs import project_job_read
+
+    row = _row(freight_profile)
+    row.result.pop("execution_path", None)
+    row.result.pop("steps", None)
+    row.result.pop("reason", None)
+
+    safe = project_job_read(row)
+
+    assert safe.agent_steps is None
+    assert safe.stop_reason is None
+    assert safe.execution_path == ()
+
+
+def test_project_job_read_redacts_unknown_action_evidence(freight_profile) -> None:
+    from app.domain.jobs import project_job_read
+
+    row = _row(freight_profile)
+    row.result["execution_path"] = [
+        {
+            "step": 1,
+            "action_key": "model_invented_action",
+            "action_known": False,
+            "policy_decision": "deny",
+            "routing_status": "rejected",
+            "policy_reason": "action_not_configured",
+            "missing_required_fields": [],
+            "tool_outcome": None,
+            "side_effect_committed": False,
+        }
+    ]
+
+    safe = project_job_read(row)
+
+    assert safe.execution_path == ()
+    assert "model_invented_action" not in safe.model_dump_json()
 
 
 @pytest.mark.parametrize(
@@ -161,6 +230,9 @@ def test_job_api_returns_only_safe_own_tenant_projection(monkeypatch, freight_pr
             "routing_status": "ready",
             "routing_reason": "complete",
             "missing_required_fields": [],
+            "steps": 0,
+            "reason": "final",
+            "execution_path": [],
             "final_response": "secret",
         },
         error_code="provider_unavailable",
@@ -200,6 +272,9 @@ def test_job_api_returns_only_safe_own_tenant_projection(monkeypatch, freight_pr
         "scenario_key",
         "status",
         "attempt_count",
+        "agent_steps",
+        "stop_reason",
+        "execution_path",
         "routing_status",
         "routing_reason",
         "missing_required_fields",

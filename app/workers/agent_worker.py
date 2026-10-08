@@ -462,6 +462,7 @@ class AgentWorker:
                             "status": "completed",
                             "reason": "executor_stopped",
                             "steps": 0,
+                            "execution_path": [],
                             "routing_status": result.routing_status.value,
                             "routing_reason": result.reason,
                             "missing_required_fields": list(
@@ -958,30 +959,33 @@ class AgentWorker:
 
     @staticmethod
     def _result_summary(result: AgentRunResult) -> dict[str, object]:
+        execution_path = [
+            {
+                "step": item.step,
+                "action_key": item.action_key,
+                "action_known": item.action_known,
+                "policy_decision": item.policy_decision,
+                "routing_status": item.routing_status,
+                "policy_reason": item.policy_reason,
+                "missing_required_fields": list(item.missing_required_fields),
+                "tool_outcome": item.tool_outcome,
+                "side_effect_committed": item.side_effect_committed,
+            }
+            for item in result.execution_path
+        ]
         summary: dict[str, object] = {
             "status": result.status.value,
             "reason": result.reason.value,
             "steps": result.steps,
+            "execution_path": execution_path,
         }
-        for message in reversed(result.messages):
-            if message.role.value != "tool":
-                continue
-            data = message.tool_result
-            if data is None or not isinstance(data, Mapping):
-                break
-            status = data.get("status")
-            reason = data.get("reason")
-            missing = data.get("missing_required_fields")
-            if (
-                isinstance(status, str)
-                and isinstance(reason, str)
-                and isinstance(missing, list)
-                and all(isinstance(item, str) for item in missing)
-            ):
-                summary["routing_status"] = status
-                summary["routing_reason"] = reason
-                summary["missing_required_fields"] = sorted(missing)
-            break
+        if execution_path:
+            terminal = execution_path[-1]
+            summary["routing_status"] = terminal["routing_status"]
+            summary["routing_reason"] = terminal["policy_reason"]
+            summary["missing_required_fields"] = terminal[
+                "missing_required_fields"
+            ]
         return summary
 
     def _retry_delay(self, attempt_count: int) -> float:

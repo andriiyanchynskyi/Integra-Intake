@@ -17,6 +17,7 @@ if TYPE_CHECKING:
         AgentMessage,
         AgentProposal,
         AgentRunResult,
+        ExecutionPathEntry,
         MessageRole,
         RunStatus,
         StopReason,
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
         ProposalValue,
         ToolData,
         ToolCall,
+        ToolExecutionEvidence,
         ToolExecutionResult,
     )
 
@@ -34,6 +36,7 @@ _MODEL_EXPORTS = {
     "AgentMessage",
     "AgentProposal",
     "AgentRunResult",
+    "ExecutionPathEntry",
     "MessageRole",
     "RunStatus",
     "StopReason",
@@ -43,6 +46,7 @@ _MODEL_EXPORTS = {
     "ProposalValue",
     "ToolData",
     "ToolCall",
+    "ToolExecutionEvidence",
     "ToolExecutionResult",
 }
 _LOOP_EXPORTS = {

@@ -273,6 +273,24 @@ def test_product_docs_describe_safe_live_demo_entrypoints() -> None:
     assert "WORKER_CONCURRENCY" not in readme
     assert runbook.is_file()
     text = runbook.read_text(encoding="utf-8")
+    for scenario in (
+        "body-complete",
+        "body-incomplete",
+        "webhook-body",
+        "webhook-document-txt",
+        "webhook-document-pdf",
+        "webhook-document-malformed",
+        "webhook-duplicate",
+        "webhook-conflict",
+        "direct-case",
+        "approval-decision",
+    ):
+        assert scenario in text
+    assert "--transport webhook" in text
+    assert "--input-file" in text
+    assert "--json" in text
+    assert "pytest evals/test_freight.py -q" in text
+    assert "NOT OBSERVED" in text
     for required in (
         "docker compose down -v",
         "docker compose up -d db",

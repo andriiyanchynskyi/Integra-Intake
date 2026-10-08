@@ -131,10 +131,15 @@ python scripts/live_provider_smoke.py `
   --base-url http://localhost:8000
 ~~~
 
-The smoke submits synthetic intake and returns a source-free terminal job
-projection. The worker is the only Compose service that receives provider
-settings. Provider configuration is optional for the API, database, and direct
-case endpoint; a live-provider intake needs it.
+The smoke submits synthetic intake and returns a human-readable, source-free
+terminal report by default. It includes the accepted endpoint, job and trace
+identity, timing, routing, approval, agent steps, and observed policy/tool path.
+Use `--json` for the same allowlisted machine projection. Use
+`--transport webhook --attachment path/to/file.txt` or `.pdf` to send a local
+fixture through the real signed webhook endpoint. The worker is the only
+Compose service that receives provider settings. Provider configuration is
+optional for the API, database, and direct case endpoint; a live-provider
+intake needs it.
 
 For a clean database reset, the host-worker alternative, all demo profiles,
 approval decisions, and expected evidence, use the
@@ -150,7 +155,7 @@ All tenant endpoints require `X-API-Key` unless noted otherwise.
 | `POST /v1/cases` | Creates a received case directly. Body: `channel`, `subject`, `body`, optional `customer_id` and `extracted_fields`. Returns `201`. |
 | `GET /v1/cases/{case_id}` | Returns a case only for its tenant. Unknown and cross-tenant UUIDs return `404`. |
 | `POST /v1/intake` | Requires `Idempotency-Key`; accepts `channel`, `subject`, and `body`; queues one `AgentJob`; returns `202`. |
-| `GET /v1/jobs/{job_id}` | Returns a tenant-scoped, read-only, source-free job status and result projection. |
+| `GET /v1/jobs/{job_id}` | Returns a tenant-scoped, read-only, source-free job status, routing, approval, and bounded execution-path projection. |
 | `POST /v1/inbound/email/webhook` | Verifies a signed email-like envelope, normalizes its optional attachment, and queues one job. Returns `202`. |
 | `POST /v1/approvals/{approval_id}/decide` | Requires an active operator key with `approval_decider`; accepts `approve` or `reject` and a non-blank reason. |
 

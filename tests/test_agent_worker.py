@@ -14,7 +14,14 @@ import pytest
 import httpx
 import yaml
 
-from app.agent.models import AgentMessage, AgentRunResult, MessageRole, RunStatus, StopReason
+from app.agent.models import (
+    AgentMessage,
+    AgentRunResult,
+    ExecutionPathEntry,
+    MessageRole,
+    RunStatus,
+    StopReason,
+)
 from app.core.config import Settings
 from app.documents import DocumentExtractionError
 from app.domain.approval_repository import ExpiredApprovalObservation
@@ -229,22 +236,30 @@ def test_result_summary_keeps_only_safe_routing_fields_from_terminal_tool_data()
     result = AgentRunResult(
         status=RunStatus.COMPLETED,
         reason=StopReason.EXECUTOR_STOPPED,
-        messages=(
-            AgentMessage(
-                role=MessageRole.TOOL,
-                tool_result={
-                    "status": "awaiting_input",
-                    "reason": "document_unreadable",
-                    "missing_required_fields": ["valid_until", "origin"],
-                    "source": "must not persist",
-                    "document": "must not persist",
-                    "proposal": {"confidence": 0.99},
-                    "source_excerpt": "must not persist",
-                },
-            ),
-        ),
+        messages=(AgentMessage(role=MessageRole.TOOL, tool_result={
+            "status": "awaiting_input",
+            "reason": "document_unreadable",
+            "missing_required_fields": ["valid_until", "origin"],
+            "source": "must not persist",
+            "document": "must not persist",
+            "proposal": {"confidence": 0.99},
+            "source_excerpt": "must not persist",
+        }),),
         steps=2,
         final_response="document_unreadable",
+        execution_path=(
+            ExecutionPathEntry(
+                step=2,
+                action_key="create_case",
+                action_known=True,
+                policy_decision="deny",
+                routing_status="awaiting_input",
+                policy_reason="document_unreadable",
+                missing_required_fields=("valid_until", "origin"),
+                tool_outcome=None,
+                side_effect_committed=False,
+            ),
+        ),
     )
 
     summary = AgentWorker._result_summary(result)
@@ -256,6 +271,7 @@ def test_result_summary_keeps_only_safe_routing_fields_from_terminal_tool_data()
         "routing_status",
         "routing_reason",
         "missing_required_fields",
+        "execution_path",
     }
     assert summary == {
         "status": "completed",
@@ -264,6 +280,19 @@ def test_result_summary_keeps_only_safe_routing_fields_from_terminal_tool_data()
         "routing_status": "awaiting_input",
         "routing_reason": "document_unreadable",
         "missing_required_fields": ["origin", "valid_until"],
+        "execution_path": [
+            {
+                "step": 2,
+                "action_key": "create_case",
+                "action_known": True,
+                "policy_decision": "deny",
+                "routing_status": "awaiting_input",
+                "policy_reason": "document_unreadable",
+                "missing_required_fields": ["origin", "valid_until"],
+                "tool_outcome": None,
+                "side_effect_committed": False,
+            }
+        ],
     }
 
 
@@ -292,6 +321,7 @@ def test_result_summary_does_not_reuse_routing_data_before_none_tool_result() ->
         "status": "completed",
         "reason": "executor_stopped",
         "steps": 2,
+        "execution_path": [],
     }
 
 
@@ -335,6 +365,7 @@ async def test_persist_result_redacts_document_response_from_job_summary(
         "status": "completed",
         "reason": "executor_stopped",
         "steps": 2,
+        "execution_path": [],
     }
     assert "secret document excerpt" not in repr(summary)
 
@@ -402,11 +433,12 @@ async def test_serve_once_runs_loop_through_injected_to_thread_seam(
     succeeded = [entry for entry in repository.calls if entry[0] == "mark_succeeded"]
     assert succeeded
     summary = succeeded[-1][1][0][1]  # type: ignore[index]
-    assert set(summary) == {"status", "reason", "steps"}
+    assert set(summary) == {"status", "reason", "steps", "execution_path"}
     assert summary == {
         "status": "completed",
         "reason": "final",
         "steps": 2,
+        "execution_path": [],
     }
 
 
@@ -527,6 +559,7 @@ async def test_terminal_unreadable_preflight_is_persisted_as_safe_success(
         "routing_status": "awaiting_input",
         "routing_reason": "document_unreadable",
         "missing_required_fields": ["required_field"],
+        "execution_path": [],
     }
     assert "synthetic_document" not in repr(summary)
     assert not [entry for entry in repository.calls if entry[0] == "mark_failed"]

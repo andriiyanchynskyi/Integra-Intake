@@ -19,6 +19,7 @@ from app.agent import (
     ProposalToolCall,
     ProposalValue,
     ToolCall,
+    ToolExecutionEvidence,
     ToolExecutionResult,
 )
 from app.documents import (
@@ -538,6 +539,16 @@ def test_create_case_uses_trusted_source_and_only_declared_fields(
         "summary": "declared summary",
         "contact": "customer@example.com",
     }
+    assert created.evidence == ToolExecutionEvidence(
+        action_key="create_case",
+        action_known=True,
+        policy_decision="allow",
+        routing_status="ready",
+        policy_reason="action_allowed",
+        missing_required_fields=(),
+        tool_outcome="executed",
+        side_effect_committed=True,
+    )
 
 
 def test_document_candidates_with_exact_verified_excerpts_can_create_case(
@@ -612,6 +623,16 @@ def test_document_candidates_without_matching_excerpts_await_input_without_mutat
     assert port.calls == []
     assert port.approval_requests == []
     assert port.cases == {}
+    assert result.evidence == ToolExecutionEvidence(
+        action_key="create_case",
+        action_known=True,
+        policy_decision="deny",
+        routing_status="awaiting_input",
+        policy_reason="missing_required_fields",
+        missing_required_fields=("summary",),
+        tool_outcome=None,
+        side_effect_committed=False,
+    )
 
 
 def test_document_injection_signal_preserves_review_precedence(
@@ -644,6 +665,16 @@ def test_document_injection_signal_preserves_review_precedence(
     assert port.calls == []
     assert port.cases == {}
     assert len(port.approval_requests) == 1
+    assert result.evidence == ToolExecutionEvidence(
+        action_key="create_case",
+        action_known=True,
+        policy_decision="needs_approval",
+        routing_status="urgent",
+        policy_reason="safety_or_legal_risk",
+        missing_required_fields=(),
+        tool_outcome=None,
+        side_effect_committed=False,
+    )
 
 
 def test_unreadable_document_awaits_input_without_handler_or_approval(
@@ -701,6 +732,10 @@ def test_create_case_rejects_malicious_source_arguments_and_extra_keys(
     assert result.data == {"outcome": "tool_arguments_invalid"}
     assert result.continue_run is False
     assert port.cases == {}
+    assert result.evidence is not None
+    assert result.evidence.policy_decision == "allow"
+    assert result.evidence.tool_outcome == "invalid_arguments"
+    assert result.evidence.side_effect_committed is False
 
 
 def test_create_case_rejects_cross_tenant_customer_without_mutation(
@@ -765,6 +800,10 @@ def test_backend_exception_is_sanitized_and_stops_execution(
     assert result.final_response == "tool_execution_failed"
     assert "secret-token" not in repr(result.data)
     assert "do-not-leak" not in repr(result.data)
+    assert result.evidence is not None
+    assert result.evidence.policy_decision == "allow"
+    assert result.evidence.tool_outcome == "backend_failure"
+    assert result.evidence.side_effect_committed is False
 
 
 def test_policy_and_tool_events_are_typed_and_content_free(
@@ -841,6 +880,11 @@ def test_unknown_model_action_emits_known_flag_without_raw_name(
     assert observer.events[0].action_key is None
     assert observer.events[0].action_known is False
     assert unknown_action not in observer.events[0].model_dump_json()
+    assert result.evidence is not None
+    assert result.evidence.action_key is None
+    assert result.evidence.action_known is False
+    assert result.evidence.policy_decision == "deny"
+    assert result.evidence.tool_outcome is None
 
 
 def test_approval_event_is_emitted_after_durable_request_without_payload(
@@ -919,6 +963,9 @@ def test_tool_events_distinguish_none_result_and_backend_failure(
     ][-1]
     assert none_event.result_is_none is True
     assert none_event.outcome is OutcomeCode.NO_RESULT
+    assert none_result.evidence is not None
+    assert none_result.evidence.tool_outcome == "no_result"
+    assert none_result.evidence.side_effect_committed is False
 
     failure_observer = RecordingObserver()
     failure_executor, _ = build_executor(

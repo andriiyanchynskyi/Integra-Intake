@@ -6,7 +6,7 @@ import math
 
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Annotated
 
@@ -179,6 +179,7 @@ class ToolExecutionResult:
     continue_run: bool | None = None
     final_response: str | None = None
     disposition: ToolExecutionDisposition | None = None
+    evidence: ToolExecutionEvidence | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", _freeze_data(self.data))
@@ -201,6 +202,63 @@ class ToolExecutionResult:
         )
         if disposition is ToolExecutionDisposition.CONTINUE and self.final_response is not None:
             raise ValueError("continuing execution cannot set final_response")
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecutionEvidence:
+    """Closed policy/tool facts carried with one tool execution result."""
+
+    action_key: str | None
+    action_known: bool
+    policy_decision: str
+    routing_status: str
+    policy_reason: str
+    missing_required_fields: tuple[str, ...] = ()
+    tool_outcome: str | None = None
+    side_effect_committed: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "missing_required_fields",
+            tuple(sorted(set(self.missing_required_fields))),
+        )
+        if self.action_known != (self.action_key is not None):
+            raise ValueError("known action evidence requires an action key")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionPathEntry:
+    """One bounded agent-step projection of policy and tool execution."""
+
+    step: int
+    action_key: str | None
+    action_known: bool
+    policy_decision: str
+    routing_status: str
+    policy_reason: str
+    missing_required_fields: tuple[str, ...] = ()
+    tool_outcome: str | None = None
+    side_effect_committed: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "missing_required_fields",
+            tuple(sorted(set(self.missing_required_fields))),
+        )
+        if self.action_known != (self.action_key is not None):
+            raise ValueError("known action evidence requires an action key")
+
+    @classmethod
+    def from_tool(
+        cls,
+        step: int,
+        evidence: ToolExecutionEvidence,
+    ) -> "ExecutionPathEntry":
+        if step < 1:
+            raise ValueError("execution path step must be positive")
+        return cls(step=step, **asdict(evidence))
 
 
 class ProposalPriority(str, Enum):
@@ -326,3 +384,4 @@ class AgentRunResult:
     steps: int
     final_response: str | None
     proposal: AgentProposal | None = None
+    execution_path: tuple[ExecutionPathEntry, ...] = ()

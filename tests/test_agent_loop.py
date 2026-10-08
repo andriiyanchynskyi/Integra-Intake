@@ -13,6 +13,7 @@ from app.agent import (
     AgentLoop,
     AgentMessage,
     AgentProposal,
+    ExecutionPathEntry,
     MAX_STEPS,
     MessageRole,
     ProposalPriority,
@@ -22,6 +23,7 @@ from app.agent import (
     ToolCall,
     ToolData,
     ToolExecutionDisposition,
+    ToolExecutionEvidence,
     ToolExecutionResult,
 )
 from app.observability import EventName, ObservationContext, RecordingObserver
@@ -358,6 +360,56 @@ def test_executor_stopped_result_appends_data_once_and_preserves_response() -> N
     assert len(tool_messages) == 1
     assert tool_messages[0].tool_call == tool_call
     assert tool_messages[0].tool_result == {"draft_id": "draft-1"}
+
+
+def test_agent_loop_attaches_step_to_typed_tool_evidence() -> None:
+    tool_call = ToolCall(name="create_case")
+    tool_proposal = _proposal(
+        rationale="Creating the case",
+        tool_call=tool_call,
+    )
+    tools = StoppingFakeToolExecutor(
+        ToolExecutionResult(
+            data={"outcome": "executed"},
+            continue_run=False,
+            final_response="Case created",
+            evidence=ToolExecutionEvidence(
+                action_key="create_case",
+                action_known=True,
+                policy_decision="allow",
+                routing_status="ready",
+                policy_reason="action_allowed",
+                missing_required_fields=(),
+                tool_outcome="executed",
+                side_effect_committed=True,
+            ),
+        )
+    )
+
+    result = AgentLoop(FakeLLM([tool_proposal]), tools).run([])
+
+    assert result.execution_path == (
+        ExecutionPathEntry(
+            step=1,
+            action_key="create_case",
+            action_known=True,
+            policy_decision="allow",
+            routing_status="ready",
+            policy_reason="action_allowed",
+            missing_required_fields=(),
+            tool_outcome="executed",
+            side_effect_committed=True,
+        ),
+    )
+
+
+def test_agent_loop_keeps_execution_path_empty_without_tool_evidence() -> None:
+    result = AgentLoop(
+        FakeLLM([_proposal(rationale="Finished")]),
+        FakeToolExecutor(),
+    ).run([])
+
+    assert result.execution_path == ()
 
 
 def test_tool_execution_failure_returns_failed_run_without_backend_details() -> None:

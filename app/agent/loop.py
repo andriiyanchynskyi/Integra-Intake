@@ -10,6 +10,7 @@ from app.agent.models import (
     AgentMessage,
     AgentProposal,
     AgentRunResult,
+    ExecutionPathEntry,
     MessageRole,
     RunStatus,
     StopReason,
@@ -73,6 +74,7 @@ class AgentLoop:
     def run(self, initial_messages: Sequence[AgentMessage]) -> AgentRunResult:
         messages = deepcopy(list(initial_messages))
         steps = 0
+        execution_path: list[ExecutionPathEntry] = []
         previous_tool_call: ToolCall | None = None
         consecutive_tool_calls = 0
 
@@ -111,6 +113,7 @@ class AgentLoop:
                     steps=steps,
                     final_response=proposal.rationale_short,
                     proposal=deepcopy(proposal),
+                    execution_path=tuple(execution_path),
                     )
                 )
 
@@ -123,6 +126,7 @@ class AgentLoop:
                     messages=tuple(deepcopy(messages)),
                     steps=steps,
                     final_response=None,
+                    execution_path=tuple(execution_path),
                     )
                 )
 
@@ -145,6 +149,7 @@ class AgentLoop:
                     messages=tuple(deepcopy(messages)),
                     steps=steps,
                     final_response=None,
+                    execution_path=tuple(execution_path),
                     )
                 )
 
@@ -156,6 +161,10 @@ class AgentLoop:
             execution = self.tools.execute(
                 deepcopy(proposal), deepcopy(tool_call)
             )
+            if execution.evidence is not None:
+                execution_path.append(
+                    ExecutionPathEntry.from_tool(steps, execution.evidence)
+                )
             messages.append(
                 AgentMessage(
                     role=MessageRole.TOOL,
@@ -173,6 +182,7 @@ class AgentLoop:
                         steps=steps,
                         final_response=execution.final_response,
                         proposal=deepcopy(proposal),
+                        execution_path=tuple(execution_path),
                     )
                 )
 
@@ -185,6 +195,7 @@ class AgentLoop:
                         steps=steps,
                         final_response=execution.final_response,
                         proposal=deepcopy(proposal),
+                        execution_path=tuple(execution_path),
                     )
                 )
 
@@ -195,6 +206,7 @@ class AgentLoop:
                 messages=tuple(deepcopy(messages)),
                 steps=steps,
                 final_response=None,
+                execution_path=tuple(execution_path),
             )
         )
 

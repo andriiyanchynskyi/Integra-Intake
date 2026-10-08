@@ -10,8 +10,14 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from app.observability.events import WorkerErrorCode
+from app.agent.models import StopReason
+from app.observability.events import OutcomeCode, PolicyReason, WorkerErrorCode
 from app.runtime.profiles import resolve_persisted_profile
+from app.tenants.config import RoutingDecision, RoutingStatus
+from app.tenants.identifiers import SafeIdentifier
+
+
+MAX_EXECUTION_STEPS = 8
 
 
 JobStatus = Literal[
@@ -53,6 +59,20 @@ class ApprovalRead(BaseModel):
     status: str
 
 
+class ExecutionPathRead(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    step: int
+    action_key: SafeIdentifier | None
+    action_known: bool
+    policy_decision: RoutingDecision
+    routing_status: RoutingStatus
+    policy_reason: PolicyReason
+    missing_required_fields: tuple[SafeIdentifier, ...] = ()
+    tool_outcome: OutcomeCode | None = None
+    side_effect_committed: bool
+
+
 class JobRead(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -61,6 +81,9 @@ class JobRead(BaseModel):
     scenario_key: str
     status: JobStatus
     attempt_count: int
+    agent_steps: int | None = None
+    stop_reason: StopReason | None = None
+    execution_path: tuple[ExecutionPathRead, ...] = ()
     routing_status: str | None = None
     routing_reason: str | None = None
     missing_required_fields: tuple[str, ...] = ()
@@ -98,6 +121,93 @@ def _safe_result_values(
     )
 
 
+def _safe_execution_values(
+    result: Mapping[str, object] | None,
+    registered_actions: frozenset[str],
+) -> tuple[int | None, StopReason | None, tuple[ExecutionPathRead, ...]]:
+    if result is None or not ("steps" in result or "execution_path" in result):
+        return None, None, ()
+
+    steps = result.get("steps")
+    agent_steps = (
+        steps
+        if isinstance(steps, int)
+        and not isinstance(steps, bool)
+        and 0 <= steps <= MAX_EXECUTION_STEPS
+        else None
+    )
+    stop_reason = None
+    raw_reason = result.get("reason")
+    if isinstance(raw_reason, str):
+        try:
+            stop_reason = StopReason(raw_reason)
+        except ValueError:
+            pass
+
+    raw_path = result.get("execution_path")
+    if raw_path is None:
+        return agent_steps, stop_reason, ()
+    if not isinstance(raw_path, list) or len(raw_path) > MAX_EXECUTION_STEPS:
+        return agent_steps, stop_reason, ()
+
+    path: list[ExecutionPathRead] = []
+    previous_step = 0
+    expected_keys = {
+        "step",
+        "action_key",
+        "action_known",
+        "policy_decision",
+        "routing_status",
+        "policy_reason",
+        "missing_required_fields",
+        "tool_outcome",
+        "side_effect_committed",
+    }
+    for item in raw_path:
+        if not isinstance(item, Mapping) or set(item) != expected_keys:
+            return agent_steps, stop_reason, ()
+        step = item.get("step")
+        action_known = item.get("action_known")
+        action_key = item.get("action_key")
+        missing = item.get("missing_required_fields")
+        if (
+            not isinstance(step, int)
+            or isinstance(step, bool)
+            or not 1 <= step <= MAX_EXECUTION_STEPS
+            or step <= previous_step
+            or not isinstance(action_known, bool)
+            or (action_known and not isinstance(action_key, str))
+            or (not action_known and action_key is not None)
+            or (action_known and action_key not in registered_actions)
+            or not isinstance(missing, list)
+            or not all(isinstance(value, str) for value in missing)
+            or not isinstance(item.get("side_effect_committed"), bool)
+        ):
+            return agent_steps, stop_reason, ()
+        try:
+            path.append(
+                ExecutionPathRead(
+                    step=step,
+                    action_key=action_key,
+                    action_known=action_known,
+                    policy_decision=RoutingDecision(item["policy_decision"]),
+                    routing_status=RoutingStatus(item["routing_status"]),
+                    policy_reason=PolicyReason(item["policy_reason"]),
+                    missing_required_fields=tuple(sorted(set(missing))),
+                    tool_outcome=(
+                        None
+                        if item["tool_outcome"] is None
+                        else OutcomeCode(item["tool_outcome"])
+                    ),
+                    side_effect_committed=item["side_effect_committed"],
+                )
+            )
+        except (TypeError, ValueError):
+            return agent_steps, stop_reason, ()
+        previous_step = step
+    return agent_steps, stop_reason, tuple(path)
+
+
 def project_job_read(row: PersistedJobRead) -> JobRead:
     """Resolve trusted identity and return only the closed public read model."""
 
@@ -113,6 +223,15 @@ def project_job_read(row: PersistedJobRead) -> JobRead:
         else profile.config.scenario_key
     )
     routing_status, routing_reason, missing = _safe_result_values(row.result)
+    registered_actions = (
+        profile.compiled.registered_actions
+        if profile.compiled is not None
+        else frozenset(profile.config.action_policy)
+    )
+    agent_steps, stop_reason, execution_path = _safe_execution_values(
+        row.result,
+        registered_actions,
+    )
     approval = None
     if row.approval_id is not None and isinstance(row.approval_status, str):
         approval = ApprovalRead(
@@ -125,6 +244,9 @@ def project_job_read(row: PersistedJobRead) -> JobRead:
         scenario_key=scenario_key,
         status=row.status,
         attempt_count=row.attempt_count,
+        agent_steps=agent_steps,
+        stop_reason=stop_reason,
+        execution_path=execution_path,
         routing_status=routing_status,
         routing_reason=routing_reason,
         missing_required_fields=missing,
@@ -138,6 +260,7 @@ def project_job_read(row: PersistedJobRead) -> JobRead:
 
 __all__ = [
     "ApprovalRead",
+    "ExecutionPathRead",
     "JobRead",
     "JobStatus",
     "PersistedJobRead",

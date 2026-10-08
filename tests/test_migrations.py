@@ -620,19 +620,6 @@ async def assert_tenant_boundaries(connection: AsyncConnection) -> None:
     )
     await assert_integrity_error(
         connection,
-        "INSERT INTO idempotency_records "
-        "(id, tenant_id, key, request_hash, job_id) "
-        "VALUES (:id, :tenant_id, :key, :request_hash, :job_id)",
-        {
-            "id": uuid4(),
-            "tenant_id": tenant_b,
-            "key": "duplicate-job-key",
-            "request_hash": "f" * 64,
-            "job_id": agent_job_b,
-        },
-    )
-    await assert_integrity_error(
-        connection,
         "INSERT INTO tenants (id, slug, name, status) "
         "VALUES (:id, :slug, :name, :status)",
         {
@@ -775,6 +762,19 @@ async def assert_tenant_boundaries(connection: AsyncConnection) -> None:
             "tenant_id": tenant_b,
             "key": "job-only-key",
             "request_hash": "e" * 64,
+            "job_id": agent_job_b,
+        },
+    )
+    await assert_integrity_error(
+        connection,
+        "INSERT INTO idempotency_records "
+        "(id, tenant_id, key, request_hash, job_id) "
+        "VALUES (:id, :tenant_id, :key, :request_hash, :job_id)",
+        {
+            "id": uuid4(),
+            "tenant_id": tenant_b,
+            "key": "duplicate-job-key",
+            "request_hash": "f" * 64,
             "job_id": agent_job_b,
         },
     )

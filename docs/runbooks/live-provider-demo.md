@@ -126,7 +126,7 @@ host worker reads provider settings from `.env` and uses `localhost` for
 PostgreSQL. If `.env` changes, recreate the Compose worker with
 `docker compose up -d --force-recreate worker`; an image rebuild is not needed.
 
-## 8. Run the freight body smoke
+## 8. Run live freight intake checks
 
 PowerShell environment variables belong to one terminal process. With Option A,
 run the smoke in the terminal that captured the freight service key. With
@@ -137,11 +137,174 @@ and repeat the freight seed command from Section 6 there before running:
 python scripts/live_provider_smoke.py --profile freight-broker --base-url http://localhost:8000
 ```
 
-The smoke submits synthetic body intake, polls `GET /v1/jobs/{job_id}`, and
-returns the job ID, server trace ID, scenario identity, routing summary,
-approval identity, timestamps, and stable error codes. `succeeded` and
-`awaiting_approval` are valid live outcomes. Provider output can vary, so use
-the safe lifecycle and identity fields as the check.
+The command submits synthetic body intake through the real API, polls
+`GET /v1/jobs/{job_id}`, and prints a human-readable source-free report. Use
+`--json` for the same allowlisted report as one machine-readable object.
+`succeeded` and `awaiting_approval` are valid live outcomes. Provider output can
+vary, so the report shows the path actually observed and prints
+`NOT OBSERVED` when a nullable policy or tool field was not reached.
+
+The named cases below use the real HTTP endpoint and the checked-in synthetic
+fixtures. Run them with one freight service key in the current shell.
+
+### `body-complete`
+
+```powershell
+python scripts/live_provider_smoke.py `
+  --profile freight-broker `
+  --demo-case body-complete `
+  --base-url http://localhost:8000
+```
+
+This checks complete body intake and prints the policy/tool path. Add
+`--expect-path tool` when the demonstration must fail if the live proposal does
+not request a tool.
+
+### `body-incomplete`
+
+```powershell
+python scripts/live_provider_smoke.py `
+  --profile freight-broker `
+  --demo-case body-incomplete `
+  --base-url http://localhost:8000
+```
+
+The case omits `contact` and expects `routing_status=awaiting_input` with
+`missing_required_fields=["contact"]`.
+
+### `webhook-body`
+
+```powershell
+python scripts/live_provider_smoke.py `
+  --profile freight-broker `
+  --demo-case webhook-body `
+  --base-url http://localhost:8000
+```
+
+The command signs the exact JSON bytes and sends them to
+`POST /v1/inbound/email/webhook`. A `202` response and matching job trace prove
+that the real signature and tenant boundary accepted the delivery.
+
+### `webhook-document-txt`
+
+```powershell
+python scripts/live_provider_smoke.py `
+  --profile freight-broker `
+  --demo-case webhook-document-txt `
+  --base-url http://localhost:8000
+```
+
+This sends `evals/fixtures/docs/01-complete-en.txt` as a signed webhook
+attachment and runs document normalization in the worker.
+
+The same real webhook path can use transport selection directly:
+
+```powershell
+python scripts/live_provider_smoke.py `
+  --profile freight-broker `
+  --transport webhook `
+  --attachment evals/fixtures/docs/01-complete-en.txt `
+  --base-url http://localhost:8000
+```
+
+### `webhook-document-pdf`
+
+```powershell
+python scripts/live_provider_smoke.py `
+  --profile freight-broker `
+  --demo-case webhook-document-pdf `
+  --base-url http://localhost:8000
+```
+
+This sends `evals/fixtures/docs/03-complete.pdf` through the same real webhook
+path.
+
+### `webhook-document-malformed`
+
+```powershell
+python scripts/live_provider_smoke.py `
+  --profile freight-broker `
+  --demo-case webhook-document-malformed `
+  --base-url http://localhost:8000
+```
+
+The expected result is `status=succeeded`,
+`routing_reason=document_unreadable`, `agent_steps=0`, an empty execution path,
+and no approval. Deterministic preflight stops the job before provider, tool,
+or approval construction.
+
+### `webhook-duplicate`
+
+```powershell
+python scripts/live_provider_smoke.py `
+  --profile freight-broker `
+  --demo-case webhook-duplicate `
+  --base-url http://localhost:8000
+```
+
+The command sends the same provider delivery twice and requires the second
+response to reuse the first `job_id` and `trace_id`.
+
+### `webhook-conflict`
+
+```powershell
+python scripts/live_provider_smoke.py `
+  --profile freight-broker `
+  --demo-case webhook-conflict `
+  --base-url http://localhost:8000
+```
+
+The second delivery keeps the provider ID but changes the body. The command
+requires `409` and polls the original job separately.
+
+### Custom body input
+
+Create a synthetic JSON input file and send it through the body endpoint:
+
+```powershell
+@'
+{
+  "transport": "intake",
+  "channel": "email",
+  "subject": "Custom freight request",
+  "body": "Origin: Kyiv; destination: Lviv; equipment: dry_van; contact: ops@example.test"
+}
+'@ | Set-Content -LiteralPath .\custom-body.json -Encoding utf8
+
+python scripts/live_provider_smoke.py `
+  --profile freight-broker `
+  --input-file .\custom-body.json `
+  --base-url http://localhost:8000
+```
+
+The input file is read locally and its body is never printed by the smoke.
+
+### Custom webhook input with a file
+
+The attachment remains a local sender-side file. The server receives it only
+through the signed webhook request:
+
+```powershell
+@'
+{
+  "transport": "webhook",
+  "provider_id": "custom-live-message-1",
+  "from_addr": "dispatcher@example.test",
+  "subject": "Custom rate confirmation",
+  "body": "Attached synthetic confirmation",
+  "attachment_path": "evals/fixtures/docs/01-complete-en.txt"
+}
+'@ | Set-Content -LiteralPath .\custom-webhook.json -Encoding utf8
+
+python scripts/live_provider_smoke.py `
+  --profile freight-broker `
+  --input-file .\custom-webhook.json `
+  --base-url http://localhost:8000
+```
+
+Use `--json` when saving the source-free result for automation. Do not save the
+input file, raw document, credential, signature, provider response, or worker
+logs with shared demo evidence.
 
 ### What an ideal verification proves
 
@@ -173,6 +336,11 @@ routing outcome, approval ID when present, and stable error code when present.
 Those fields let another person repeat the run and compare outcomes. Do not
 record the request body, document text, credentials, or provider response.
 
+The live commands prove the real HTTP, PostgreSQL, worker, configured provider,
+and observed policy/tool path. The deterministic freight gate proves all 50
+version-controlled freight cases, including policy branches and adversarial
+inputs that one live provider proposal may not reach.
+
 ## 9. Run the repair-service scenario
 
 Keep the same API, database, and worker. Replace the service key and run only
@@ -202,7 +370,7 @@ The safe scenario identity is `language_school`. Its synthetic
 declares `documents: {}`, so it does not support the freight attachment or
 webhook demonstration.
 
-## 11. Optional freight webhook
+## 11. Optional low-level freight webhook sender
 
 Only `freight-broker` has the registered document capability. Set the webhook
 sender key to the current freight service key and send one synthetic signed
@@ -224,7 +392,36 @@ maps the message through the existing tenant-scoped intake and idempotency
 boundary. A repeated provider ID reuses the existing job; a changed payload
 returns a conflict.
 
-## 12. Optional approval decision
+## 12. direct-case
+
+The direct case endpoint is synchronous. It authenticates the tenant, writes one
+case, and returns `201`; it does not call the worker or provider. Verify the
+created record through the tenant-scoped GET endpoint:
+
+```powershell
+$headers = @{ "X-API-Key" = $env:INTEGRA_DEMO_API_KEY }
+$caseBody = @{
+  channel = "email"
+  subject = "Synthetic direct case"
+  body = "Synthetic freight request"
+} | ConvertTo-Json
+$createdCase = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8000/v1/cases" `
+  -Headers $headers `
+  -ContentType "application/json" `
+  -Body $caseBody
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://localhost:8000/v1/cases/$($createdCase.id)" `
+  -Headers $headers
+```
+
+Capture only the case ID, status, tenant-safe channel, and timestamp in shared
+evidence. The direct response contains the submitted synthetic body by design;
+do not use production data in this demo.
+
+## 13. approval-decision
 
 Run this flow only when the safe smoke result has `status` set to
 `awaiting_approval`. Copy its safe approval identity into `$approvalId` in the
@@ -248,7 +445,26 @@ Read the job again after the decision. Service keys cannot decide approvals;
 operator keys cannot submit service intake. The reason stays in the local
 decision request and is not copied into diagnostic events or demo artifacts.
 
-## 13. Troubleshooting
+Use `decision = "reject"` to demonstrate the other terminal decision. If no
+live smoke result has `status=awaiting_approval` and an approval ID, record
+`SKIPPED: no pending approval`; do not fabricate an ID.
+
+## 14. Deterministic freight gate
+
+Run the provider-free matrix after the live checks:
+
+```powershell
+pytest evals/test_freight.py -q
+```
+
+The command runs 50 cases from
+`evals/datasets/freight.v1.yaml`. Six cases exercise signed-webhook semantics,
+and document cases resolve files from `evals/fixtures/docs/manifest.yaml`.
+The eval runner verifies HMAC and maps webhook messages through application
+services in memory. It does not call the live HTTP endpoint, PostgreSQL,
+worker, or provider; treat it as deterministic behavioral evidence.
+
+## 15. Troubleshooting
 
 - A missing key, invalid key, unavailable model, or unreachable base URL follows
   the stable provider error path. The worker may schedule bounded retries. Do
@@ -266,6 +482,9 @@ decision request and is not copied into diagnostic events or demo artifacts.
   `INTEGRA_DEMO_API_KEY` in the current shell.
 - A polling timeout does not delete or replay the job. Inspect the safe job
   state and JSON event lines, then check worker health and lease expiry.
+- `expected_path_not_observed` means the provider completed through a different
+  safe path than the optional `--expect-path` assertion. Review the printed
+  execution path before rerunning with a stricter expectation.
 - `failed_uncertain` means the system will not replay a possible side effect
   automatically. A backend tool failure persists `tool_execution_failed` and
   never produces `succeeded`.
@@ -281,7 +500,7 @@ Logs, job reads, durable summaries, approval records, and optional reports stay
 source-free. They contain no raw document bytes, base64, source text,
 transcripts, proposal rationale, tool payloads, credentials, or exception text.
 
-## 14. Stop the demo and clear secrets
+## 16. Stop the demo and clear secrets
 
 Stop a host worker with `Ctrl+C` in its terminal. Then stop the Compose stack
 without removing its volume:

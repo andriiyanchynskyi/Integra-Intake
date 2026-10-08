@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping
 from copy import deepcopy
+from dataclasses import replace
 from uuid import uuid4
 
 from pydantic import BaseModel, ValidationError
@@ -14,11 +15,13 @@ from app.agent import (
     ToolCall,
     ToolData,
     ToolExecutionDisposition,
+    ToolExecutionEvidence,
     ToolExecutionResult,
 )
 from app.policy import (
     PolicyEngine,
     PolicyInput,
+    PolicyOutcome,
     TrustedToolRuntimeContext,
 )
 from app.policy.models import proposal_value_is_present
@@ -169,6 +172,35 @@ class PolicyGatedToolExecutor:
             )
         return definitions
 
+    @classmethod
+    def _with_evidence(
+        cls,
+        result: ToolExecutionResult,
+        *,
+        action_key: str,
+        action_known: bool,
+        policy: PolicyOutcome,
+        tool_executed: bool,
+        side_effect_committed: bool = False,
+    ) -> ToolExecutionResult:
+        return replace(
+            result,
+            evidence=ToolExecutionEvidence(
+                action_key=action_key if action_known else None,
+                action_known=action_known,
+                policy_decision=policy.decision.value,
+                routing_status=policy.status.value,
+                policy_reason=policy.reason,
+                missing_required_fields=policy.missing_required_fields,
+                tool_outcome=(
+                    cls._tool_outcome(result.data).value
+                    if tool_executed
+                    else None
+                ),
+                side_effect_committed=side_effect_committed,
+            ),
+        )
+
     def execute(
         self, proposal: AgentProposal, tool_call: ToolCall
     ) -> ToolExecutionResult:
@@ -203,10 +235,17 @@ class PolicyGatedToolExecutor:
                 definition is None
                 or policy.decision is not RoutingDecision.NEEDS_APPROVAL
             ):
-                return ToolExecutionResult(
+                result = ToolExecutionResult(
                     data=policy.as_tool_data(),
                     continue_run=False,
                     final_response=policy.reason,
+                )
+                return self._with_evidence(
+                    result,
+                    action_key=tool_call.name,
+                    action_known=definition is not None,
+                    policy=policy,
+                    tool_executed=False,
                 )
         if definition is None:
             raise AssertionError("allowed action must have a registered tool")
@@ -226,7 +265,13 @@ class PolicyGatedToolExecutor:
                 started_ns=started_ns,
                 side_effect_committed=False,
             )
-            return result
+            return self._with_evidence(
+                result,
+                action_key=definition.name,
+                action_known=True,
+                policy=policy,
+                tool_executed=True,
+            )
         if policy.decision is RoutingDecision.NEEDS_APPROVAL:
             requested = self._port.request_approval(
                 self._runtime.tenant_id,
@@ -240,10 +285,17 @@ class PolicyGatedToolExecutor:
             )
             data = policy.as_tool_data()
             data["approval_id"] = str(requested.id)
-            return ToolExecutionResult(
+            result = ToolExecutionResult(
                 data=data,
                 continue_run=False,
                 final_response="approval_requested",
+            )
+            return self._with_evidence(
+                result,
+                action_key=definition.name,
+                action_known=True,
+                policy=policy,
+                tool_executed=False,
             )
         try:
             result = definition.handler(arguments, proposal, self._runtime)
@@ -254,7 +306,14 @@ class PolicyGatedToolExecutor:
                 started_ns=started_ns,
                 side_effect_committed=definition.commits_side_effect,
             )
-            return execution
+            return self._with_evidence(
+                execution,
+                action_key=definition.name,
+                action_known=True,
+                policy=policy,
+                tool_executed=True,
+                side_effect_committed=definition.commits_side_effect,
+            )
         except _ToolExecutionStop as error:
             execution = ToolExecutionResult(
                 data={"outcome": error.outcome},
@@ -267,7 +326,13 @@ class PolicyGatedToolExecutor:
                 started_ns=started_ns,
                 side_effect_committed=False,
             )
-            return execution
+            return self._with_evidence(
+                execution,
+                action_key=definition.name,
+                action_known=True,
+                policy=policy,
+                tool_executed=True,
+            )
         except CustomerNotFoundError:
             execution = ToolExecutionResult(
                 data={"outcome": "customer_not_found"},
@@ -280,7 +345,13 @@ class PolicyGatedToolExecutor:
                 started_ns=started_ns,
                 side_effect_committed=False,
             )
-            return execution
+            return self._with_evidence(
+                execution,
+                action_key=definition.name,
+                action_known=True,
+                policy=policy,
+                tool_executed=True,
+            )
         except Exception:
             # A tool adapter is a trust boundary.  Never expose backend exception
             # text to the transcript or let an implementation failure escape the loop.
@@ -295,7 +366,13 @@ class PolicyGatedToolExecutor:
                 started_ns=started_ns,
                 side_effect_committed=False,
             )
-            return execution
+            return self._with_evidence(
+                execution,
+                action_key=definition.name,
+                action_known=True,
+                policy=policy,
+                tool_executed=True,
+            )
 
     def _emit_policy(
         self,
