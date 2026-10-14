@@ -102,7 +102,7 @@ class _RecordingEnqueueService:
                     channel=command.document.channel,
                     sender=command.sender,
                     subject=command.document.subject,
-                    body="Document received.",
+                    body=command.document.body,
                     document=normalized,
                 )
             )
@@ -478,7 +478,7 @@ async def test_pdf_attachment_delegates_document_command_and_normalizer_through_
     assert command.sender == "dispatcher@example.test"
     assert len(enqueue.document_sources) == 1
     source = enqueue.document_sources[0]
-    assert source.body == "Document received."
+    assert source.body == message.body
     assert source.sender == "dispatcher@example.test"
     assert source.document == normalized
     source_repr = repr(source)
@@ -665,7 +665,7 @@ async def test_inbound_source_uses_existing_sync_loop_and_policy_boundaries() ->
         _SequenceLLM([proposal("find_customer"), proposal(None)]),
         policy_executor,
     ).run(initial_messages)
-    assert policy_result.reason is StopReason.FINAL
+    assert policy_result.reason is StopReason.EXECUTOR_STOPPED
     assert policy_port.tenant_ids == [message.tenant_id]
 
     class _NoneTool:

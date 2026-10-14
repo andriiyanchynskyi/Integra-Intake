@@ -77,11 +77,26 @@ class RecordingPolicy:
     def __init__(self) -> None:
         self._delegate = PolicyEngine()
         self.outcomes: list[PolicyOutcome] = []
+        self.action_outcomes: list[PolicyOutcome] = []
 
     def evaluate(self, value: PolicyInput) -> PolicyOutcome:
         outcome = self._delegate.evaluate(value)
         self.outcomes.append(outcome)
+        self.action_outcomes.append(outcome)
         return outcome
+
+    def evaluate_terminal(self, value: PolicyInput) -> PolicyOutcome:
+        outcome = self._delegate.evaluate_terminal(value)
+        self.outcomes.append(outcome)
+        return outcome
+
+
+def last_business_outcome(policy: RecordingPolicy) -> PolicyOutcome | None:
+    """Project the outcome for the executed action, not a terminal no-op."""
+
+    if policy.action_outcomes:
+        return policy.action_outcomes[-1]
+    return policy.outcomes[-1] if policy.outcomes else None
 
 
 class _FailingCreateCasePort(InMemoryTenantToolPort):
@@ -236,7 +251,7 @@ def run_agent_contract(
     except ScenarioExecutionError as error:
         extra.append(error.code)
 
-    outcome = policy.outcomes[-1] if policy.outcomes else None
+    outcome = last_business_outcome(policy)
     observation = ScenarioObservation(
         routing_status=outcome.status if outcome is not None else None,
         policy_reason=outcome.reason if outcome is not None else None,
@@ -297,6 +312,7 @@ async def run_scenario_case(
 
 
 __all__ = [
+    "last_business_outcome",
     "RecordingPolicy",
     "ScenarioExecutionError",
     "ScriptedLLM",

@@ -299,3 +299,34 @@ class ApprovalEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class JobArtifact(TimestampedModel, Base):
+    """Tenant-owned operational artifact produced by one intake job."""
+
+    __tablename__ = "job_artifacts"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "job_id",
+            "kind",
+            name="uq_job_artifacts_tenant_job_kind",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "job_id"],
+            ["agent_jobs.tenant_id", "agent_jobs.id"],
+            name="fk_job_artifacts_tenant_job",
+        ),
+        CheckConstraint(
+            "kind IN ('reply_draft', 'review_flag')",
+            name="ck_job_artifacts_kind",
+        ),
+        Index("ix_job_artifacts_tenant_id_id", "tenant_id", "id"),
+        Index("ix_job_artifacts_tenant_id_job_id", "tenant_id", "job_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    job_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    kind: Mapped[str] = mapped_column(String(50), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")

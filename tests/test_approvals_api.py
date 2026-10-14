@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.dialects import postgresql
 
 from app.auth import generate_api_key
-from app.db.models import ApiKey, Approval, ApprovalEvent, Tenant
+from app.db.models import AgentJob, ApiKey, Approval, ApprovalEvent, Tenant
 from app.db.session import get_db_session
 from app.main import app
 from app.tools.models import PendingAction
@@ -47,6 +47,14 @@ class _Result:
     def one_or_none(self) -> object:
         return self.value
 
+    def scalars(self) -> "_Result":
+        return self
+
+    def all(self) -> list[object]:
+        if isinstance(self.value, list):
+            return self.value
+        return [self.value] if self.value is not None else []
+
 
 class _Transaction(AbstractAsyncContextManager["_Transaction"]):
     async def __aenter__(self) -> "_Transaction":
@@ -60,6 +68,7 @@ class _Database:
     def __init__(self) -> None:
         self.tenants: dict[UUID, Tenant] = {}
         self.api_keys: list[ApiKey] = []
+        self.jobs: list[AgentJob] = []
         self.approvals: list[Approval] = []
         self.events: list[ApprovalEvent] = []
 
@@ -110,7 +119,7 @@ class _Database:
             name=action_name,
             version=action_version,
             arguments=arguments or {"customer_id": None},
-            known_fields={"summary": "Create a case"},
+            known_fields={"customer_name": "Create a case"},
         )
         approval = Approval(
             id=uuid4(),
@@ -125,6 +134,20 @@ class _Database:
             tenant_config_sha256=REPAIR_PROFILE_SHA256,
             expires_at=expires_at,
             execution_result=None,
+        )
+        self.jobs.append(
+            AgentJob(
+                id=approval.job_id,
+                tenant_id=tenant_id,
+                trace_id=TRACE_ID,
+                status="awaiting_approval",
+                source_snapshot={"channel": "email", "subject": "Approval", "body": "Approval body"},
+                tenant_config_snapshot=deepcopy(REPAIR_PROFILE_SNAPSHOT),
+                tenant_config_sha256=REPAIR_PROFILE_SHA256,
+                risk_signals={},
+                attempt_count=1,
+                available_at=NOW,
+            )
         )
         self.approvals.append(approval)
         return approval
@@ -165,6 +188,16 @@ class _Session:
         if "FROM agent_jobs" in query:
             job_id = params["id_1"]
             tenant_id = params["tenant_id_1"]
+            job = next(
+                (
+                    candidate
+                    for candidate in self.database.jobs
+                    if candidate.id == job_id and candidate.tenant_id == tenant_id
+                ),
+                None,
+            )
+            if "agent_jobs.status" in query:
+                return _Result(job)
             approval = next(
                 (
                     candidate
@@ -186,8 +219,17 @@ class _Session:
             return _Result(TRACE_ID)
 
         assert "FROM approvals" in query
-        approval_id = params["id_1"]
         tenant_id = params["tenant_id_1"]
+        if "status_1" in params:
+            rows = [
+                candidate
+                for candidate in self.database.approvals
+                if candidate.tenant_id == tenant_id
+                and candidate.status == params["status_1"]
+            ]
+            rows.sort(key=lambda candidate: (candidate.expires_at, candidate.id))
+            return _Result(rows)
+        approval_id = params["id_1"]
         return _Result(
             next(
                 (
@@ -424,3 +466,98 @@ def test_missing_approval_id_returns_404(
     )
 
     assert response.status_code == 404
+
+
+def test_operator_can_read_a_source_free_approval_detail(
+    client: TestClient,
+    database: _Database,
+    operator_key: str,
+) -> None:
+    approval = database.add_approval(TENANT_A)
+
+    response = client.get(
+        f"/v1/approvals/{approval.id}",
+        headers={"X-API-Key": operator_key},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "approval_id": str(approval.id),
+        "job_id": str(approval.job_id),
+        "action": "create_case",
+        "case_id": None,
+        "validated_fields": {"customer_name": "Create a case"},
+        "policy_reason": "approval_required",
+        "expires_at": approval.expires_at.isoformat().replace("+00:00", "Z"),
+        "status": "pending",
+        "result_reference": {},
+        "executable": True,
+        "decided_at": None,
+    }
+    assert "source_snapshot" not in response.text
+    assert "pending_action" not in response.text
+    assert "rationale" not in response.text
+
+
+def test_cross_tenant_approval_detail_is_not_found(
+    client: TestClient,
+    database: _Database,
+    operator_key: str,
+) -> None:
+    approval = database.add_approval(TENANT_B)
+
+    response = client.get(
+        f"/v1/approvals/{approval.id}",
+        headers={"X-API-Key": operator_key},
+    )
+
+    assert response.status_code == 404
+
+
+def test_approval_list_is_tenant_scoped_ordered_and_bounded(
+    client: TestClient,
+    database: _Database,
+    operator_key: str,
+) -> None:
+    first = database.add_approval(
+        TENANT_A,
+        expires_at=NOW + timedelta(minutes=2),
+    )
+    second = database.add_approval(
+        TENANT_A,
+        expires_at=NOW + timedelta(minutes=1),
+    )
+    database.add_approval(TENANT_B, expires_at=NOW)
+
+    response = client.get(
+        "/v1/approvals",
+        headers={"X-API-Key": operator_key},
+        params={"status": "pending", "limit": 1},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["limit"] == 1
+    assert payload["has_more"] is True
+    assert [item["approval_id"] for item in payload["items"]] == [str(second.id)]
+    assert str(first.id) not in response.text or first.id == second.id
+
+
+def test_malformed_legacy_pending_command_is_safe_and_not_executable(
+    client: TestClient,
+    database: _Database,
+    operator_key: str,
+) -> None:
+    approval = database.add_approval(TENANT_A)
+    approval.pending_action = {"known_fields": {"secret": "source text"}}
+
+    response = client.get(
+        f"/v1/approvals/{approval.id}",
+        headers={"X-API-Key": operator_key},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["executable"] is False
+    assert payload["validated_fields"] == {}
+    assert "source text" not in response.text

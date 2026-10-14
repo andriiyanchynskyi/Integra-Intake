@@ -2,7 +2,9 @@
 
 IntegraIntake is a policy-governed, multi-tenant intake service. It accepts
 direct cases, idempotent intake requests, and one signed email-like webhook,
-then processes queued jobs through a dedicated PostgreSQL worker.
+then processes queued jobs through a dedicated PostgreSQL worker. A job reaches
+`awaiting_approval` without a completion timestamp; approve/reject/expiry then
+finalize the same job transactionally.
 
 Tenant profiles define supported fields, documents, and actions. A typed agent
 loop proposes work; server-owned policy and approval rules decide whether an
@@ -20,8 +22,9 @@ action may run. Durable results and diagnostic events remain source-free.
   and an isolated OpenAI-compatible adapter.
 - Deterministic policy, typed tools, and tenant-scoped human approvals for
   controlled side effects.
-- PostgreSQL leases, structured source-free observability, and provider-free
-  regression suites for freight, repair, and language-school scenarios.
+- PostgreSQL leases, bounded worker supervision, structured source-free
+  observability, durable draft/review artifacts, and provider-free regression
+  suites for freight, repair, and language-school scenarios.
 
 ## Architecture
 
@@ -35,7 +38,7 @@ X-API-Key or signed webhook
                 +-> idempotent AgentJob -> PostgreSQL lease
                                           -> worker runtime
                                           -> profile preflight and AgentLoop
-                                          -> policy -> tool, approval, or result
+                                          -> policy -> tool, approval, artifact, or result
 ~~~
 
 | Component | Responsibility |
@@ -91,10 +94,8 @@ docker compose up -d api worker
 
 Wait until `docker compose ps db` reports the database as healthy, then apply
 the migration. Check `http://localhost:8000/health` after the stack starts.
-The first release starts new databases from `001_initial_schema`; it cannot
-upgrade the retired development chain. Keep that baseline immutable and add
-append-only revisions for later schema changes. API and worker startup never
-applies migrations.
+The release applies the append-only `002_job_artifacts` revision after
+`001_initial_schema`. API and worker startup never applies migrations.
 
 ### 3. Create a demo service key
 
@@ -156,8 +157,11 @@ All tenant endpoints require `X-API-Key` unless noted otherwise.
 | `GET /v1/cases/{case_id}` | Returns a case only for its tenant. Unknown and cross-tenant UUIDs return `404`. |
 | `POST /v1/intake` | Requires `Idempotency-Key`; accepts `channel`, `subject`, and `body`; queues one `AgentJob`; returns `202`. |
 | `GET /v1/jobs/{job_id}` | Returns a tenant-scoped, read-only, source-free job status, routing, approval, and bounded execution-path projection. |
+| `GET /v1/approvals?status=pending&limit=100` | Operator-only, tenant-scoped bounded approval review list ordered by expiry. |
+| `GET /v1/approvals/{approval_id}` | Operator-only, tenant-scoped validated approval projection. Cross-tenant IDs return `404`. |
 | `POST /v1/inbound/email/webhook` | Verifies a signed email-like envelope, normalizes its optional attachment, and queues one job. Returns `202`. |
 | `POST /v1/approvals/{approval_id}/decide` | Requires an active operator key with `approval_decider`; accepts `approve` or `reject` and a non-blank reason. |
+| `GET /v1/artifacts/{artifact_id}` | Returns a tenant-scoped typed `reply_draft` or `review_flag` artifact referenced by a job. |
 
 ### Signed inbound webhook
 
@@ -170,6 +174,14 @@ The envelope carries `provider_id`, `from_addr`, `subject`, `body`, and an
 optional attachment. The server supplies `tenant_id` and `channel=email_webhook`.
 Duplicate provider IDs reuse the original job; a changed delivery with the
 same ID returns `409`.
+
+Body values take precedence over attachment values when both sources provide a
+field. The server verifies the declared source excerpt and profile field type;
+the provider cannot grant permission by changing provenance. A normal intake
+job exposes tenant-checked `case`, `reply_draft`, and `review_flag` references
+in `GET /v1/jobs/{job_id}`. Awaiting-input corrections require a new
+`Idempotency-Key`; reusing the original key with changed content remains a
+conflict.
 
 Ordinary POST bodies are limited to 1 MiB before JSON parsing. Intake and case
 body text is limited to 100,000 characters. Webhook envelopes are limited to
@@ -205,8 +217,10 @@ request and document content, credentials, authorization and signature
 headers, proposals, tool payloads, exception text, and transcripts.
 
 The local scope has no external observability backend, trace table, dashboard,
-alerting, or transcript storage. Case and approval audit records remain the
-durable business history.
+alerting, or transcript storage. Case, approval, and operational artifact
+records remain the durable business history. Retention of those records is a
+deployment policy; telemetry redaction does not delete or shorten business
+record retention.
 
 ## Configuration
 
@@ -225,6 +239,15 @@ of source control and logs.
 | `WORKER_POLL_INTERVAL_SECONDS` | `0.5` | Idle worker polling interval. |
 | `WORKER_LEASE_SECONDS` | `60` | Job lease duration. |
 | `WORKER_MAX_RETRIES` | `4` | Retry limit for recoverable jobs. |
+| `WORKER_JOB_TIMEOUT_SECONDS` | `120` | Whole-job execution deadline. |
+| `WORKER_GATEWAY_TIMEOUT_SECONDS` | `15` | Synchronous tool-to-owner-loop deadline. |
+| `WORKER_SHUTDOWN_GRACE_SECONDS` | `10` | Grace period for cooperative cancellation. |
+| `WORKER_PERSISTENCE_BACKOFF_INITIAL_SECONDS` | `0.5` | Initial transient persistence backoff. |
+| `WORKER_PERSISTENCE_BACKOFF_MAX_SECONDS` | `30` | Maximum transient persistence backoff. |
+| `DATABASE_STATEMENT_TIMEOUT_MS` | `10000` | PostgreSQL statement budget for worker/API connections. |
+| `DATABASE_LOCK_TIMEOUT_MS` | `5000` | PostgreSQL lock wait budget. |
+| `DOCUMENT_PARSE_TIMEOUT_SECONDS` | `15` | Per-document normalization deadline. |
+| `DOCUMENT_PARSE_CONCURRENCY` | `2` | Process-local document parser concurrency. |
 | `APPROVAL_TIMEOUT_SECONDS` | `86400` | Approval deadline in seconds. |
 
 ## Testing
@@ -234,6 +257,7 @@ Run the provider-free checks:
 ~~~bash
 pytest -q
 pytest evals/test_freight.py -q
+python scripts/verify_release_artifact.py --output dist/integra-intake-release.zip
 git diff --check
 ~~~
 

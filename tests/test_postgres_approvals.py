@@ -313,7 +313,7 @@ async def test_create_for_running_job_locks_tenant_attempt_and_parks_job() -> No
     )
 
     assert job.status == "awaiting_approval"
-    assert job.finished_at == now
+    assert job.finished_at is None
     assert job.lease_expires_at is None
     assert job.error_code is None
     assert job.result == {
@@ -553,6 +553,15 @@ async def test_postgres_approval_approve_create_case_is_atomic_and_idempotent(
     assert approval is not None
     assert approval.case_id == cases[0].id
     assert persisted_job is not None
+    assert persisted_job.status == "succeeded"
+    assert persisted_job.finished_at == first_clock
+    assert persisted_job.error_code is None
+    assert persisted_job.result == {
+        "business_outcome": "tool_result",
+        "approval_id": str(requested.id),
+        "approval_status": "approved",
+        "result_reference": {"case_id": str(cases[0].id)},
+    }
     assert persisted_job.side_effect_committed_at is not None
     assert persisted_idempotency is not None
     assert persisted_idempotency.case_id == cases[0].id

@@ -7,7 +7,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
-from app.agent import ToolData
+from app.agent import ResultReference, ToolData
 from app.policy import TrustedSource
 from app.tools.models import (
     ApprovalRequested,
@@ -26,6 +26,8 @@ class InMemoryTenantToolPort:
         self.customers: dict[UUID, _CustomerRecord] = {}
         self.cases: dict[UUID, _CaseRecord] = {}
         self.approval_requests: list[tuple[UUID, PendingAction, str]] = []
+        self.artifacts: dict[tuple[UUID, UUID, str], dict[str, object]] = {}
+        self._default_job_id = uuid4()
 
     def add_customer(
         self,
@@ -147,3 +149,54 @@ class InMemoryTenantToolPort:
             id=approval_id,
             expires_at=datetime.now(timezone.utc) + timedelta(days=1),
         )
+
+    def create_reply_draft(
+        self,
+        tenant_id: UUID,
+        *,
+        job_id: UUID | None,
+        recipient: str | None,
+        subject: str,
+        body: str,
+    ) -> ResultReference:
+        return self._create_artifact(
+            tenant_id,
+            job_id=job_id,
+            kind="reply_draft",
+            payload={
+                "recipient": recipient,
+                "subject": subject,
+                "body": body,
+            },
+        )
+
+    def flag_for_review(
+        self,
+        tenant_id: UUID,
+        *,
+        job_id: UUID | None,
+        reason: str,
+    ) -> ResultReference:
+        return self._create_artifact(
+            tenant_id,
+            job_id=job_id,
+            kind="review_flag",
+            payload={"reason": reason},
+        )
+
+    def _create_artifact(
+        self,
+        tenant_id: UUID,
+        *,
+        job_id: UUID | None,
+        kind: str,
+        payload: dict[str, object],
+    ) -> ResultReference:
+        identifier = job_id or self._default_job_id
+        key = (tenant_id, identifier, kind)
+        existing = self.artifacts.get(key)
+        if existing is not None:
+            return ResultReference(kind=kind, id=existing["id"])  # type: ignore[arg-type]
+        artifact_id = uuid4()
+        self.artifacts[key] = {"id": artifact_id, "payload": deepcopy(payload)}
+        return ResultReference(kind=kind, id=artifact_id)

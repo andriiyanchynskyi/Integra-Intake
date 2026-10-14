@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 
 from app.api.approvals import router as approvals_router
+from app.api.artifacts import router as artifacts_router
 from app.api.body_limit import RequestBodyLimitMiddleware
 from app.api.cases import router as cases_router
 from app.api.inbound import router as inbound_router
@@ -27,6 +28,7 @@ app.include_router(cases_router, prefix="/v1")
 app.include_router(intake_router, prefix="/v1")
 app.include_router(inbound_router, prefix="/v1")
 app.include_router(approvals_router, prefix="/v1")
+app.include_router(artifacts_router, prefix="/v1")
 app.include_router(jobs_router, prefix="/v1")
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+import threading
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -90,6 +91,7 @@ class TrustedToolRuntimeContext:
     case_id: UUID | None = None
     risk_signals: RiskSignals = field(default_factory=RiskSignals)
     job_id: UUID | None = None
+    cancellation_event: threading.Event | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +104,7 @@ class PolicyInput:
     registered_actions: frozenset[str]
     runtime: TrustedToolRuntimeContext
     verified_present_fields: frozenset[str] | None = None
+    invalid_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

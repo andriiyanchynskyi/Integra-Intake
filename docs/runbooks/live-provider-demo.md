@@ -66,9 +66,10 @@ docker compose run --rm api alembic current
 docker compose run --rm api alembic heads
 ```
 
-The current and head revisions must report `001_initial_schema`. This first
-release targets databases created from scratch. Treat that revision as
-immutable; future schema changes add append-only revisions.
+The current and head revisions must report `002_job_artifacts`. The migration
+chain is append-only: `001_initial_schema` creates the core tables and
+`002_job_artifacts` adds durable reply-draft and review-flag results. Treat
+applied revisions as immutable; future schema changes add a new revision.
 
 ## 5. Start and verify the API
 
@@ -81,6 +82,11 @@ Invoke-RestMethod http://localhost:8000/health
 
 The response must report `status = ok`. The API startup command does not apply
 migrations.
+
+The worker readiness probe runs a bounded `SELECT 1` with the configured
+statement and lock timeouts. Compose restarts the worker after process failure;
+the worker also retries transient persistence outages with bounded jittered
+backoff.
 
 ## 6. Provision the freight demo tenant
 
@@ -143,6 +149,11 @@ The command submits synthetic body intake through the real API, polls
 `succeeded` and `awaiting_approval` are valid live outcomes. Provider output can
 vary, so the report shows the path actually observed and prints
 `NOT OBSERVED` when a nullable policy or tool field was not reached.
+
+An `awaiting_approval` job has `finished_at = null` until an operator approves,
+rejects, or the deadline expires. Approval is terminal: approval completes the
+job with `tool_result`, rejection completes it with `approval_rejected`, and
+expiry fails it with `approval_expired`. There is no hidden model continuation.
 
 The named cases below use the real HTTP endpoint and the checked-in synthetic
 fixtures. Run them with one freight service key in the current shell.
@@ -317,11 +328,11 @@ Use the evidence below to explain each step to another operator:
 
 | Check | Evidence to capture | Why the check matters |
 | --- | --- | --- |
-| Clean release state | `alembic current` reports `001_initial_schema (head)` after a fresh database reset. | The demo cannot rely on retained tables, old revisions, or manual schema changes. |
+| Clean release state | `alembic current` reports `002_job_artifacts (head)` after a fresh database reset. | The demo cannot rely on retained tables, old revisions, or manual schema changes. |
 | API readiness | `/health` responds after the migration completes. | The API connects to the database that received the release schema. |
 | Tenant and profile identity | The seed command uses the selected profile, and the job result reports its expected `scenario_key`. | The server derives tenant access from the API key and applies the checked-in profile rather than request-supplied ownership. |
 | Worker ownership | One selected worker claims the job and emits source-free lifecycle events for the same trace. | Provider access, leases, and result persistence remain in the worker boundary. |
-| End-to-end job lifecycle | The smoke result contains a `job_id`, `trace_id`, terminal status, routing fields, and any approval identity. | Another operator can connect the accepted request, worker execution, and durable result without reading source content. |
+| End-to-end job lifecycle | The smoke result contains a `job_id`, `trace_id`, terminal status, routing fields, approval identity, and typed result references when present. | Another operator can connect the accepted request, worker execution, and durable result without reading source content. |
 | Policy and approval gate | An `awaiting_approval` job has no executed side effect before an authorized operator decides it. | Server policy, not model confidence, controls high-impact actions. |
 | Privacy boundary | Commands, logs, and captured output contain no API keys, source text, documents, transcripts, proposal rationale, or tool payloads. | The demo can be shared as diagnostic evidence without exposing customer data or credentials. |
 
@@ -332,7 +343,8 @@ side effect. A stable failure such as `provider_unavailable` proves that the
 system records a bounded failure without leaking provider or source details.
 
 Record the profile slug, `scenario_key`, `job_id`, `trace_id`, terminal status,
-routing outcome, approval ID when present, and stable error code when present.
+routing outcome, approval ID when present, typed result-reference IDs when
+present, and stable error code when present.
 Those fields let another person repeat the run and compare outcomes. Do not
 record the request body, document text, credentials, or provider response.
 
@@ -449,6 +461,23 @@ Use `decision = "reject"` to demonstrate the other terminal decision. If no
 live smoke result has `status=awaiting_approval` and an approval ID, record
 `SKIPPED: no pending approval`; do not fabricate an ID.
 
+Operator review can inspect pending work without reading the source snapshot:
+
+```powershell
+Invoke-RestMethod `
+  -Uri "http://localhost:8000/v1/approvals?status=pending&limit=20" `
+  -Headers $headers
+```
+
+After a draft or review flag is produced, retrieve its typed artifact with the
+`reply_draft` or `review_flag` ID from the job projection:
+
+```powershell
+Invoke-RestMethod `
+  -Uri "http://localhost:8000/v1/artifacts/$artifactId" `
+  -Headers @{ "X-API-Key" = $env:INTEGRA_DEMO_API_KEY }
+```
+
 ## 14. Deterministic freight gate
 
 Run the provider-free matrix after the live checks:
@@ -495,10 +524,18 @@ worker, or provider; treat it as deterministic behavioral evidence.
   8 MiB and one attachment to 5 MiB.
 - A job lease fences stale attempts. The old attempt cannot persist its result
   after another worker owns the job.
+- A job timeout emits a stable `worker_timeout` retry outcome. A gateway timeout
+  cancels the owner-loop future; the worker waits only for the configured
+  shutdown grace before releasing the attempt.
+- Document normalization is bounded by attachment size, cumulative text,
+  parser concurrency, and `DOCUMENT_PARSE_TIMEOUT_SECONDS`. A timeout returns
+  `document_processing_timeout` without partial text.
 
 Logs, job reads, durable summaries, approval records, and optional reports stay
 source-free. They contain no raw document bytes, base64, source text,
 transcripts, proposal rationale, tool payloads, credentials, or exception text.
+Business cases, approvals, drafts, and review flags remain available through
+their tenant-scoped APIs according to the deployment's retention policy.
 
 ## 16. Stop the demo and clear secrets
 

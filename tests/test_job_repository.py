@@ -187,6 +187,16 @@ class _ReadResult:
     def one_or_none(self) -> tuple[object, ...] | None:
         return self.row
 
+    def scalar_one_or_none(self) -> object | None:
+        if self.row is None:
+            return None
+        if isinstance(self.row, tuple) and len(self.row) == 1:
+            return self.row[0]
+        return None
+
+    def all(self) -> list[tuple[object, ...]]:
+        return []
+
 
 class _ReadSession:
     def __init__(self, row: tuple[object, ...]) -> None:
@@ -196,6 +206,11 @@ class _ReadSession:
     async def execute(self, statement: object) -> _ReadResult:
         compiled = statement.compile(dialect=postgresql.dialect())
         self.queries.append(str(compiled))
+        query = str(compiled)
+        if "FROM idempotency_records" in query:
+            return _ReadResult(None)
+        if "FROM job_artifacts" in query:
+            return _ReadResult(None)
         return _ReadResult(self.row)
 
 

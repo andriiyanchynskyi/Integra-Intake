@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timezone
+import re
 from typing import Literal, Protocol
 from uuid import UUID
 
@@ -17,6 +18,7 @@ from app.domain.approval_repository import (
     ApprovalObservationIdentity,
     ApprovalRepository,
 )
+from app.domain.artifact_repository import ArtifactRepository
 from app.observability import (
     Component,
     EventLevel,
@@ -28,12 +30,15 @@ from app.observability import (
     OutcomeCode,
     safe_emit,
 )
+from app.observability.events import PolicyReason
 from app.tools.models import PendingAction
 from app.tools.registry import (
     ActionCapabilityUnavailable,
     ActionRegistry,
     BUILTIN_ACTION_REGISTRY,
 )
+from app.policy import TrustedToolRuntimeContext
+from app.tenants.field_values import validate_frozen_fields
 from app.runtime.profiles import (
     ResolvedTenantProfile,
     TenantProfileUnavailableError,
@@ -90,6 +95,34 @@ class ApprovalDecisionResponse(BaseModel):
     executed: bool
 
 
+class ApprovalReviewRead(BaseModel):
+    """Closed, source-free projection for an operator approval review."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    approval_id: UUID
+    job_id: UUID | None
+    action: str | None
+    case_id: UUID | None
+    validated_fields: dict[str, object]
+    policy_reason: PolicyReason | None
+    expires_at: datetime | None
+    status: Literal["pending", "approved", "rejected", "expired"]
+    result_reference: dict[str, str]
+    executable: bool
+    decided_at: datetime | None
+
+
+class ApprovalReviewPage(BaseModel):
+    """Bounded approval review page."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    items: tuple[ApprovalReviewRead, ...]
+    limit: int
+    has_more: bool
+
+
 class ApprovalDecisionService:
     def __init__(
         self,
@@ -137,6 +170,12 @@ class ApprovalDecisionService:
             ):
                 raise ApprovalDecisionConflict("legacy approval is not executable")
             try:
+                job = await self.repository.get_job_for_update(
+                    approval.tenant_id,
+                    approval.job_id,
+                )
+                if job is None:
+                    raise ApprovalCreationConflict("approval job is unavailable")
                 identity = await self.repository.get_job_observation_identity(approval)
                 if identity is None:
                     raise ApprovalCreationConflict("approval job is unavailable")
@@ -163,6 +202,7 @@ class ApprovalDecisionService:
                 raise ApprovalDecisionConflict("approval state is not decidable")
             elif approval.expires_at <= now:
                 self.repository.expire_locked(approval, now=now)
+                self.repository.finalize_job_for_decision(approval, job, now=now)
                 decision_outcome = OutcomeCode.EXPIRED
                 if request.decision == "reject":
                     response = self._response(approval)
@@ -187,6 +227,7 @@ class ApprovalDecisionService:
                     actor_ref=operator.actor_ref,
                     payload={},
                 )
+                self.repository.finalize_job_for_decision(approval, job, now=now)
                 response = self._response(approval)
                 decision_outcome = OutcomeCode.REJECTED
             else:
@@ -206,6 +247,25 @@ class ApprovalDecisionService:
                     capability.arguments_model.model_validate(action.arguments)
                 except ValidationError as error:
                     raise ApprovalDecisionConflict("approval action is invalid") from error
+                compiled = resolved_profile.compiled
+                if compiled is None or action.name not in compiled.available_actions:
+                    raise ApprovalDecisionConflict(
+                        "approval action is no longer authorized"
+                    )
+                validated_fields = validate_frozen_fields(
+                    action.known_fields,
+                    TrustedToolRuntimeContext(
+                        tenant_id=approval.tenant_id,
+                        tenant_config=resolved_profile.config,
+                    ),
+                )
+                if (
+                    validated_fields.invalid_fields
+                    or set(validated_fields.values) != set(action.known_fields)
+                ):
+                    raise ApprovalDecisionConflict(
+                        "approval known fields are no longer valid"
+                    )
                 execution_result = await self.action_executor.execute(
                     self.session,
                     approval,
@@ -239,6 +299,7 @@ class ApprovalDecisionService:
                         "executed": True,
                     },
                 )
+                self.repository.finalize_job_for_decision(approval, job, now=now)
                 response = self._response(approval)
                 decision_outcome = OutcomeCode.APPROVED
                 action_executed = True
@@ -421,12 +482,174 @@ class ApprovalDecisionService:
         return value
 
 
+class ApprovalReviewService:
+    """Build tenant-scoped approval projections without exposing raw payloads."""
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        action_registry: ActionRegistry = BUILTIN_ACTION_REGISTRY,
+    ) -> None:
+        self.repository = ApprovalRepository(session)
+        self.action_registry = action_registry
+
+    async def get(
+        self,
+        approval_id: UUID,
+        tenant_id: UUID,
+    ) -> ApprovalReviewRead | None:
+        approval = await self.repository.get_for_tenant(approval_id, tenant_id)
+        if approval is None:
+            return None
+        return await self._project(approval)
+
+    async def list(
+        self,
+        tenant_id: UUID,
+        *,
+        status: Literal["pending", "approved", "rejected", "expired"] = "pending",
+        limit: int = 100,
+    ) -> ApprovalReviewPage:
+        bounded_limit = min(max(limit, 1), 100)
+        rows = await self.repository.list_for_tenant(
+            tenant_id,
+            status=status,
+            limit=bounded_limit,
+        )
+        has_more = len(rows) > bounded_limit
+        projected: list[ApprovalReviewRead] = []
+        for approval in rows[:bounded_limit]:
+            projected.append(await self._project(approval))
+        return ApprovalReviewPage(
+            items=tuple(projected),
+            limit=bounded_limit,
+            has_more=has_more,
+        )
+
+    async def _project(self, approval: Approval) -> ApprovalReviewRead:
+        action_name = self._safe_action_name(approval.action)
+        policy_reason = self._safe_policy_reason(approval.policy_reason)
+        result_reference = await self._safe_result_reference(approval)
+        validated_fields: dict[str, object] = {}
+        executable = False
+
+        action: PendingAction | None = None
+        if isinstance(approval.pending_action, dict):
+            try:
+                candidate = PendingAction.model_validate(approval.pending_action)
+            except ValidationError:
+                candidate = None
+            if candidate is not None and candidate.name == approval.action:
+                action = candidate
+
+        if action is not None:
+            identity = await self.repository.get_job_observation_identity(approval)
+            if identity is not None:
+                try:
+                    profile = resolve_persisted_profile(
+                        identity.tenant_config_snapshot,
+                        identity.tenant_config_sha256,
+                    )
+                except Exception:
+                    profile = None
+                if profile is not None:
+                    validation = validate_frozen_fields(
+                        action.known_fields,
+                        TrustedToolRuntimeContext(
+                            tenant_id=approval.tenant_id,
+                            tenant_config=profile.config,
+                        ),
+                    )
+                    validated_fields = dict(validation.values)
+                    if not validation.invalid_fields and approval.status == "pending":
+                        try:
+                            capability = self.action_registry.require(action.name)
+                            capability.arguments_model.model_validate(action.arguments)
+                        except (ActionCapabilityUnavailable, ValidationError):
+                            executable = False
+                        else:
+                            compiled = profile.compiled
+                            executable = (
+                                compiled is not None
+                                and action.name in compiled.available_actions
+                                and action_name == action.name
+                            )
+
+        return ApprovalReviewRead(
+            approval_id=approval.id,
+            job_id=approval.job_id,
+            action=action_name,
+            case_id=approval.case_id,
+            validated_fields=validated_fields,
+            policy_reason=policy_reason,
+            expires_at=approval.expires_at,
+            status=approval.status,
+            result_reference=result_reference,
+            executable=executable,
+            decided_at=approval.decided_at,
+        )
+
+    @staticmethod
+    def _safe_action_name(value: object) -> str | None:
+        if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,99}", value):
+            return value
+        return None
+
+    @staticmethod
+    def _safe_policy_reason(value: object) -> PolicyReason | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            return PolicyReason(value)
+        except ValueError:
+            return None
+
+    async def _safe_result_reference(self, approval: Approval) -> dict[str, str]:
+        # A case ID is backed by the approval's tenant-scoped composite FK.
+        # Artifact references are accepted only after the tenant/job lookup;
+        # arbitrary JSON in execution_result is never an ownership proof.
+        if isinstance(approval.case_id, UUID):
+            return {"case_id": str(approval.case_id)}
+        if isinstance(approval.execution_result, dict):
+            raw_reference = approval.execution_result.get("result_reference")
+            if isinstance(raw_reference, dict):
+                kind = raw_reference.get("kind")
+                identifier = raw_reference.get("id")
+                if isinstance(kind, str) and kind in {
+                    "case",
+                    "reply_draft",
+                    "review_flag",
+                } and isinstance(identifier, str):
+                    try:
+                        artifact_id = UUID(identifier)
+                    except ValueError:
+                        return {}
+                    if (
+                        kind in {"reply_draft", "review_flag"}
+                        and approval.job_id is not None
+                    ):
+                        artifact = await ArtifactRepository(
+                            self.repository.session
+                        ).get_for_tenant(artifact_id, approval.tenant_id)
+                        if (
+                            artifact is not None
+                            and artifact.job_id == approval.job_id
+                            and artifact.kind == kind
+                        ):
+                            return {"kind": kind, "id": str(artifact.id)}
+        return {}
+
+
 __all__ = [
     "ApprovalActionExecutor",
     "ApprovalDecisionConflict",
     "ApprovalDecisionRequest",
     "ApprovalDecisionResponse",
     "ApprovalDecisionService",
+    "ApprovalReviewPage",
+    "ApprovalReviewRead",
+    "ApprovalReviewService",
     "ApprovalExpired",
     "ApprovalNotFound",
 ]

@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import random
+import inspect
+import threading
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
+from sqlalchemy.exc import DBAPIError
 
 from app.agent.models import AgentRunResult, RunStatus, StopReason
 from app.core.config import Settings, settings
@@ -71,6 +74,10 @@ class RetryableJobError(RuntimeError):
 
 class ProviderRequestRejectedError(RuntimeError):
     """A provider rejected a request and retrying it unchanged cannot help."""
+
+
+class TransientPersistenceError(RuntimeError):
+    """A bounded persistence outage that the supervisor may retry."""
 
 
 # A descriptive alias keeps callers that use the runtime terminology stable.
@@ -130,7 +137,12 @@ class AgentWorker:
             observer=observer,
         )
 
-    async def serve_once(self) -> bool:
+    async def serve_once(
+        self,
+        *,
+        excluded_tenant_ids: Collection[UUID] = (),
+        on_claim: Callable[[ClaimedJob], None] | None = None,
+    ) -> bool:
         """Recover leases, claim at most one job, and process it."""
 
         now = self._now()
@@ -173,6 +185,7 @@ class AgentWorker:
                 claimed = await repository.claim_next(
                     now=now,
                     lease_until=now + timedelta(seconds=self._lease_seconds),
+                    excluded_tenant_ids=excluded_tenant_ids,
                 )
             except Exception:
                 self._emit_persistence_failure(
@@ -186,9 +199,14 @@ class AgentWorker:
         if claimed is None:
             return False
 
+        if on_claim is not None:
+            on_claim(claimed)
         self._emit_job_claimed(claimed)
         self._emit_job_started(claimed)
-        gateway = WorkerAsyncGateway(asyncio.get_running_loop())
+        gateway = WorkerAsyncGateway(
+            asyncio.get_running_loop(),
+            timeout_seconds=self._gateway_timeout_seconds,
+        )
         run_started_ns = self._monotonic_clock()
         finished = False
         try:
@@ -344,12 +362,106 @@ class AgentWorker:
         return True
 
     async def serve(self) -> None:
-        """Run until cancelled, polling only when no job was available."""
+        """Run bounded, tenant-fair jobs while supervising persistence outages."""
+
+        backoff = self._persistence_backoff_initial_seconds
+        active_tenants: set[UUID] = set()
+        tasks: set[asyncio.Task[bool]] = set()
+        task_holders: dict[asyncio.Task[bool], list[UUID]] = {}
+
+        async def cancel_tasks() -> None:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            tasks.clear()
+            for holder in task_holders.values():
+                for tenant_id in holder:
+                    active_tenants.discard(tenant_id)
+            task_holders.clear()
 
         while True:
-            claimed = await self.serve_once()
-            if not claimed:
-                await self._sleep(self._poll_interval_seconds)
+            try:
+                while len(tasks) < self._worker_concurrency:
+                    holder: list[UUID] = []
+                    claimed_signal = asyncio.Event()
+
+                    def reserve(
+                        claimed: ClaimedJob,
+                        *,
+                        _holder: list[UUID] = holder,
+                        _signal: asyncio.Event = claimed_signal,
+                    ) -> None:
+                        active_tenants.add(claimed.tenant_id)
+                        _holder.append(claimed.tenant_id)
+                        _signal.set()
+
+                    task = asyncio.create_task(
+                        self.serve_once(
+                            excluded_tenant_ids=tuple(active_tenants),
+                            on_claim=reserve,
+                        )
+                    )
+                    tasks.add(task)
+                    task_holders[task] = holder
+                    while not claimed_signal.is_set() and not task.done():
+                        await asyncio.sleep(0)
+                    if task.done():
+                        tasks.discard(task)
+                        finished_holder = task_holders.pop(task, [])
+                        for tenant_id in finished_holder:
+                            active_tenants.discard(tenant_id)
+                        result = task.result()
+                        if not result:
+                            break
+
+                if not tasks:
+                    await self._sleep(self._poll_interval_seconds)
+                    continue
+                done, _ = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    tasks.discard(task)
+                    holder = task_holders.pop(task, [])
+                    for tenant_id in holder:
+                        active_tenants.discard(tenant_id)
+                    result = task.result()
+                    if not result:
+                        # A no-work slot is normal; the other active slots may
+                        # still be processing jobs.
+                        continue
+            except asyncio.CancelledError:
+                await cancel_tasks()
+                raise
+            except TransientPersistenceError:
+                await cancel_tasks()
+                delay = min(backoff, self._persistence_backoff_max_seconds)
+                await self._sleep(
+                    delay + self._random_uniform(0.0, delay * 0.1)
+                )
+                backoff = min(
+                    self._persistence_backoff_max_seconds,
+                    max(backoff * 2, self._persistence_backoff_initial_seconds),
+                )
+                continue
+            except (DBAPIError, ConnectionError, TimeoutError) as error:
+                await cancel_tasks()
+                delay = min(backoff, self._persistence_backoff_max_seconds)
+                await self._sleep(
+                    delay + self._random_uniform(0.0, delay * 0.1)
+                )
+                backoff = min(
+                    self._persistence_backoff_max_seconds,
+                    max(backoff * 2, self._persistence_backoff_initial_seconds),
+                )
+                continue
+            except BaseException:
+                await cancel_tasks()
+                raise
+            else:
+                backoff = self._persistence_backoff_initial_seconds
 
     async def _run_claimed_with_lease(
         self,
@@ -357,28 +469,87 @@ class AgentWorker:
         gateway: WorkerAsyncGateway,
     ) -> AgentRunResult | TerminalPreflightResult:
         stopped = asyncio.Event()
+        cancellation_event = threading.Event()
         heartbeat = asyncio.create_task(self._maintain_lease(claimed, stopped))
-        result: AgentRunResult | TerminalPreflightResult | None = None
-        run_error: BaseException | None = None
-        try:
-            result = await self._to_thread(
+        run_task = asyncio.ensure_future(
+            self._to_thread(
                 self._run_claimed_job,
                 claimed,
                 gateway,
+                cancellation_event,
             )
-        except BaseException as error:
-            run_error = error
+        )
+        deadline = asyncio.create_task(asyncio.sleep(self._job_timeout_seconds))
+        try:
+            while True:
+                tasks: set[asyncio.Future[object]] = {run_task, deadline}
+                if heartbeat is not None:
+                    tasks.add(heartbeat)
+                done, _ = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if run_task in done:
+                    stopped.set()
+                    deadline.cancel()
+                    lease_owned = True if heartbeat is None else await heartbeat
+                    if not lease_owned:
+                        raise JobLeaseLostError(
+                            "job lease was lost during execution"
+                        )
+                    result = run_task.result()
+                    if result is None:
+                        raise RuntimeError("worker execution returned no result")
+                    return result
+                if heartbeat is not None and heartbeat in done:
+                    if not heartbeat.result():
+                        stopped.set()
+                        cancellation_event.set()
+                        deadline.cancel()
+                        await self._await_run_shutdown(run_task)
+                        raise JobLeaseLostError(
+                            "job lease was lost during execution"
+                        )
+                    # A successful heartbeat task only means that the stop
+                    # event was set; keep observing the run task.
+                    heartbeat = None
+                if deadline in done:
+                    stopped.set()
+                    cancellation_event.set()
+                    await self._await_run_shutdown(run_task)
+                    raise RetryableJobError(
+                        "job execution timed out",
+                        error_code=WorkerErrorCode.WORKER_TIMEOUT.value,
+                    )
+        except asyncio.CancelledError:
+            stopped.set()
+            cancellation_event.set()
+            await self._await_run_shutdown(run_task)
+            raise
         finally:
             stopped.set()
+            cancellation_event.set()
+            deadline.cancel()
+            if heartbeat is not None and not heartbeat.done():
+                heartbeat.cancel()
+            if not run_task.done():
+                run_task.cancel()
 
-        lease_owned = await heartbeat
-        if not lease_owned:
-            raise JobLeaseLostError("job lease was lost during execution")
-        if run_error is not None:
-            raise run_error
-        if result is None:
-            raise RuntimeError("worker execution returned no result")
-        return result
+    async def _await_run_shutdown(
+        self,
+        run_task: asyncio.Future[object],
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(run_task),
+                timeout=self._shutdown_grace_seconds,
+            )
+        except asyncio.TimeoutError:
+            run_task.cancel()
+        except BaseException:
+            # Lease/timeout classification must not be replaced by a stale
+            # thread's provider or tool exception.
+            return
 
     async def _maintain_lease(
         self,
@@ -426,8 +597,21 @@ class AgentWorker:
         self,
         claimed: ClaimedJob,
         gateway: WorkerAsyncGateway,
+        cancellation_event: threading.Event | None = None,
     ) -> AgentRunResult | TerminalPreflightResult:
-        runtime = self._runtime_factory.build(claimed, gateway)
+        build = self._runtime_factory.build
+        parameters = inspect.signature(build).parameters
+        if "cancellation_event" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            runtime = build(
+                claimed,
+                gateway,
+                cancellation_event=cancellation_event,
+            )
+        else:
+            runtime = build(claimed, gateway)
         if isinstance(runtime, TerminalPreflightResult):
             return runtime
         try:
@@ -443,6 +627,11 @@ class AgentWorker:
                     ) from error
                 raise ProviderRequestRejectedError(
                     "provider rejected request"
+                ) from error
+            except TimeoutError as error:
+                raise RetryableJobError(
+                    "worker gateway timed out",
+                    error_code=WorkerErrorCode.GATEWAY_TIMEOUT.value,
                 ) from error
         finally:
             runtime.close()
@@ -463,6 +652,7 @@ class AgentWorker:
                             "reason": "executor_stopped",
                             "steps": 0,
                             "execution_path": [],
+                            "business_outcome": "routing_only",
                             "routing_status": result.routing_status.value,
                             "routing_reason": result.reason,
                             "missing_required_fields": list(
@@ -531,6 +721,30 @@ class AgentWorker:
                         )
                         raise
                 return OutcomeCode.FAILED_UNCERTAIN
+        if result.status is RunStatus.COMPLETED and not result.execution_path:
+            async with self._session_factory() as session:
+                repository = JobRepository(session)
+                try:
+                    await repository.mark_failed(
+                        claimed.id,
+                        WorkerErrorCode.AGENT_FAILED.value,
+                        now=now,
+                        tenant_id=claimed.tenant_id,
+                        attempt_count=claimed.attempt_count,
+                    )
+                except JobLeaseLostError:
+                    raise
+                except Exception:
+                    self._emit_persistence_failure(
+                        trace_id=claimed.trace_id,
+                        tenant_id=claimed.tenant_id,
+                        job_id=claimed.id,
+                        operation=PersistenceOperation.MARK_FAILED,
+                        tenant_config_snapshot=claimed.tenant_config_snapshot,
+                        tenant_config_sha256=claimed.tenant_config_sha256,
+                    )
+                    raise
+            return OutcomeCode.FAILED
         async with self._session_factory() as session:
             repository = JobRepository(session)
             if result.status == RunStatus.COMPLETED:
@@ -980,12 +1194,31 @@ class AgentWorker:
             "execution_path": execution_path,
         }
         if execution_path:
-            terminal = execution_path[-1]
+            # A closing no-tool proposal is policy-evaluated for safety, but it
+            # must not overwrite the business outcome of an earlier executed
+            # action (for example, an empty follow-up after create_case).
+            terminal = next(
+                (
+                    item
+                    for item in reversed(execution_path)
+                    if item["action_key"] is not None
+                ),
+                execution_path[-1],
+            )
             summary["routing_status"] = terminal["routing_status"]
             summary["routing_reason"] = terminal["policy_reason"]
             summary["missing_required_fields"] = terminal[
                 "missing_required_fields"
             ]
+            summary["business_outcome"] = (
+                "tool_result"
+                if terminal["tool_outcome"] is not None
+                else (
+                    "approval_requested"
+                    if terminal["routing_status"] == "pending_approval"
+                    else "routing_only"
+                )
+            )
         return summary
 
     def _retry_delay(self, attempt_count: int) -> float:
@@ -1014,9 +1247,34 @@ class AgentWorker:
     def _max_retries(self) -> int:
         return int(self._settings.worker_max_retries)
 
+    @property
+    def _persistence_backoff_initial_seconds(self) -> float:
+        return float(self._settings.worker_persistence_backoff_initial_seconds)
+
+    @property
+    def _persistence_backoff_max_seconds(self) -> float:
+        return float(self._settings.worker_persistence_backoff_max_seconds)
+
+    @property
+    def _job_timeout_seconds(self) -> float:
+        return float(self._settings.worker_job_timeout_seconds)
+
+    @property
+    def _gateway_timeout_seconds(self) -> float:
+        return float(self._settings.worker_gateway_timeout_seconds)
+
+    @property
+    def _worker_concurrency(self) -> int:
+        return int(self._settings.worker_concurrency)
+
+    @property
+    def _shutdown_grace_seconds(self) -> float:
+        return float(self._settings.worker_shutdown_grace_seconds)
+
 
 __all__ = [
     "AgentWorker",
     "RetryableJobError",
+    "TransientPersistenceError",
     "WorkerRetryableError",
 ]

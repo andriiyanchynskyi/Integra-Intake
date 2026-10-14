@@ -6,12 +6,13 @@ import time
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import replace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ValidationError
 
 from app.agent import (
     AgentProposal,
+    ResultReference,
     ToolCall,
     ToolData,
     ToolExecutionDisposition,
@@ -24,8 +25,11 @@ from app.policy import (
     PolicyOutcome,
     TrustedToolRuntimeContext,
 )
-from app.policy.models import proposal_value_is_present
 from app.tenants.config import FieldType, RoutingDecision
+from app.tenants.field_values import (
+    ValidatedProposalFields,
+    validate_proposal_fields,
+)
 from app.observability import (
     Component,
     EventName,
@@ -54,33 +58,10 @@ from app.tools.ports import CustomerNotFoundError, TenantToolPort
 from app.tools.registry import ActionRegistry, BUILTIN_ACTION_REGISTRY
 
 
-def _known_proposal_fields(
+def _validated_proposal_fields(
     proposal: AgentProposal, runtime: TrustedToolRuntimeContext
-) -> dict[str, ToolData]:
-    known = set(runtime.tenant_config.fields)
-    document = runtime.source.document if runtime.source else None
-    return {
-        item.name: deepcopy(item.value)
-        for item in proposal.fields
-        if item.name in known and proposal_value_is_present(item.value)
-        and (
-            document is None
-            or (
-                document.text is not None
-                and item.source_excerpt is not None
-                and bool(item.source_excerpt.strip())
-                and item.source_excerpt in document.text
-            )
-        )
-    }
-
-
-def _verified_present_fields(
-    proposal: AgentProposal, runtime: TrustedToolRuntimeContext
-) -> frozenset[str] | None:
-    if runtime.source is None or runtime.source.document is None:
-        return None
-    return frozenset(_known_proposal_fields(proposal, runtime))
+) -> ValidatedProposalFields:
+    return validate_proposal_fields(proposal, runtime)
 
 
 def _customer_data(summary: CustomerSummary | None) -> ToolData:
@@ -103,7 +84,7 @@ def _recomputed_missing_required_fields(
     )
     if intake is None:
         return ()
-    present = set(_known_proposal_fields(proposal, runtime))
+    present = set(_validated_proposal_fields(proposal, runtime).values)
     return tuple(sorted(set(intake.required_fields) - present))
 
 
@@ -185,6 +166,7 @@ class PolicyGatedToolExecutor:
     ) -> ToolExecutionResult:
         return replace(
             result,
+            result_reference=cls._result_reference(result.data),
             evidence=ToolExecutionEvidence(
                 action_key=action_key if action_known else None,
                 action_known=action_known,
@@ -201,11 +183,28 @@ class PolicyGatedToolExecutor:
             ),
         )
 
+    @staticmethod
+    def _result_reference(value: ToolData) -> ResultReference | None:
+        if not isinstance(value, Mapping):
+            return None
+        raw = value.get("result_reference")
+        if not isinstance(raw, Mapping):
+            return None
+        try:
+            return ResultReference(
+                kind=raw["kind"],  # type: ignore[arg-type]
+                id=UUID(raw["id"]) if isinstance(raw["id"], str) else raw["id"],  # type: ignore[arg-type]
+            )
+        except (KeyError, TypeError, ValueError, ValidationError):
+            return None
+
     def execute(
         self, proposal: AgentProposal, tool_call: ToolCall
     ) -> ToolExecutionResult:
+        self._check_cancelled()
         started_ns = self._clock()
         definition = self._definitions.get(tool_call.name)
+        validated_fields = _validated_proposal_fields(proposal, self._runtime)
         policy = self._policy.evaluate(
             PolicyInput(
                 proposal=proposal,
@@ -219,9 +218,8 @@ class PolicyGatedToolExecutor:
                     else frozenset(self._definitions)
                 ),
                 runtime=self._runtime,
-                verified_present_fields=_verified_present_fields(
-                    proposal, self._runtime
-                ),
+                verified_present_fields=frozenset(validated_fields.values),
+                invalid_fields=validated_fields.invalid_fields,
             )
         )
         self._emit_policy(
@@ -273,6 +271,7 @@ class PolicyGatedToolExecutor:
                 tool_executed=True,
             )
         if policy.decision is RoutingDecision.NEEDS_APPROVAL:
+            self._check_cancelled()
             requested = self._port.request_approval(
                 self._runtime.tenant_id,
                 action=self._pending_action(definition, arguments, proposal),
@@ -298,6 +297,7 @@ class PolicyGatedToolExecutor:
                 tool_executed=False,
             )
         try:
+            self._check_cancelled()
             result = definition.handler(arguments, proposal, self._runtime)
             execution = ToolExecutionResult(data=result)
             self._emit_tool(
@@ -333,6 +333,7 @@ class PolicyGatedToolExecutor:
                 policy=policy,
                 tool_executed=True,
             )
+
         except CustomerNotFoundError:
             execution = ToolExecutionResult(
                 data={"outcome": "customer_not_found"},
@@ -352,6 +353,7 @@ class PolicyGatedToolExecutor:
                 policy=policy,
                 tool_executed=True,
             )
+
         except Exception:
             # A tool adapter is a trust boundary.  Never expose backend exception
             # text to the transcript or let an implementation failure escape the loop.
@@ -373,6 +375,53 @@ class PolicyGatedToolExecutor:
                 policy=policy,
                 tool_executed=True,
             )
+
+    def evaluate_terminal(self, proposal: AgentProposal) -> ToolExecutionResult:
+        """Evaluate a terminal proposal without inventing an executable action."""
+
+        self._check_cancelled()
+        started_ns = self._clock()
+        validated_fields = _validated_proposal_fields(proposal, self._runtime)
+        policy = self._policy.evaluate_terminal(
+            PolicyInput(
+                proposal=proposal,
+                requested_action="",
+                requires_complete_fields=True,
+                registered_actions=(
+                    self._runtime.compiled_profile.registered_actions
+                    if self._runtime.compiled_profile is not None
+                    else frozenset(self._definitions)
+                ),
+                runtime=self._runtime,
+                verified_present_fields=frozenset(validated_fields.values),
+                invalid_fields=validated_fields.invalid_fields,
+            )
+        )
+        self._emit_policy(
+            action_key="",
+            action_known=False,
+            policy=policy,
+            started_ns=started_ns,
+        )
+        data = policy.as_tool_data()
+        data["business_outcome"] = "routing_only"
+        final_response = (
+            "review_required"
+            if policy.reason == "safety_or_legal_risk"
+            else policy.reason
+        )
+        result = ToolExecutionResult(
+            data=data,
+            continue_run=False,
+            final_response=final_response,
+        )
+        return self._with_evidence(
+            result,
+            action_key="",
+            action_known=False,
+            policy=policy,
+            tool_executed=False,
+        )
 
     def _emit_policy(
         self,
@@ -496,6 +545,11 @@ class PolicyGatedToolExecutor:
     def _duration_ms(self, started_ns: int) -> int:
         return max(0, (self._clock() - started_ns) // 1_000_000)
 
+    def _check_cancelled(self) -> None:
+        event = self._runtime.cancellation_event
+        if event is not None and event.is_set():
+            raise RuntimeError("worker execution cancelled")
+
     def _pending_action(
         self,
         definition: ToolDefinition,
@@ -506,7 +560,9 @@ class PolicyGatedToolExecutor:
             version=definition.pending_action_version,
             name=definition.name,
             arguments=deepcopy(arguments.model_dump(mode="json")),
-            known_fields=deepcopy(_known_proposal_fields(proposal, self._runtime)),
+            known_fields=deepcopy(
+                _validated_proposal_fields(proposal, self._runtime).values
+            ),
         )
 
     def _find_customer(
@@ -537,7 +593,7 @@ class PolicyGatedToolExecutor:
             runtime.tenant_id,
             runtime.source,
             customer_id=values.customer_id,
-            fields=_known_proposal_fields(proposal, runtime),
+            fields=_validated_proposal_fields(proposal, runtime).values,
         )
         return result.model_dump(mode="json")
 
@@ -551,7 +607,7 @@ class PolicyGatedToolExecutor:
         result = self._port.update_case_fields(
             runtime.tenant_id,
             values.case_id,
-            fields=_known_proposal_fields(proposal, runtime),
+            fields=_validated_proposal_fields(proposal, runtime).values,
         )
         if result is None:
             raise _ToolExecutionStop("case_not_found")
@@ -569,7 +625,7 @@ class PolicyGatedToolExecutor:
         ):
             raise _ToolExecutionStop("case_not_found")
         contact_definition = runtime.tenant_config.fields.get("contact")
-        accepted_fields = _known_proposal_fields(proposal, runtime)
+        accepted_fields = _validated_proposal_fields(proposal, runtime).values
         recipient_value: str | None = None
         contact_value = accepted_fields.get("contact")
         if (
@@ -583,12 +639,17 @@ class PolicyGatedToolExecutor:
         if missing:
             body += f" Missing information: {missing}."
         subject = runtime.source.subject if runtime.source else "Intake reply draft"
-        return ReplyDraft(
+        reference = self._port.create_reply_draft(
+            runtime.tenant_id,
+            job_id=runtime.job_id,
             recipient=recipient_value,
             subject=subject,
             body=body,
-            persisted=False,
-        ).model_dump(mode="json")
+        )
+        return {
+            "result_reference": reference.model_dump(mode="json"),
+            "persisted": True,
+        }
 
     def _flag_for_review(
         self,
@@ -597,10 +658,15 @@ class PolicyGatedToolExecutor:
         runtime: TrustedToolRuntimeContext,
     ) -> ToolData:
         values = FlagForReviewArgs.model_validate(arguments)
-        return ReviewFlag(
+        reference = self._port.flag_for_review(
+            runtime.tenant_id,
+            job_id=runtime.job_id,
             reason=values.note or proposal.rationale_short,
-            persisted=False,
-        ).model_dump(mode="json")
+        )
+        return {
+            "result_reference": reference.model_dump(mode="json"),
+            "persisted": True,
+        }
 
 
 __all__ = ["PolicyGatedToolExecutor"]

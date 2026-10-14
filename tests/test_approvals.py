@@ -14,7 +14,7 @@ import yaml
 from sqlalchemy.dialects import postgresql
 
 from app.auth import AuthenticatedOperator
-from app.db.models import Approval, ApprovalEvent
+from app.db.models import AgentJob, Approval, ApprovalEvent
 from app.domain.approvals import (
     ApprovalDecisionConflict,
     ApprovalDecisionRequest,
@@ -85,8 +85,36 @@ class _Transaction(AbstractAsyncContextManager["_Transaction"]):
 class _ApprovalSession:
     """Async-session double for locked approval lookup and transaction rollback."""
 
-    def __init__(self, approvals: Iterable[Approval]) -> None:
+    def __init__(
+        self,
+        approvals: Iterable[Approval],
+        *,
+        profile_snapshot: dict[str, object] | None = None,
+        profile_sha256: str | None = None,
+    ) -> None:
         self.approvals = list(approvals)
+        self.profile_snapshot = deepcopy(profile_snapshot or REPAIR_PROFILE_SNAPSHOT)
+        self.profile_sha256 = profile_sha256 or REPAIR_PROFILE_SHA256
+        self.jobs = [
+            AgentJob(
+                id=approval.job_id,
+                tenant_id=approval.tenant_id,
+                trace_id=TRACE_ID,
+                status="awaiting_approval",
+                source_snapshot={
+                    "channel": "email",
+                    "subject": "Approval",
+                    "body": "Approval body",
+                },
+                tenant_config_snapshot=deepcopy(self.profile_snapshot),
+                tenant_config_sha256=self.profile_sha256,
+                risk_signals={},
+                attempt_count=1,
+                available_at=DECISION_TIME,
+            )
+            for approval in self.approvals
+            if approval.job_id is not None
+        ]
         self.events: list[ApprovalEvent] = []
         self.cases: list[UUID] = []
         self.queries: list[str] = []
@@ -106,6 +134,16 @@ class _ApprovalSession:
             params = compiled.params
             job_id = params["id_1"]
             tenant_id = params["tenant_id_1"]
+            job = next(
+                (
+                    value
+                    for value in self.jobs
+                    if value.id == job_id and value.tenant_id == tenant_id
+                ),
+                None,
+            )
+            if "agent_jobs.status" in query:
+                return _ScalarResult(job)
             approval = next(
                 (
                     value
@@ -117,8 +155,8 @@ class _ApprovalSession:
             return _RowResult(
                 (
                     TRACE_ID,
-                    deepcopy(REPAIR_PROFILE_SNAPSHOT),
-                    REPAIR_PROFILE_SHA256,
+                    deepcopy(self.profile_snapshot),
+                    self.profile_sha256,
                 )
                 if approval is not None
                 else None
@@ -162,6 +200,23 @@ class _ApprovalSession:
             ],
             "events": list(self.events),
             "cases": list(self.cases),
+            "jobs": [
+                (
+                    job,
+                    {
+                        name: deepcopy(getattr(job, name))
+                        for name in (
+                            "status",
+                            "finished_at",
+                            "lease_expires_at",
+                            "result",
+                            "error_code",
+                            "side_effect_committed_at",
+                        )
+                    },
+                )
+                for job in self.jobs
+            ],
         }
 
     def _rollback(self) -> None:
@@ -172,6 +227,9 @@ class _ApprovalSession:
                 setattr(approval, name, value)
         self.events[:] = snapshot["events"]
         self.cases[:] = snapshot["cases"]
+        for job, values in snapshot["jobs"]:
+            for name, value in values.items():
+                setattr(job, name, value)
 
 
 class _RecordingExecutor:
@@ -213,7 +271,7 @@ def _action() -> PendingAction:
     return PendingAction(
         name="create_case",
         arguments={"customer_id": None},
-        known_fields={"summary": "Create a case"},
+        known_fields={"customer_name": "Create a case"},
     )
 
 
@@ -221,8 +279,12 @@ def _approval(
     *,
     status: str = "pending",
     expires_at: datetime = DECISION_TIME + timedelta(hours=1),
+    tenant_config_sha256: str = REPAIR_PROFILE_SHA256,
+    known_fields: dict[str, object] | None = None,
 ) -> Approval:
     action = _action()
+    if known_fields is not None:
+        action = action.model_copy(update={"known_fields": known_fields})
     return Approval(
         id=APPROVAL_ID,
         tenant_id=TENANT_A,
@@ -233,7 +295,7 @@ def _approval(
         decision={},
         policy_reason="approval_required",
         pending_action=action.model_dump(mode="json"),
-        tenant_config_sha256=REPAIR_PROFILE_SHA256,
+        tenant_config_sha256=tenant_config_sha256,
         expires_at=expires_at,
         execution_result=None,
     )
@@ -276,6 +338,16 @@ async def test_reject_records_decision_without_invoking_action_executor() -> Non
     assert result.executed is False
     assert result.case_id is None
     assert executor.calls == 0
+    job = session.jobs[0]
+    assert job.status == "succeeded"
+    assert job.finished_at == DECISION_TIME
+    assert job.error_code is None
+    assert job.result == {
+        "business_outcome": "approval_rejected",
+        "approval_id": str(APPROVAL_ID),
+        "approval_status": "rejected",
+        "result_reference": {},
+    }
     assert approval.decided_by_actor_ref == "ops-alice"
     assert approval.decision_reason == "Reviewed by operations"
     assert [event.event_type for event in session.events] == ["approval_rejected"]
@@ -300,6 +372,15 @@ async def test_approve_executes_create_case_once_and_retries_are_idempotent() ->
     assert executor.calls == 1
     assert approval.status == "approved"
     assert approval.executed_at == DECISION_TIME
+    job = session.jobs[0]
+    assert job.status == "succeeded"
+    assert job.finished_at == DECISION_TIME
+    assert job.result == {
+        "business_outcome": "tool_result",
+        "approval_id": str(APPROVAL_ID),
+        "approval_status": "approved",
+        "result_reference": {"case_id": str(CASE_ID)},
+    }
     assert [event.event_type for event in session.events] == [
         "approval_approved",
         "approved_action_executed",
@@ -309,6 +390,44 @@ async def test_approve_executes_create_case_once_and_retries_are_idempotent() ->
         await service.decide(APPROVAL_ID, operator, _request("reject"))
     assert executor.calls == 1
     assert len(session.events) == 2
+
+
+@pytest.mark.asyncio
+async def test_approve_rechecks_frozen_profile_authorization_and_fields() -> None:
+    denied_snapshot = deepcopy(REPAIR_PROFILE_SNAPSHOT)
+    denied_snapshot["action_policy"]["create_case"]["allowed"] = False  # type: ignore[index]
+    denied_sha256 = hashlib.sha256(
+        canonical_json_bytes(denied_snapshot)
+    ).hexdigest()
+    approval = _approval(tenant_config_sha256=denied_sha256)
+    session = _ApprovalSession(
+        [approval],
+        profile_snapshot=denied_snapshot,
+        profile_sha256=denied_sha256,
+    )
+    executor = _RecordingExecutor()
+
+    with pytest.raises(ApprovalDecisionConflict, match="no longer authorized"):
+        await _service(session, executor).decide(
+            APPROVAL_ID,
+            _operator(),
+            _request("approve"),
+        )
+    assert executor.calls == 0
+    assert session.jobs[0].status == "awaiting_approval"
+    assert approval.status == "pending"
+
+    invalid_fields_approval = _approval(known_fields={"not_a_profile_field": "x"})
+    invalid_session = _ApprovalSession([invalid_fields_approval])
+    invalid_executor = _RecordingExecutor()
+    with pytest.raises(ApprovalDecisionConflict, match="known fields"):
+        await _service(invalid_session, invalid_executor).decide(
+            APPROVAL_ID,
+            _operator(),
+            _request("approve"),
+        )
+    assert invalid_executor.calls == 0
+    assert invalid_fields_approval.status == "pending"
 
 
 @pytest.mark.asyncio
@@ -399,6 +518,9 @@ async def test_expired_reject_is_terminal_and_never_executes_action() -> None:
     assert executor.calls == 0
     assert approval.decided_by_actor_ref == "system_timeout"
     assert approval.decision_reason == "approval_timeout"
+    assert session.jobs[0].status == "failed"
+    assert session.jobs[0].finished_at == DECISION_TIME
+    assert session.jobs[0].error_code == "approval_expired"
     assert [event.event_type for event in session.events] == ["approval_expired"]
 
 
@@ -417,6 +539,8 @@ async def test_expired_approve_transitions_to_expired_and_never_executes_action(
 
     assert approval.status == "expired"
     assert approval.decided_by_actor_ref == "system_timeout"
+    assert session.jobs[0].status == "failed"
+    assert session.jobs[0].error_code == "approval_expired"
     assert executor.calls == 0
     assert [event.event_type for event in session.events] == ["approval_expired"]
 

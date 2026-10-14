@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -98,7 +99,11 @@ class AgentRuntimeFactory:
         self._observer = observer
 
     def build(
-        self, claimed_job: Any, gateway: WorkerAsyncGateway
+        self,
+        claimed_job: Any,
+        gateway: WorkerAsyncGateway,
+        *,
+        cancellation_event: threading.Event | None = None,
     ) -> ReadyAgentRuntime | TerminalPreflightResult:
         source: TrustedSource | None = None
         try:
@@ -184,6 +189,7 @@ class AgentRuntimeFactory:
             source=source,
             risk_signals=risk,
             job_id=claimed_job.id,
+            cancellation_event=cancellation_event,
         )
         context = ObservationContext(
             trace_id=claimed_job.trace_id,
@@ -213,6 +219,11 @@ class AgentRuntimeFactory:
             for parameter in constructor.parameters.values()
         ):
             port_kwargs["runtime_settings"] = self._settings
+        if "cancellation_event" in constructor.parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in constructor.parameters.values()
+        ):
+            port_kwargs["cancellation_event"] = cancellation_event
         async_port = PostgresTenantToolPort(self._session_factory, **port_kwargs)
         port = SyncTenantToolPort(gateway, async_port)
         executor = PolicyGatedToolExecutor(
@@ -444,10 +455,41 @@ class AgentRuntimeFactory:
                 and rule.allowed
                 and key in BUILTIN_ACTION_REGISTRY.keys
             )
+        catalog_actions: list[dict[str, object]] = []
+        for action_key in sorted(available_actions):
+            try:
+                capability = BUILTIN_ACTION_REGISTRY.require(action_key)
+            except ActionCapabilityUnavailable:
+                continue
+            catalog_actions.append(
+                {
+                    "name": capability.key,
+                    "description": capability.description,
+                    "arguments_schema": capability.arguments_model.model_json_schema(),
+                }
+            )
         catalog = {
-            "actions": sorted(available_actions),
-            "fields": sorted(config.fields),
-            "intake_types": sorted(item.name for item in config.intake_types),
+            "intake_types": [
+                {
+                    "name": item.name,
+                    "description": item.description,
+                    "required_fields": list(item.required_fields),
+                }
+                for item in config.intake_types
+            ],
+            "fields": {
+                name: {
+                    "type": definition.type.value,
+                    "label": definition.label,
+                    "options": (
+                        list(definition.options)
+                        if definition.options is not None
+                        else None
+                    ),
+                }
+                for name, definition in config.fields.items()
+            },
+            "actions": catalog_actions,
         }
         source_data: dict[str, object] = {
             "body": source.body,
@@ -457,9 +499,12 @@ class AgentRuntimeFactory:
         if source.document is not None and source.document.text is not None:
             source_data = {
                 "channel": source.channel,
-                "document_text": source.document.text,
-                "message": source.body,
                 "subject": source.subject,
+                "sources": {
+                    "body": source.body,
+                    "document": source.document.text,
+                },
+                "field_precedence": ["body", "document"],
             }
         if source.sender is not None:
             source_data["sender"] = source.sender

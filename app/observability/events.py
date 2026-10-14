@@ -117,7 +117,10 @@ class RouteName(str, Enum):
     JOB = "/v1/jobs/{job_id}"
     INTAKE = "/v1/intake"
     INBOUND_EMAIL = "/v1/inbound/email/webhook"
+    APPROVALS = "/v1/approvals"
+    APPROVAL = "/v1/approvals/{approval_id}"
     APPROVAL_DECIDE = "/v1/approvals/{approval_id}/decide"
+    ARTIFACT = "/v1/artifacts/{artifact_id}"
     UNKNOWN = "unknown"
 
 
@@ -141,10 +144,13 @@ class PolicyReason(str, Enum):
     SAFETY_OR_LEGAL_RISK = "safety_or_legal_risk"
     UNKNOWN_INTAKE_TYPE = "unknown_intake_type"
     MISSING_REQUIRED_FIELDS = "missing_required_fields"
+    INVALID_FIELD_VALUES = "invalid_field_values"
     ACTION_NOT_CONFIGURED = "action_not_configured"
+    ACTION_NOT_EXECUTABLE = "action_not_executable"
     ACTION_NOT_ALLOWED = "action_not_allowed"
     APPROVAL_REQUIRED = "approval_required"
     ACTION_ALLOWED = "action_allowed"
+    NO_ACTION_REQUESTED = "no_action_requested"
     DOCUMENT_UNREADABLE = "document_unreadable"
 
 
@@ -177,6 +183,9 @@ class WorkerErrorCode(str, Enum):
     LEASE_LOST = "lease_lost"
     CAPABILITY_UNAVAILABLE = "capability_unavailable"
     SNAPSHOT_INCOMPATIBLE = "snapshot_incompatible"
+    APPROVAL_EXPIRED = "approval_expired"
+    GATEWAY_TIMEOUT = "gateway_timeout"
+    WORKER_TIMEOUT = "worker_timeout"
 
 
 SafeFieldName = Annotated[

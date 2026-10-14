@@ -536,10 +536,15 @@ def _fixture_proposal(
         if match is None:
             fields.append({"name": name, "value": "invented"})
             continue
+        value = match.split(":", 1)[1].strip()
+        if name == "quoted_rate":
+            value = float(value.split(maxsplit=1)[0].replace(",", ""))
+            if value.is_integer():
+                value = int(value)
         fields.append(
             {
                 "name": name,
-                "value": match.split(":", 1)[1].strip(),
+                "value": value,
                 "source_excerpt": match,
             }
         )
@@ -708,7 +713,9 @@ def test_incomplete_and_malformed_fixtures_await_input_without_side_effects(
     assert result.data["status"] == "awaiting_input"
     assert result.data["decision"] == "deny"
     expected_reason = (
-        "document_unreadable" if entry["id"] == "malformed-pdf" else "missing_required_fields"
+        "document_unreadable"
+        if entry["id"] == "malformed-pdf"
+        else "invalid_field_values"
     )
     assert result.data["reason"] == expected_reason
     assert result.data["missing_required_fields"] == sorted(entry["expected_missing_fields"])

@@ -18,6 +18,7 @@ from app.agent import (
     ProposalPriority,
     ProposalToolCall,
     ProposalValue,
+    StopReason,
     ToolCall,
     ToolExecutionEvidence,
     ToolExecutionResult,
@@ -62,6 +63,7 @@ TENANT_B = UUID("00000000-0000-0000-0000-000000000002")
 def _action_capability(key: str) -> ActionCapability:
     return ActionCapability(
         key=key,
+        description="Synthetic action capability.",
         arguments_model=FindCustomerArgs,
         requires_complete_fields=False,
         commits_side_effect=False,
@@ -73,6 +75,18 @@ def test_action_registry_rejects_duplicate_keys() -> None:
 
     with pytest.raises(ValueError):
         ActionRegistry((capability, capability))
+
+
+@pytest.mark.parametrize("description", ["", "   ", "x" * 501])
+def test_action_capability_rejects_invalid_description(description: str) -> None:
+    with pytest.raises(ValueError):
+        ActionCapability(
+            key="synthetic_action",
+            description=description,
+            arguments_model=FindCustomerArgs,
+            requires_complete_fields=False,
+            commits_side_effect=False,
+        )
 
 
 @pytest.mark.parametrize("key", ["BadKey", "bad-key", "bad/key", "1bad", ""])
@@ -106,8 +120,8 @@ def test_builtin_action_registry_contains_exact_current_catalog() -> None:
         "find_customer": (False, False, 1),
         "create_case": (True, True, 1),
         "update_case_fields": (True, True, 1),
-        "create_reply_draft": (False, False, 1),
-        "flag_for_review": (False, False, 1),
+        "create_reply_draft": (False, True, 1),
+        "flag_for_review": (False, True, 1),
     }
     for key, (requires_complete, commits_side_effect, pending_version) in (
         expected_metadata.items()
@@ -615,11 +629,11 @@ def test_document_candidates_without_matching_excerpts_await_input_without_mutat
     assert result.data == {
         "decision": "deny",
         "status": "awaiting_input",
-        "reason": "missing_required_fields",
+        "reason": "invalid_field_values",
         "missing_required_fields": ["summary"],
     }
     assert result.continue_run is False
-    assert result.final_response == "missing_required_fields"
+    assert result.final_response == "invalid_field_values"
     assert port.calls == []
     assert port.approval_requests == []
     assert port.cases == {}
@@ -628,7 +642,7 @@ def test_document_candidates_without_matching_excerpts_await_input_without_mutat
         action_known=True,
         policy_decision="deny",
         routing_status="awaiting_input",
-        policy_reason="missing_required_fields",
+        policy_reason="invalid_field_values",
         missing_required_fields=("summary",),
         tool_outcome=None,
         side_effect_committed=False,
@@ -766,7 +780,7 @@ def test_create_case_rejects_cross_tenant_customer_without_mutation(
 def test_flag_for_review_returns_typed_json_result(
     tenant_config: TenantConfig,
 ) -> None:
-    executor, _ = build_executor(tenant_config)
+    executor, port = build_executor(tenant_config)
 
     result = executor.execute(
         make_proposal(),
@@ -776,10 +790,12 @@ def test_flag_for_review_returns_typed_json_result(
         ),
     )
 
-    assert result.data == {
-        "reason": "Manual review required",
-        "persisted": False,
-    }
+    assert result.data is not None
+    assert result.data["persisted"] is True
+    assert result.data["result_reference"]["kind"] == "review_flag"
+    assert result.result_reference is not None
+    assert result.result_reference.kind == "review_flag"
+    assert len(port.artifacts) == 1
 
 
 def test_backend_exception_is_sanitized_and_stops_execution(
@@ -1056,7 +1072,7 @@ def test_invalid_closed_arguments_stop_without_mutating_existing_case(
     assert port.cases[case_id].extracted_fields == before
 
 
-def test_transient_draft_and_review_results_create_no_records(
+def test_draft_and_review_results_create_durable_artifacts(
     tenant_config: TenantConfig,
 ) -> None:
     port = InMemoryTenantToolPort()
@@ -1074,8 +1090,14 @@ def test_transient_draft_and_review_results_create_no_records(
     )
 
     assert draft.data is not None
-    assert draft.data["persisted"] is False
-    assert review.data == {"reason": "Needs review", "persisted": False}
+    assert draft.data["persisted"] is True
+    assert review.data is not None
+    assert review.data["persisted"] is True
+    assert draft.result_reference is not None
+    assert draft.result_reference.kind == "reply_draft"
+    assert review.result_reference is not None
+    assert review.result_reference.kind == "review_flag"
+    assert len(port.artifacts) == 2
     assert port.customers == before_customers
     assert port.cases == before_cases
 
@@ -1109,7 +1131,7 @@ def test_reply_draft_ignores_unknown_contact_and_model_missing_fields(
     config_data = tenant_config.model_dump()
     config_data["fields"].pop("contact")
     config = TenantConfig.model_validate(config_data)
-    executor, _ = build_executor(config)
+    executor, port = build_executor(config)
 
     result = executor.execute(
         make_proposal(
@@ -1121,9 +1143,13 @@ def test_reply_draft_ignores_unknown_contact_and_model_missing_fields(
     )
 
     assert result.data is not None
-    assert result.data["recipient"] is None
-    assert "summary" in result.data["body"]
-    assert "model_fabricated_field" not in result.data["body"]
+    assert result.result_reference is not None
+    artifact = next(iter(port.artifacts.values()))
+    payload = artifact["payload"]
+    assert isinstance(payload, dict)
+    assert payload["recipient"] is None
+    assert "summary" in payload["body"]
+    assert "model_fabricated_field" not in payload["body"]
 
 
 @pytest.mark.parametrize(
@@ -1271,6 +1297,51 @@ def test_critical_registered_create_case_requires_approval_without_running_handl
     assert len(port.approval_requests) == 1
 
 
+@pytest.mark.parametrize(
+    ("proposal", "expected_status", "expected_reason"),
+    [
+        (make_proposal(), "ready", "no_action_requested"),
+        (make_proposal(fields=()), "awaiting_input", "missing_required_fields"),
+        (
+            make_proposal(intake_type="unknown", fields=()),
+            "rejected",
+            "unknown_intake_type",
+        ),
+        (
+            make_proposal(injection=True),
+            "urgent",
+            "safety_or_legal_risk",
+        ),
+        (
+            make_proposal(fields=(("summary", 123),)),
+            "awaiting_input",
+            "invalid_field_values",
+        ),
+    ],
+    ids=["complete", "missing", "unknown_intake", "risk", "invalid"],
+)
+def test_terminal_proposals_are_policy_evaluated_without_approval_or_side_effect(
+    tenant_config: TenantConfig,
+    proposal: AgentProposal,
+    expected_status: str,
+    expected_reason: str,
+) -> None:
+    port = SpyPort()
+    executor, _ = build_executor(tenant_config, port)
+
+    result = executor.evaluate_terminal(proposal)
+
+    assert result.data is not None
+    assert result.data["status"] == expected_status
+    assert result.data["reason"] == expected_reason
+    assert result.data["business_outcome"] == "routing_only"
+    assert result.evidence is not None
+    assert result.evidence.action_key is None
+    assert result.evidence.action_known is False
+    assert port.calls == []
+    assert port.approval_requests == []
+
+
 def test_invalid_create_case_arguments_do_not_create_an_approval(
     tenant_config: TenantConfig,
 ) -> None:
@@ -1333,7 +1404,10 @@ def test_send_reply_and_unknown_action_never_run(
     result = executor.execute(make_proposal(), ToolCall(name=action))
 
     assert result.data["decision"] == "deny"
-    assert result.data["reason"] == "action_not_configured"
+    expected_reason = (
+        "action_not_executable" if action == "send_reply" else "action_not_configured"
+    )
+    assert result.data["reason"] == expected_reason
     assert result.continue_run is False
     assert port.calls == []
     assert port.cases == {}
@@ -1388,3 +1462,4 @@ def test_executed_handler_none_is_preserved_in_loop_transcript(
     assert result.messages[1].tool_call == ToolCall(name="return_none")
     assert result.messages[1].tool_result is None
     assert result.final_response == final_proposal.rationale_short
+    assert result.reason is StopReason.EXECUTOR_STOPPED

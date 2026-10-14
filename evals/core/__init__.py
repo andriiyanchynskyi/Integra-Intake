@@ -11,6 +11,7 @@ from .contracts import (
     compare_scenario_observation,
 )
 from .runner import (
+    last_business_outcome,
     RecordingPolicy,
     ScenarioExecutionError,
     ScriptedLLM,
@@ -23,6 +24,7 @@ __all__ = [
     "SAFE_MISMATCH_CODES",
     "SAFE_RESULT_KEYS",
     "RecordingPolicy",
+    "last_business_outcome",
     "ScenarioCase",
     "ScenarioCaseKind",
     "ScenarioExecutionError",

@@ -439,17 +439,17 @@ def make_load_assessment(
     )
 
 
-def test_router_prioritizes_safety_risk_over_an_unknown_action(
+def test_router_denies_an_unknown_action_before_safety_review(
     freight_router: TenantRouter,
 ) -> None:
     outcome = freight_router.route(
         make_load_assessment(requested_action="unknown", contains_risk=True)
     )
 
-    assert outcome.status is RoutingStatus.URGENT
-    assert outcome.decision is RoutingDecision.NEEDS_APPROVAL
+    assert outcome.status is RoutingStatus.REJECTED
+    assert outcome.decision is RoutingDecision.DENY
     assert outcome.missing_required_fields == ()
-    assert outcome.reason == "safety_or_legal_risk"
+    assert outcome.reason == "action_not_configured"
 
 
 def test_router_rejects_an_unknown_intake_type(freight_router: TenantRouter) -> None:
@@ -496,12 +496,12 @@ def test_router_allows_a_complete_configured_action(freight_router: TenantRouter
     assert outcome.reason == "action_allowed"
 
 
-def test_router_requires_approval_for_send_reply(freight_router: TenantRouter) -> None:
+def test_router_rejects_policy_only_send_reply(freight_router: TenantRouter) -> None:
     outcome = freight_router.route(make_load_assessment(requested_action="send_reply"))
 
-    assert outcome.status is RoutingStatus.PENDING_APPROVAL
-    assert outcome.decision is RoutingDecision.NEEDS_APPROVAL
-    assert outcome.reason == "approval_required"
+    assert outcome.status is RoutingStatus.REJECTED
+    assert outcome.decision is RoutingDecision.DENY
+    assert outcome.reason == "action_not_executable"
 
 
 def test_router_allows_configured_find_customer_when_required_fields_are_optional(
@@ -582,7 +582,7 @@ def test_router_rejects_a_configured_action_missing_from_registered_actions(
     assert outcome.status is RoutingStatus.REJECTED
     assert outcome.decision is RoutingDecision.DENY
     assert outcome.missing_required_fields == ()
-    assert outcome.reason == "action_not_configured"
+    assert outcome.reason == "action_not_executable"
 
 
 def test_router_rejects_an_explicitly_disallowed_action(

@@ -38,10 +38,47 @@ from app.runtime.profiles import (
 from app.runtime.retry import RetryPolicy, RetryableHttpError, run_http_with_retry
 from app.skills.definitions import ALL_SKILLS, EXTRACT_RATE_CONFIRMATION_V1
 from app.tools.postgres import SyncTenantToolPort
+from app.tools.registry import BUILTIN_ACTION_REGISTRY
 from app.tenants.loader import load_tenant_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _assert_contract_catalog(
+    catalog: dict[str, object], snapshot: dict[str, object]
+) -> None:
+    assert set(catalog) == {"actions", "fields", "intake_types"}
+    assert catalog["intake_types"] == [
+        {
+            "name": item["name"],
+            "description": item["description"],
+            "required_fields": item["required_fields"],
+        }
+        for item in snapshot["intake_types"]
+    ]
+    assert catalog["fields"] == {
+        name: {
+            "type": definition["type"],
+            "label": definition["label"],
+            "options": definition.get("options"),
+        }
+        for name, definition in snapshot["fields"].items()
+    }
+    actions = catalog["actions"]
+    assert isinstance(actions, list)
+    expected_names = [
+        "create_case",
+        "create_reply_draft",
+        "find_customer",
+        "flag_for_review",
+        "update_case_fields",
+    ]
+    assert [item["name"] for item in actions] == expected_names
+    for item in actions:
+        capability = BUILTIN_ACTION_REGISTRY.require(item["name"])
+        assert item["description"] == capability.description
+        assert item["arguments_schema"] == capability.arguments_model.model_json_schema()
 
 
 def test_profile_resolver_uses_exact_slug_path_and_canonical_snapshot(
@@ -273,22 +310,8 @@ def test_agent_runtime_factory_reconstructs_trusted_context_and_message_order(
             skill.system_prompt for skill in generic_skills
         ]
         catalog = json.loads(messages[4].content or "")
-        expected_actions = [
-            "create_case",
-            "create_reply_draft",
-            "find_customer",
-            "flag_for_review",
-            "update_case_fields",
-        ]
-        assert catalog == {
-            "actions": expected_actions,
-            "fields": sorted(job.tenant_config_snapshot["fields"]),
-            "intake_types": sorted(
-                item["name"] for item in job.tenant_config_snapshot["intake_types"]
-            ),
-        }
-        assert len(catalog["actions"]) == 5
-        assert "send_reply" not in catalog["actions"]
+        _assert_contract_catalog(catalog, job.tenant_config_snapshot)
+        assert "send_reply" not in [item["name"] for item in catalog["actions"]]
         assert json.loads(messages[5].content or "") == {
             "body": job.source_snapshot["body"],
             "channel": job.source_snapshot["channel"],
@@ -446,27 +469,16 @@ def test_agent_runtime_factory_builds_document_messages_and_skill_order(
         ]
         assert messages[4].content == EXTRACT_RATE_CONFIRMATION_V1.system_prompt
         catalog = json.loads(messages[5].content or "")
-        expected_actions = [
-            "create_case",
-            "create_reply_draft",
-            "find_customer",
-            "flag_for_review",
-            "update_case_fields",
-        ]
-        assert catalog == {
-            "actions": expected_actions,
-            "fields": sorted(job.tenant_config_snapshot["fields"]),
-            "intake_types": sorted(
-                item["name"] for item in job.tenant_config_snapshot["intake_types"]
-            ),
-        }
-        assert len(catalog["actions"]) == 5
-        assert "send_reply" not in catalog["actions"]
+        _assert_contract_catalog(catalog, job.tenant_config_snapshot)
+        assert "send_reply" not in [item["name"] for item in catalog["actions"]]
         assert json.loads(messages[6].content or "") == {
             "channel": "email",
-            "document_text": normalized.text,
-            "message": "Rate confirmation document received.",
             "subject": "Rate confirmation",
+            "sources": {
+                "body": "Rate confirmation document received.",
+                "document": normalized.text,
+            },
+            "field_precedence": ["body", "document"],
         }
         prompt_text = "\n".join(message.content or "" for message in messages)
         assert normalized.sha256 not in prompt_text

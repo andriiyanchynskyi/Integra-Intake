@@ -23,6 +23,7 @@ FINAL_SCHEMA_TABLES = {
     "idempotency_records",
     "approvals",
     "approval_events",
+    "job_artifacts",
 }
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VERSIONS_DIRECTORY = PROJECT_ROOT / "alembic" / "versions"
@@ -35,6 +36,7 @@ JSONB_COLUMNS = {
     "idempotency_records": {"response"},
     "approvals": {"decision", "pending_action", "execution_result"},
     "approval_events": {"payload"},
+    "job_artifacts": {"payload"},
     "agent_jobs": {
         "source_snapshot",
         "tenant_config_snapshot",
@@ -45,14 +47,14 @@ JSONB_COLUMNS = {
 TIMESTAMPED_TABLES = FINAL_SCHEMA_TABLES - {"case_events", "approval_events"}
 
 
-def test_release_uses_single_initial_schema_revision() -> None:
+def test_release_uses_append_only_schema_revisions() -> None:
     revision_files = sorted(
         path.name
         for path in VERSIONS_DIRECTORY.glob("*.py")
         if path.name != "__init__.py"
     )
 
-    assert revision_files == ["001_initial_schema.py"]
+    assert revision_files == ["001_initial_schema.py", "002_job_artifacts.py"]
     source = INITIAL_SCHEMA_MIGRATION_PATH.read_text(encoding="utf-8")
     assert 'revision: str = "001_initial_schema"' in source
     assert "down_revision: Union[str, None] = None" in source
@@ -60,6 +62,11 @@ def test_release_uses_single_initial_schema_revision() -> None:
     assert source.count('"ck_approvals_status"') == 1
     assert source.count('"ck_approvals_payload_complete"') == 1
     assert "ck_approvals_phase8_payload_complete" not in source
+    artifact_source = (VERSIONS_DIRECTORY / "002_job_artifacts.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'revision: str = "002_job_artifacts"' in artifact_source
+    assert 'down_revision: Union[str, None] = "001_initial_schema"' in artifact_source
 
 
 def test_orm_metadata_declares_tenant_isolation_contract() -> None:
@@ -257,6 +264,20 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
     assert isinstance(approval_events.c.payload.type, JSONB)
     assert approval_events.c.created_at.nullable is False
 
+    artifacts = Base.metadata.tables["job_artifacts"]
+    assert artifacts.c.tenant_id.nullable is False
+    assert artifacts.c.job_id.nullable is False
+    assert artifacts.c.kind.nullable is False
+    assert artifacts.c.payload.nullable is False
+    assert isinstance(artifacts.c.payload.type, JSONB)
+    assert any(
+        isinstance(constraint, UniqueConstraint)
+        and constraint.name == "uq_job_artifacts_tenant_job_kind"
+        and tuple(column.name for column in constraint.columns)
+        == ("tenant_id", "job_id", "kind")
+        for constraint in artifacts.constraints
+    )
+
     for table_name in ("customers", "intake_cases"):
         assert any(
             isinstance(constraint, UniqueConstraint)
@@ -272,6 +293,7 @@ def test_orm_metadata_declares_tenant_isolation_contract() -> None:
         ("approvals", "intake_cases", ("tenant_id", "case_id")),
         ("approvals", "agent_jobs", ("tenant_id", "job_id")),
         ("approval_events", "approvals", ("tenant_id", "approval_id")),
+        ("job_artifacts", "agent_jobs", ("tenant_id", "job_id")),
     ):
         assert any(
             isinstance(constraint, ForeignKeyConstraint)
@@ -289,7 +311,8 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
             "WHERE table_schema = 'public' "
             "AND table_name IN "
             "('tenants', 'api_keys', 'customers', 'intake_cases', 'case_events', "
-            "'idempotency_records', 'approvals', 'agent_jobs', 'approval_events')"
+            "'idempotency_records', 'approvals', 'agent_jobs', 'approval_events', "
+            "'job_artifacts')"
         )
     )
     assert set(tables.scalars()) == FINAL_SCHEMA_TABLES
@@ -409,9 +432,15 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
         "case_events",
         "idempotency_records",
         "approval_events",
+        "job_artifacts",
     ):
         assert f"(tenant_id, id)" in index_map[(table_name, f"ix_{table_name}_tenant_id_id")]
-    for table_name in ("customers", "intake_cases", "agent_jobs", "approvals"):
+    for table_name in (
+        "customers",
+        "intake_cases",
+        "agent_jobs",
+        "approvals",
+    ):
         assert (table_name, f"ix_{table_name}_tenant_id_id") not in index_map
     assert "(status, available_at, id)" in index_map[
         ("agent_jobs", "ix_agent_jobs_status_available_at")
@@ -460,6 +489,7 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
         ("approvals", "intake_cases", "tenant_id, case_id"),
         ("approvals", "agent_jobs", "tenant_id, job_id"),
         ("approval_events", "approvals", "tenant_id, approval_id"),
+        ("job_artifacts", "agent_jobs", "tenant_id, job_id"),
     ):
         assert any(
             f"FOREIGN KEY ({local_columns}) REFERENCES {referenced_table}(tenant_id, id)" in definition

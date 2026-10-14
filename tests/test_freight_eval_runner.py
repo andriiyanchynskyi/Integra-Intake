@@ -524,7 +524,7 @@ def test_loop_preserves_none_tool_results_and_stops_at_final_proposal() -> None:
     )
     result = AgentLoop(llm, _NoneExecutor()).run(_initial_messages())
 
-    assert result.reason is StopReason.FINAL
+    assert result.reason is StopReason.EXECUTOR_STOPPED
     tool_messages = [
         message for message in result.messages if message.role is MessageRole.TOOL
     ]

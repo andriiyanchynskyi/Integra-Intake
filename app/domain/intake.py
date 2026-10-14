@@ -13,7 +13,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import IdempotencyRecord
-from app.documents import DocumentInput, DocumentNormalizer
+from app.documents import (
+    DocumentExtractionError,
+    DocumentInput,
+    DocumentNormalizer,
+    NormalizedDocument,
+)
 from app.documents.registry import DocumentCapabilityUnavailable
 from app.observability import (
     Component,
@@ -27,6 +32,7 @@ from app.observability import (
     PersistenceOperation,
     safe_emit,
 )
+from app.core.config import Settings, settings
 from app.policy.models import RiskSignals, TrustedSource
 from app.domain.job_repository import JobRepository
 from app.domain.schemas import MAX_BODY_CHARS, MAX_CHANNEL_CHARS, MAX_SUBJECT_CHARS
@@ -143,6 +149,8 @@ class IntakeEnqueueService:
         *,
         observer: Observer = NULL_OBSERVER,
         context: ObservationContext | None = None,
+        runtime_settings: Settings | None = None,
+        document_parse_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         self.session = session
         self.repository = JobRepository(session)
@@ -150,6 +158,13 @@ class IntakeEnqueueService:
         self.observer = observer
         self.context = context
         self.document_normalizer = document_normalizer
+        effective_settings = runtime_settings or settings
+        self._document_parse_timeout_seconds = float(
+            effective_settings.document_parse_timeout_seconds
+        )
+        self._document_parse_semaphore = document_parse_semaphore or asyncio.Semaphore(
+            int(effective_settings.document_parse_concurrency)
+        )
 
     async def enqueue(self, command: EnqueueIntakeCommand) -> EnqueueResult:
         profile = self.profile_resolver.resolve(command.tenant_slug)
@@ -200,8 +215,8 @@ class IntakeEnqueueService:
         )
         if isinstance(normalizer, DocumentNormalizer):
             normalizer.context = context
-        normalized = await asyncio.to_thread(
-            normalizer.normalize,
+        normalized = await self._normalize_document(
+            normalizer,
             command.document,
             document_kind=binding.document_kind,
             target_intake_type=binding.target_intake_type,
@@ -212,7 +227,7 @@ class IntakeEnqueueService:
             channel=command.document.channel,
             sender=command.sender,
             subject=command.document.subject,
-            body="Document received.",
+            body=command.document.body,
             document=normalized,
         )
         return await self._enqueue(
@@ -227,6 +242,44 @@ class IntakeEnqueueService:
             profile=profile,
             request_hash=request_hash,
         )
+
+    async def _normalize_document(
+        self,
+        normalizer: object,
+        document: DocumentInput,
+        *,
+        document_kind: str,
+        target_intake_type: str,
+        normalizer_key: str,
+        normalizer_version: int,
+    ) -> NormalizedDocument:
+        try:
+            async with self._document_parse_semaphore:
+                async with asyncio.timeout(self._document_parse_timeout_seconds):
+                    result = await asyncio.to_thread(
+                        normalizer.normalize,  # type: ignore[attr-defined]
+                        document,
+                        document_kind=document_kind,
+                        target_intake_type=target_intake_type,
+                        normalizer_key=normalizer_key,
+                        normalizer_version=normalizer_version,
+                    )
+                    return result
+        except TimeoutError:
+            raw = (
+                document.text.encode("utf-8")
+                if document.media_type.value == "text/plain"
+                else document.content or b""
+            )
+            return NormalizedDocument(
+                document_kind=document_kind,
+                target_intake_type=target_intake_type,
+                media_type=document.media_type,
+                sha256=hashlib.sha256(raw).hexdigest(),
+                normalizer_key=normalizer_key,
+                normalizer_version=normalizer_version,
+                extraction_error=DocumentExtractionError.DOCUMENT_PROCESSING_TIMEOUT,
+            )
 
     async def _enqueue(
         self,
@@ -320,7 +373,7 @@ class IntakeEnqueueService:
                 channel=command.document.channel,
                 sender=command.sender,
                 subject=command.document.subject,
-                body="Document received.",
+                body=command.document.body,
             ),
             idempotency_key=command.idempotency_key,
             trace_id=command.trace_id,

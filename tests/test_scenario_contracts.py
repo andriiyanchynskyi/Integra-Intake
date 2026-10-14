@@ -500,6 +500,7 @@ def test_future_scenario_can_compile_snapshot_preflight_and_emit_action_without_
         (
             ActionCapability(
                 key="future_action",
+                description="Execute a synthetic future action.",
                 arguments_model=_FutureActionArgs,
                 requires_complete_fields=False,
                 commits_side_effect=False,

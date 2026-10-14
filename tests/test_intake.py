@@ -543,7 +543,7 @@ async def test_inbound_provider_id_reuses_per_tenant_and_conflicts_on_changed_so
 
 
 @pytest.mark.asyncio
-async def test_enqueue_document_uses_compiled_default_binding_and_generic_body_marker() -> None:
+async def test_enqueue_document_preserves_body_alongside_compiled_document() -> None:
     session = _IntakeSession()
     document = _document_input(text="Origin: Chicago\r\nDestination: Detroit")
     normalized = NormalizedDocument(
@@ -581,7 +581,7 @@ async def test_enqueue_document_uses_compiled_default_binding_and_generic_body_m
     snapshot = session.jobs[0].source_snapshot
     assert snapshot["channel"] == "email"
     assert snapshot["subject"] == "Rate confirmation"
-    assert snapshot["body"] == "Document received."
+    assert snapshot["body"] == command.document.body
     assert snapshot["document"] == normalized.model_dump(mode="json")
     assert set(snapshot) == {"channel", "subject", "body", "document"}
     assert snapshot["document"]["text"] == (  # type: ignore[index]

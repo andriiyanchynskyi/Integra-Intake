@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import AuthenticatedOperator, get_current_operator
@@ -17,12 +17,50 @@ from app.domain.approvals import (
     ApprovalDecisionService,
     ApprovalExpired,
     ApprovalNotFound,
+    ApprovalReviewPage,
+    ApprovalReviewRead,
+    ApprovalReviewService,
 )
 from app.observability.middleware import request_context, request_observer
 from app.tools.postgres import PostgresApprovalActionExecutor
 
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
+
+
+@router.get("", response_model=ApprovalReviewPage)
+async def list_approvals(
+    operator: Annotated[AuthenticatedOperator, Depends(get_current_operator)],
+    session: Annotated[AsyncSession, Depends(get_db_session, use_cache=False)],
+    approval_status: Literal["pending", "approved", "rejected", "expired"] = Query(
+        "pending",
+        alias="status",
+    ),
+    limit: int = Query(100, ge=1, le=100),
+) -> ApprovalReviewPage:
+    return await ApprovalReviewService(session).list(
+        operator.tenant_id,
+        status=approval_status,
+        limit=limit,
+    )
+
+
+@router.get("/{approval_id}", response_model=ApprovalReviewRead)
+async def get_approval(
+    approval_id: UUID,
+    operator: Annotated[AuthenticatedOperator, Depends(get_current_operator)],
+    session: Annotated[AsyncSession, Depends(get_db_session, use_cache=False)],
+) -> ApprovalReviewRead:
+    review = await ApprovalReviewService(session).get(
+        approval_id,
+        operator.tenant_id,
+    )
+    if review is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval not found",
+        )
+    return review
 
 
 @router.post(

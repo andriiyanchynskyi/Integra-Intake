@@ -13,8 +13,14 @@ T = TypeVar("T")
 class WorkerAsyncGateway:
     """Schedule one coroutine on the worker's owner loop."""
 
-    def __init__(self, owner_loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(
+        self,
+        owner_loop: asyncio.AbstractEventLoop,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
         self._owner_loop = owner_loop
+        self._timeout_seconds = timeout_seconds
 
     def call(self, awaitable: Coroutine[object, object, T]) -> T:
         try:
@@ -33,4 +39,8 @@ class WorkerAsyncGateway:
         except BaseException:
             awaitable.close()
             raise
-        return future.result()
+        try:
+            return future.result(timeout=self._timeout_seconds)
+        except TimeoutError:
+            future.cancel()
+            raise TimeoutError("gateway call timed out") from None

@@ -210,9 +210,9 @@ def test_tool_call_then_final_completes_with_ordered_transcript() -> None:
     result = AgentLoop(llm, tools).run([initial])
 
     assert result.status is RunStatus.COMPLETED
-    assert result.reason is StopReason.FINAL
+    assert result.reason is StopReason.EXECUTOR_STOPPED
     assert result.steps == 2
-    assert result.final_response == "Customer found"
+    assert result.final_response == "no_action_requested"
     assert result.proposal == final_proposal
     assert tools.calls == [tool_call]
     assert result.messages == (
@@ -273,9 +273,9 @@ def test_confidence_does_not_change_completion_or_tool_authorization(
     result = AgentLoop(llm, tools).run([])
 
     assert result.status is RunStatus.COMPLETED
-    assert result.reason is StopReason.FINAL
+    assert result.reason is StopReason.EXECUTOR_STOPPED
     assert result.steps == 2
-    assert result.final_response == "Customer found"
+    assert result.final_response == "no_action_requested"
     assert result.proposal == final_proposal
     assert tools.calls == [tool_call]
 
@@ -290,7 +290,7 @@ def test_loop_preserves_optional_source_excerpt_in_structured_proposal() -> None
     result = AgentLoop(FakeLLM([proposal]), FakeToolExecutor()).run([])
 
     assert result.status is RunStatus.COMPLETED
-    assert result.reason is StopReason.FINAL
+    assert result.reason is StopReason.EXECUTOR_STOPPED
     assert result.proposal == proposal
     assert result.proposal is not None
     assert result.proposal.fields[0].source_excerpt == "Origin: Chicago"
@@ -311,7 +311,7 @@ def test_none_tool_result_is_preserved_before_final_response() -> None:
     result = AgentLoop(llm, tools).run([])
 
     assert result.status is RunStatus.COMPLETED
-    assert result.reason is StopReason.FINAL
+    assert result.reason is StopReason.EXECUTOR_STOPPED
     assert result.steps == 2
     assert tools.calls == [tool_call]
     tool_messages = [
@@ -409,7 +409,9 @@ def test_agent_loop_keeps_execution_path_empty_without_tool_evidence() -> None:
         FakeToolExecutor(),
     ).run([])
 
-    assert result.execution_path == ()
+    assert len(result.execution_path) == 1
+    assert result.execution_path[0].action_key is None
+    assert result.execution_path[0].policy_reason == "no_action_requested"
 
 
 def test_tool_execution_failure_returns_failed_run_without_backend_details() -> None:
@@ -647,7 +649,7 @@ def test_same_tool_with_different_arguments_does_not_trigger_repetition_guard() 
     result = AgentLoop(llm, tools).run([])
 
     assert result.status is RunStatus.COMPLETED
-    assert result.reason is StopReason.FINAL
+    assert result.reason is StopReason.EXECUTOR_STOPPED
     assert result.steps == 4
     assert tools.calls == tool_calls
 
@@ -668,7 +670,7 @@ def test_nonconsecutive_repeated_tool_requests_are_allowed() -> None:
     result = AgentLoop(llm, tools).run([])
 
     assert result.status is RunStatus.COMPLETED
-    assert result.reason is StopReason.FINAL
+    assert result.reason is StopReason.EXECUTOR_STOPPED
     assert result.steps == 4
     assert tools.calls == [tool_a, tool_b, tool_a]
 
@@ -757,7 +759,7 @@ def test_loop_emits_safe_step_and_run_events_for_terminal_and_none_result_paths(
     assert steps[1].action_known is None
     assert [item.trace_id for item in (*steps, *runs)] == [context.trace_id] * 3
     assert len(runs) == 1
-    assert runs[0].stop_reason is StopReason.FINAL
+    assert runs[0].stop_reason is StopReason.EXECUTOR_STOPPED
     assert runs[0].steps == result.steps == 2
     assert all("No note exists" not in item.model_dump_json() for item in (*steps, *runs))
 
@@ -777,4 +779,4 @@ def test_loop_observer_failure_does_not_change_business_result() -> None:
     ).run([])
 
     assert result.status is RunStatus.COMPLETED
-    assert result.reason is StopReason.FINAL
+    assert result.reason is StopReason.EXECUTOR_STOPPED

@@ -8,7 +8,8 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -153,6 +154,15 @@ class StopReason(str, Enum):
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
 
 
+class ResultReference(BaseModel):
+    """Safe pointer to a tenant-owned business result."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    kind: Literal["case", "reply_draft", "review_flag"]
+    id: UUID
+
+
 class ToolExecutionDisposition(str, Enum):
     CONTINUE = "continue"
     COMPLETED = "completed"
@@ -179,6 +189,7 @@ class ToolExecutionResult:
     continue_run: bool | None = None
     final_response: str | None = None
     disposition: ToolExecutionDisposition | None = None
+    result_reference: ResultReference | None = None
     evidence: ToolExecutionEvidence | None = None
 
     def __post_init__(self) -> None:
@@ -269,6 +280,13 @@ class ProposalPriority(str, Enum):
     CRITICAL = "critical"
 
 
+class FieldSource(str, Enum):
+    """Untrusted source label attached to one extracted proposal value."""
+
+    BODY = "body"
+    DOCUMENT = "document"
+
+
 class _StrictProposalModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -280,6 +298,7 @@ type ProposalValueData = ProposalScalar | list[ProposalScalar]
 class ProposalValue(_StrictProposalModel):
     name: Annotated[str, Field(min_length=1)]
     value: ProposalValueData
+    source: FieldSource | None = None
     source_excerpt: Annotated[str, Field(min_length=1, max_length=500)] | None = None
 
     @field_validator("source_excerpt")
@@ -334,9 +353,9 @@ class AgentProposal(_StrictProposalModel):
     @field_validator("fields")
     @classmethod
     def require_unique_fields(cls, value: list[ProposalValue]) -> _FrozenList:
-        names = [item.name for item in value]
-        if len(names) != len(set(names)):
-            raise ValueError("field names must be unique")
+        identities = [(item.name, item.source) for item in value]
+        if len(identities) != len(set(identities)):
+            raise ValueError("field names must be unique per source")
         return _FrozenList(value)
 
     @field_validator("missing_required_fields")

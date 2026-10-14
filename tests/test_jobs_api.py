@@ -105,6 +105,7 @@ def test_project_job_read_is_an_allowlisted_source_free_projection(freight_profi
         "routing_reason": "complete",
         "missing_required_fields": ["contact"],
         "approval": None,
+        "result_references": [],
         "error_code": None,
         "created_at": NOW.isoformat().replace("+00:00", "Z"),
         "started_at": NOW.isoformat().replace("+00:00", "Z"),
@@ -192,14 +193,19 @@ def test_project_job_read_rejects_unknown_status(freight_profile) -> None:
         project_job_read(_row(freight_profile, status="unknown"))
 
 
-def test_project_job_read_verifies_profile_hash_before_projection(freight_profile) -> None:
+def test_project_job_read_keeps_base_status_when_profile_hash_is_invalid(
+    freight_profile,
+) -> None:
     from app.domain.jobs import project_job_read
 
     row = _row(freight_profile)
     row.tenant_config_snapshot["display_name"] = "tampered"
 
-    with pytest.raises(RuntimeError, match="profile"):
-        project_job_read(row)
+    safe = project_job_read(row)
+
+    assert safe.status == "succeeded"
+    assert safe.scenario_key is None
+    assert safe.execution_path == ()
 
 
 def test_project_job_read_exposes_provider_request_rejected(freight_profile) -> None:
@@ -279,6 +285,7 @@ def test_job_api_returns_only_safe_own_tenant_projection(monkeypatch, freight_pr
         "routing_reason",
         "missing_required_fields",
         "approval",
+        "result_references",
         "error_code",
         "created_at",
         "started_at",

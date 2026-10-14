@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
 
-from app.agent import ToolData
+from app.agent import ResultReference, ToolData
 from app.policy import TrustedSource
 from app.tools.models import (
     ApprovalRequested,
@@ -57,6 +57,24 @@ class TenantToolPort(Protocol):
         action: PendingAction,
         policy_reason: str,
     ) -> ApprovalRequested: ...
+
+    def create_reply_draft(
+        self,
+        tenant_id: UUID,
+        *,
+        job_id: UUID | None,
+        recipient: str | None,
+        subject: str,
+        body: str,
+    ) -> ResultReference: ...
+
+    def flag_for_review(
+        self,
+        tenant_id: UUID,
+        *,
+        job_id: UUID | None,
+        reason: str,
+    ) -> ResultReference: ...
 
 
 @dataclass

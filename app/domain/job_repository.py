@@ -5,13 +5,15 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from collections.abc import Collection
 from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import AgentJob, Approval, IdempotencyRecord
+from app.agent import ResultReference
+from app.db.models import AgentJob, Approval, IdempotencyRecord, JobArtifact
 from app.domain.jobs import PersistedJobRead
 from app.policy.models import TrustedSource
 from app.runtime.profiles import ResolvedTenantProfile
@@ -138,6 +140,27 @@ class JobRepository:
             or not isinstance(job.created_at, datetime)
         ):
             return None
+        case_statement = select(IdempotencyRecord.case_id).where(
+            IdempotencyRecord.tenant_id == tenant_id,
+            IdempotencyRecord.job_id == job_id,
+        )
+        case_id = (await self.session.execute(case_statement)).scalar_one_or_none()
+        artifact_statement = select(JobArtifact.kind, JobArtifact.id).where(
+            JobArtifact.tenant_id == tenant_id,
+            JobArtifact.job_id == job_id,
+        ).order_by(JobArtifact.kind, JobArtifact.id)
+        artifact_rows = (await self.session.execute(artifact_statement)).all()
+        result_references: list[ResultReference] = []
+        if isinstance(case_id, UUID):
+            result_references.append(ResultReference(kind="case", id=case_id))
+        for kind, artifact_id in artifact_rows:
+            if kind not in {"reply_draft", "review_flag"} or not isinstance(
+                artifact_id, UUID
+            ):
+                continue
+            result_references.append(
+                ResultReference(kind=kind, id=artifact_id)  # type: ignore[arg-type]
+            )
         return PersistedJobRead(
             job_id=job.id,
             trace_id=job.trace_id,
@@ -152,6 +175,7 @@ class JobRepository:
             created_at=job.created_at,
             started_at=job.started_at,
             finished_at=job.finished_at,
+            result_references=tuple(result_references),
         )
 
     async def get_observation_identity(
@@ -260,14 +284,19 @@ class JobRepository:
         *,
         now: datetime,
         lease_until: datetime,
+        excluded_tenant_ids: Collection[UUID] = (),
     ) -> ClaimedJob | None:
         async with self.session.begin():
+            excluded = tuple(excluded_tenant_ids)
+            predicates = [
+                AgentJob.status == "queued",
+                AgentJob.available_at <= now,
+            ]
+            if excluded:
+                predicates.append(AgentJob.tenant_id.not_in(excluded))
             statement = (
                 select(AgentJob)
-                .where(
-                    AgentJob.status == "queued",
-                    AgentJob.available_at <= now,
-                )
+                .where(*predicates)
                 .order_by(AgentJob.available_at, AgentJob.id)
                 .limit(1)
                 .with_for_update(skip_locked=True)

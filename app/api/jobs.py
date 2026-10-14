@@ -12,7 +12,6 @@ from app.db.models import Tenant
 from app.db.session import get_db_session
 from app.domain.job_repository import JobRepository
 from app.domain.jobs import JobRead, project_job_read
-from app.runtime.profiles import TenantProfileUnavailableError
 
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -30,10 +29,4 @@ async def get_job(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Job not found",
         )
-    try:
-        return project_job_read(row)
-    except (TenantProfileUnavailableError, RuntimeError, TypeError, ValueError) as error:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Job profile unavailable",
-        ) from error
+    return project_job_read(row)

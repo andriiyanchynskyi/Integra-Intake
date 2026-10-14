@@ -29,6 +29,7 @@ from app.domain.job_repository import ClaimedJob, JobLeaseLostError, LeaseRecove
 from app.observability import EventName, OutcomeCode, RecordingObserver, WorkerErrorCode
 from app.runtime.preflight import TerminalPreflightResult
 from app.runtime.profiles import canonical_json_bytes
+from app.runtime.gateway import WorkerAsyncGateway
 from app.tenants.config import RoutingStatus
 from app.workers.agent_worker import AgentWorker, RetryableJobError
 
@@ -212,6 +213,22 @@ def _result(*, status: RunStatus, reason: StopReason, final_response: str | None
         messages=(),
         steps=2,
         final_response=final_response,
+        execution_path=(
+            (
+                ExecutionPathEntry(
+                    step=2,
+                    action_key=None,
+                    action_known=False,
+                    policy_decision="allow",
+                    routing_status="ready",
+                    policy_reason="no_action_requested",
+                    tool_outcome=None,
+                    side_effect_committed=False,
+                ),
+            )
+            if status is RunStatus.COMPLETED
+            else ()
+        ),
     )
 
 
@@ -271,6 +288,7 @@ def test_result_summary_keeps_only_safe_routing_fields_from_terminal_tool_data()
         "routing_status",
         "routing_reason",
         "missing_required_fields",
+        "business_outcome",
         "execution_path",
     }
     assert summary == {
@@ -280,6 +298,7 @@ def test_result_summary_keeps_only_safe_routing_fields_from_terminal_tool_data()
         "routing_status": "awaiting_input",
         "routing_reason": "document_unreadable",
         "missing_required_fields": ["origin", "valid_until"],
+        "business_outcome": "routing_only",
         "execution_path": [
             {
                 "step": 2,
@@ -365,7 +384,23 @@ async def test_persist_result_redacts_document_response_from_job_summary(
         "status": "completed",
         "reason": "executor_stopped",
         "steps": 2,
-        "execution_path": [],
+        "routing_status": "ready",
+        "routing_reason": "no_action_requested",
+        "missing_required_fields": [],
+        "business_outcome": "routing_only",
+        "execution_path": [
+            {
+                "step": 2,
+                "action_key": None,
+                "action_known": False,
+                "policy_decision": "allow",
+                "routing_status": "ready",
+                "policy_reason": "no_action_requested",
+                "missing_required_fields": [],
+                "tool_outcome": None,
+                "side_effect_committed": False,
+            }
+        ],
     }
     assert "secret document excerpt" not in repr(summary)
 
@@ -433,12 +468,37 @@ async def test_serve_once_runs_loop_through_injected_to_thread_seam(
     succeeded = [entry for entry in repository.calls if entry[0] == "mark_succeeded"]
     assert succeeded
     summary = succeeded[-1][1][0][1]  # type: ignore[index]
-    assert set(summary) == {"status", "reason", "steps", "execution_path"}
+    assert set(summary) == {
+        "status",
+        "reason",
+        "steps",
+        "routing_status",
+        "routing_reason",
+        "missing_required_fields",
+        "business_outcome",
+        "execution_path",
+    }
     assert summary == {
         "status": "completed",
         "reason": "final",
         "steps": 2,
-        "execution_path": [],
+        "routing_status": "ready",
+        "routing_reason": "no_action_requested",
+        "missing_required_fields": [],
+        "business_outcome": "routing_only",
+        "execution_path": [
+            {
+                "step": 2,
+                "action_key": None,
+                "action_known": False,
+                "policy_decision": "allow",
+                "routing_status": "ready",
+                "policy_reason": "no_action_requested",
+                "missing_required_fields": [],
+                "tool_outcome": None,
+                "side_effect_committed": False,
+            }
+        ],
     }
 
 
@@ -557,9 +617,10 @@ async def test_terminal_unreadable_preflight_is_persisted_as_safe_success(
         "reason": "executor_stopped",
         "steps": 0,
         "routing_status": "awaiting_input",
-        "routing_reason": "document_unreadable",
-        "missing_required_fields": ["required_field"],
-        "execution_path": [],
+            "routing_reason": "document_unreadable",
+            "missing_required_fields": ["required_field"],
+            "business_outcome": "routing_only",
+            "execution_path": [],
     }
     assert "synthetic_document" not in repr(summary)
     assert not [entry for entry in repository.calls if entry[0] == "mark_failed"]
@@ -975,3 +1036,72 @@ async def test_retryable_error_after_side_effect_is_failed_uncertain(
     ]
     assert uncertain
     assert uncertain[-1][1][0][1] == "side_effect_committed"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_job_deadline_returns_stable_retryable_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    claimed = _claimed()
+
+    async def blocked_to_thread(function: object, *args: object) -> object:
+        del function, args
+        await asyncio.sleep(10)
+        return None
+
+    worker = AgentWorker(
+        _SessionFactory(),
+        settings=Settings(
+            worker_job_timeout_seconds=0.01,
+            worker_shutdown_grace_seconds=0.01,
+            worker_lease_seconds=60,
+        ),
+        to_thread=blocked_to_thread,
+    )
+
+    with pytest.raises(RetryableJobError) as raised:
+        await worker._run_claimed_with_lease(
+            claimed,
+            WorkerAsyncGateway(asyncio.get_running_loop()),
+        )
+
+    assert raised.value.error_code == WorkerErrorCode.WORKER_TIMEOUT.value
+
+
+@pytest.mark.asyncio
+async def test_serve_retries_transient_persistence_with_bounded_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    delays: list[float] = []
+
+    async def flaky_serve_once(**kwargs: object) -> bool:
+        del kwargs
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionError("database unavailable")
+        raise asyncio.CancelledError
+
+    async def stop_after_backoff(delay: float) -> None:
+        delays.append(delay)
+        raise asyncio.CancelledError
+
+    worker = AgentWorker(
+        _SessionFactory(),
+        settings=Settings(
+            worker_poll_interval_seconds=0.01,
+            worker_persistence_backoff_initial_seconds=0.5,
+            worker_persistence_backoff_max_seconds=2.0,
+        ),
+        sleep=stop_after_backoff,
+        random_uniform=lambda _lower, _upper: 0.0,
+    )
+    monkeypatch.setattr(worker, "serve_once", flaky_serve_once)
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker.serve()
+
+    assert calls == 1
+    assert delays == [0.5]

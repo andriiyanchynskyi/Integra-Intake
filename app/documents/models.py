@@ -36,6 +36,7 @@ class DocumentExtractionError(str, Enum):
     PDF_ENCRYPTED = "pdf_encrypted"
     PDF_EMPTY = "pdf_empty"
     DOCUMENT_TEXT_EMPTY = "document_text_empty"
+    DOCUMENT_PROCESSING_TIMEOUT = "document_processing_timeout"
 
 
 class _StrictDocumentModel(BaseModel):

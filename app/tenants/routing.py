@@ -2,7 +2,12 @@
 
 from dataclasses import dataclass
 
-from app.tenants.config import RoutingDecision, RoutingStatus, TenantConfig
+from app.tenants.config import (
+    ActionExecutionMode,
+    RoutingDecision,
+    RoutingStatus,
+    TenantConfig,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,8 +17,11 @@ class RoutingAssessment:
     contains_safety_or_legal_risk: bool
     requested_action: str
     requires_complete_fields: bool = True
-    registered_actions: frozenset[str] | None = None
+    executable_actions: frozenset[str] | None = None
     is_critical: bool = False
+    # Compatibility alias for callers that construct this public assessment
+    # directly. Runtime policy supplies executable_actions.
+    registered_actions: frozenset[str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,14 +40,6 @@ class TenantRouter:
         self._intake_types = {item.name: item for item in config.intake_types}
 
     def route(self, assessment: RoutingAssessment) -> RoutingOutcome:
-        if assessment.contains_safety_or_legal_risk:
-            return RoutingOutcome(
-                status=RoutingStatus.URGENT,
-                decision=RoutingDecision.NEEDS_APPROVAL,
-                missing_required_fields=(),
-                reason="safety_or_legal_risk",
-            )
-
         intake = self._intake_types.get(assessment.intake_type)
         if intake is None:
             return RoutingOutcome(
@@ -58,17 +58,6 @@ class TenantRouter:
                 reason="missing_required_fields",
             )
 
-        if (
-            assessment.registered_actions is not None
-            and assessment.requested_action not in assessment.registered_actions
-        ):
-            return RoutingOutcome(
-                status=RoutingStatus.REJECTED,
-                decision=RoutingDecision.DENY,
-                missing_required_fields=(),
-                reason="action_not_configured",
-            )
-
         rule = self.config.action_policy.get(assessment.requested_action)
         if rule is None:
             return RoutingOutcome(
@@ -77,12 +66,43 @@ class TenantRouter:
                 missing_required_fields=(),
                 reason="action_not_configured",
             )
+
+        if rule.execution is not ActionExecutionMode.EXECUTABLE:
+            return RoutingOutcome(
+                status=RoutingStatus.REJECTED,
+                decision=RoutingDecision.DENY,
+                missing_required_fields=(),
+                reason="action_not_executable",
+            )
+
+        executable_actions = assessment.executable_actions
+        if executable_actions is None:
+            executable_actions = assessment.registered_actions
+        if (
+            executable_actions is not None
+            and assessment.requested_action not in executable_actions
+        ):
+            return RoutingOutcome(
+                status=RoutingStatus.REJECTED,
+                decision=RoutingDecision.DENY,
+                missing_required_fields=(),
+                reason="action_not_configured",
+            )
+
         if not rule.allowed:
             return RoutingOutcome(
                 status=RoutingStatus.REJECTED,
                 decision=RoutingDecision.DENY,
                 missing_required_fields=(),
                 reason="action_not_allowed",
+            )
+
+        if assessment.contains_safety_or_legal_risk:
+            return RoutingOutcome(
+                status=RoutingStatus.URGENT,
+                decision=RoutingDecision.NEEDS_APPROVAL,
+                missing_required_fields=(),
+                reason="safety_or_legal_risk",
             )
 
         if (

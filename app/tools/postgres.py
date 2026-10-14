@@ -5,15 +5,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import threading
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.agent import ToolData
+from app.agent import ResultReference, ToolData
 from app.core.config import Settings, settings
 from app.db.models import AgentJob, Approval, IdempotencyRecord
 from app.domain.approval_repository import ApprovalRepository
+from app.domain.artifact_repository import ArtifactRepository
 from app.domain.repositories import CaseRepository
 from app.domain.service import CaseService
 from app.policy import TrustedSource, trusted_source_from_snapshot
@@ -48,11 +50,17 @@ class PostgresTenantToolPort:
         job_id: UUID,
         attempt_count: int | None = None,
         runtime_settings: Settings | None = None,
+        cancellation_event: threading.Event | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._job_id = job_id
         self._attempt_count = attempt_count
         self._settings = runtime_settings or settings
+        self._cancellation_event = cancellation_event
+
+    def _check_cancelled(self) -> None:
+        if self._cancellation_event is not None and self._cancellation_event.is_set():
+            raise RuntimeError("worker execution cancelled")
 
     async def find_customer(
         self,
@@ -61,6 +69,7 @@ class PostgresTenantToolPort:
         email: str | None,
         external_id: str | None,
     ) -> CustomerSummary | None:
+        self._check_cancelled()
         async with self._session_factory() as session:
             customer = await CaseRepository(session).find_customer_for_tenant(
                 tenant_id,
@@ -69,18 +78,23 @@ class PostgresTenantToolPort:
             )
             if customer is None:
                 return None
-            return CustomerSummary(
+            result = CustomerSummary(
                 id=str(customer.id),
                 external_id=customer.external_id,
                 name=customer.name,
                 email=customer.email,
                 phone=customer.phone,
             )
+            self._check_cancelled()
+            return result
 
     async def case_exists(self, tenant_id: UUID, case_id: UUID) -> bool:
+        self._check_cancelled()
         async with self._session_factory() as session:
             case = await CaseRepository(session).get_for_tenant(case_id, tenant_id)
-            return case is not None
+            result = case is not None
+            self._check_cancelled()
+            return result
 
     async def request_approval(
         self,
@@ -89,6 +103,7 @@ class PostgresTenantToolPort:
         action: PendingAction,
         policy_reason: str,
     ) -> ApprovalRequested:
+        self._check_cancelled()
         async with self._session_factory() as session:
             return await ApprovalRepository(session).create_for_running_job(
                 tenant_id,
@@ -108,6 +123,7 @@ class PostgresTenantToolPort:
         customer_id: UUID | None,
         fields: Mapping[str, ToolData],
     ) -> CreatedCase:
+        self._check_cancelled()
         async with self._session_factory() as session:
             async with session.begin():
                 repository = CaseRepository(session)
@@ -143,12 +159,63 @@ class PostgresTenantToolPort:
                     payload={},
                 )
                 idempotency.case_id = case.id
+                self._check_cancelled()
                 await self._mark_side_effect(session, tenant_id)
                 return CreatedCase(
                     id=str(case.id),
                     status=case.status,
                     accepted_fields=sorted(fields),
                 )
+
+    async def create_reply_draft(
+        self,
+        tenant_id: UUID,
+        *,
+        job_id: UUID | None,
+        recipient: str | None,
+        subject: str,
+        body: str,
+    ) -> ResultReference:
+        self._check_cancelled()
+        if job_id is not None and job_id != self._job_id:
+            raise RuntimeError("artifact job is unavailable")
+        async with self._session_factory() as session:
+            async with session.begin():
+                reference = await ArtifactRepository(session).create_for_job(
+                    tenant_id,
+                    self._job_id,
+                    kind="reply_draft",
+                    payload={
+                        "recipient": recipient,
+                        "subject": subject,
+                        "body": body,
+                    },
+                )
+                self._check_cancelled()
+                await self._mark_side_effect(session, tenant_id)
+                return reference
+
+    async def flag_for_review(
+        self,
+        tenant_id: UUID,
+        *,
+        job_id: UUID | None,
+        reason: str,
+    ) -> ResultReference:
+        self._check_cancelled()
+        if job_id is not None and job_id != self._job_id:
+            raise RuntimeError("artifact job is unavailable")
+        async with self._session_factory() as session:
+            async with session.begin():
+                reference = await ArtifactRepository(session).create_for_job(
+                    tenant_id,
+                    self._job_id,
+                    kind="review_flag",
+                    payload={"reason": reason},
+                )
+                self._check_cancelled()
+                await self._mark_side_effect(session, tenant_id)
+                return reference
 
     async def update_case_fields(
         self,
@@ -157,6 +224,7 @@ class PostgresTenantToolPort:
         *,
         fields: Mapping[str, ToolData],
     ) -> UpdatedCase | None:
+        self._check_cancelled()
         async with self._session_factory() as session:
             async with session.begin():
                 repository = CaseRepository(session)
@@ -166,6 +234,7 @@ class PostgresTenantToolPort:
                 merged = deepcopy(dict(case.extracted_fields or {}))
                 merged.update(deepcopy(dict(fields)))
                 case.extracted_fields = merged
+                self._check_cancelled()
                 CaseService(session).append_event(
                     tenant_id,
                     case.id,
@@ -195,6 +264,7 @@ class PostgresTenantToolPort:
         return record
 
     async def _mark_side_effect(self, session: AsyncSession, tenant_id: UUID) -> None:
+        self._check_cancelled()
         conditions = [
             AgentJob.id == self._job_id,
             AgentJob.tenant_id == tenant_id,
@@ -210,6 +280,7 @@ class PostgresTenantToolPort:
         job = (await session.execute(statement)).scalar_one_or_none()
         if job is None:
             raise RuntimeError("agent job is unavailable")
+        self._check_cancelled()
         job.side_effect_committed_at = datetime.now(timezone.utc)
 
 
@@ -224,6 +295,11 @@ class SyncTenantToolPort(TenantToolPort):
         self._gateway = gateway
         self._async_port = async_port
 
+    def _check_cancelled(self) -> None:
+        checker = getattr(self._async_port, "_check_cancelled", None)
+        if callable(checker):
+            checker()
+
     def find_customer(
         self,
         tenant_id: UUID,
@@ -231,11 +307,14 @@ class SyncTenantToolPort(TenantToolPort):
         email: str | None,
         external_id: str | None,
     ) -> CustomerSummary | None:
-        return self._gateway.call(
+        self._check_cancelled()
+        result = self._gateway.call(
             self._async_port.find_customer(
                 tenant_id, email=email, external_id=external_id
             )
         )
+        self._check_cancelled()
+        return result
 
     def create_case(
         self,
@@ -245,7 +324,8 @@ class SyncTenantToolPort(TenantToolPort):
         customer_id: UUID | None,
         fields: Mapping[str, ToolData],
     ) -> CreatedCase:
-        return self._gateway.call(
+        self._check_cancelled()
+        result = self._gateway.call(
             self._async_port.create_case(
                 tenant_id,
                 source,
@@ -253,6 +333,8 @@ class SyncTenantToolPort(TenantToolPort):
                 fields=fields,
             )
         )
+        self._check_cancelled()
+        return result
 
     def update_case_fields(
         self,
@@ -261,18 +343,24 @@ class SyncTenantToolPort(TenantToolPort):
         *,
         fields: Mapping[str, ToolData],
     ) -> UpdatedCase | None:
-        return self._gateway.call(
+        self._check_cancelled()
+        result = self._gateway.call(
             self._async_port.update_case_fields(
                 tenant_id,
                 case_id,
                 fields=fields,
             )
         )
+        self._check_cancelled()
+        return result
 
     def case_exists(self, tenant_id: UUID, case_id: UUID) -> bool:
-        return self._gateway.call(
+        self._check_cancelled()
+        result = self._gateway.call(
             self._async_port.case_exists(tenant_id, case_id)
         )
+        self._check_cancelled()
+        return result
 
     def request_approval(
         self,
@@ -281,13 +369,56 @@ class SyncTenantToolPort(TenantToolPort):
         action: PendingAction,
         policy_reason: str,
     ) -> ApprovalRequested:
-        return self._gateway.call(
+        self._check_cancelled()
+        result = self._gateway.call(
             self._async_port.request_approval(
                 tenant_id,
                 action=action,
                 policy_reason=policy_reason,
             )
         )
+        self._check_cancelled()
+        return result
+
+    def create_reply_draft(
+        self,
+        tenant_id: UUID,
+        *,
+        job_id: UUID | None,
+        recipient: str | None,
+        subject: str,
+        body: str,
+    ) -> ResultReference:
+        self._check_cancelled()
+        result = self._gateway.call(
+            self._async_port.create_reply_draft(
+                tenant_id,
+                job_id=job_id,
+                recipient=recipient,
+                subject=subject,
+                body=body,
+            )
+        )
+        self._check_cancelled()
+        return result
+
+    def flag_for_review(
+        self,
+        tenant_id: UUID,
+        *,
+        job_id: UUID | None,
+        reason: str,
+    ) -> ResultReference:
+        self._check_cancelled()
+        result = self._gateway.call(
+            self._async_port.flag_for_review(
+                tenant_id,
+                job_id=job_id,
+                reason=reason,
+            )
+        )
+        self._check_cancelled()
+        return result
 
 
 class PostgresApprovalActionExecutor:
@@ -374,6 +505,7 @@ class PostgresApprovalActionExecutor:
             email=values.email,
             external_id=values.external_id,
         )
+
         return {
             "found": customer is not None,
             "customer_id": str(customer.id) if customer is not None else None,
@@ -386,7 +518,6 @@ class PostgresApprovalActionExecutor:
         job: AgentJob,
         action: PendingAction,
     ) -> dict[str, object]:
-        del job
         values = CreateReplyDraftArgs.model_validate(action.arguments)
         if values.case_id is not None:
             case = await CaseRepository(session).get_for_tenant(
@@ -395,7 +526,24 @@ class PostgresApprovalActionExecutor:
             if case is None:
                 raise RuntimeError("approved case is unavailable")
             approval.case_id = case.id
-        return {"outcome": "draft_generated", "persisted": False}
+        source = self._source_from_job(job.source_snapshot)
+        recipient = action.known_fields.get("contact")
+        if not isinstance(recipient, str):
+            recipient = None
+        reference = await ArtifactRepository(session).create_for_job(
+            approval.tenant_id,
+            job.id,
+            kind="reply_draft",
+            payload={
+                "recipient": recipient,
+                "subject": source.subject or "Intake reply",
+                "body": "Reply draft generated for operator review.",
+            },
+        )
+        return {
+            "result_reference": reference.model_dump(mode="json"),
+            "persisted": True,
+        }
 
     async def _flag_for_review(
         self,
@@ -404,9 +552,19 @@ class PostgresApprovalActionExecutor:
         job: AgentJob,
         action: PendingAction,
     ) -> dict[str, object]:
-        del session, approval, job
-        FlagForReviewArgs.model_validate(action.arguments)
-        return {"outcome": "review_flagged", "persisted": False}
+        values = FlagForReviewArgs.model_validate(action.arguments)
+        reference = await ArtifactRepository(session).create_for_job(
+            approval.tenant_id,
+            job.id,
+            kind="review_flag",
+            payload={
+                "reason": values.note or "Review requested for operator follow-up.",
+            },
+        )
+        return {
+            "result_reference": reference.model_dump(mode="json"),
+            "persisted": True,
+        }
 
     async def _create_case(
         self,

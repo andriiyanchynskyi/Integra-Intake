@@ -10,6 +10,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
+from app.agent import ResultReference
 from app.agent.models import StopReason
 from app.observability.events import OutcomeCode, PolicyReason, WorkerErrorCode
 from app.runtime.profiles import resolve_persisted_profile
@@ -50,6 +51,7 @@ class PersistedJobRead:
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+    result_references: tuple[ResultReference, ...] = ()
 
 
 class ApprovalRead(BaseModel):
@@ -78,7 +80,7 @@ class JobRead(BaseModel):
 
     job_id: UUID
     trace_id: UUID
-    scenario_key: str
+    scenario_key: SafeIdentifier | None = None
     status: JobStatus
     attempt_count: int
     agent_steps: int | None = None
@@ -88,6 +90,7 @@ class JobRead(BaseModel):
     routing_reason: str | None = None
     missing_required_fields: tuple[str, ...] = ()
     approval: ApprovalRead | None = None
+    result_references: tuple[ResultReference, ...] = ()
     error_code: str | None = None
     created_at: datetime
     started_at: datetime | None = None
@@ -209,25 +212,31 @@ def _safe_execution_values(
 
 
 def project_job_read(row: PersistedJobRead) -> JobRead:
-    """Resolve trusted identity and return only the closed public read model."""
+    """Return a safe status projection with optional profile enrichment."""
 
     if row.status not in _JOB_STATUSES:
         raise ValueError("unsupported job status")
-    profile = resolve_persisted_profile(
-        row.tenant_config_snapshot,
-        row.tenant_config_sha256,
-    )
-    scenario_key = (
-        profile.compiled.scenario_key
-        if profile.compiled is not None
-        else profile.config.scenario_key
-    )
+    scenario_key: str | None = None
+    registered_actions = frozenset()
+    try:
+        profile = resolve_persisted_profile(
+            row.tenant_config_snapshot,
+            row.tenant_config_sha256,
+        )
+    except Exception:
+        profile = None
+    if profile is not None:
+        scenario_key = (
+            profile.compiled.scenario_key
+            if profile.compiled is not None
+            else profile.config.scenario_key
+        )
+        registered_actions = (
+            profile.compiled.registered_actions
+            if profile.compiled is not None
+            else frozenset(profile.config.action_policy)
+        )
     routing_status, routing_reason, missing = _safe_result_values(row.result)
-    registered_actions = (
-        profile.compiled.registered_actions
-        if profile.compiled is not None
-        else frozenset(profile.config.action_policy)
-    )
     agent_steps, stop_reason, execution_path = _safe_execution_values(
         row.result,
         registered_actions,
@@ -251,6 +260,7 @@ def project_job_read(row: PersistedJobRead) -> JobRead:
         routing_reason=routing_reason,
         missing_required_fields=missing,
         approval=approval,
+        result_references=row.result_references,
         error_code=_safe_error_code(row.error_code),
         created_at=row.created_at,
         started_at=row.started_at,

@@ -122,7 +122,10 @@ class ApprovalRepository:
                 },
             )
             job.status = "awaiting_approval"
-            job.finished_at = now
+            # Parking for a human decision is not a terminal processing state.
+            # The job is finalized by the same transaction that resolves the
+            # approval, so its completion timestamp must remain unset here.
+            job.finished_at = None
             job.lease_expires_at = None
             job.result = {
                 "status": "awaiting_approval",
@@ -131,6 +134,23 @@ class ApprovalRepository:
             }
             job.error_code = None
             return ApprovalRequested(id=approval.id, expires_at=expires_at)
+
+    async def get_job_for_update(
+        self,
+        tenant_id: UUID,
+        job_id: UUID,
+    ) -> AgentJob | None:
+        """Lock the approval's tenant-owned job after the approval row lock."""
+
+        statement = (
+            select(AgentJob)
+            .where(
+                AgentJob.id == job_id,
+                AgentJob.tenant_id == tenant_id,
+            )
+            .with_for_update()
+        )
+        return (await self.session.execute(statement)).scalar_one_or_none()
 
     async def get_for_tenant_for_update(
         self, approval_id: UUID, tenant_id: UUID
@@ -144,6 +164,39 @@ class ApprovalRepository:
             .with_for_update()
         )
         return (await self.session.execute(statement)).scalar_one_or_none()
+
+    async def get_for_tenant(
+        self, approval_id: UUID, tenant_id: UUID
+    ) -> Approval | None:
+        """Read one approval through the authenticated tenant predicate."""
+
+        statement = select(Approval).where(
+            Approval.id == approval_id,
+            Approval.tenant_id == tenant_id,
+        )
+        return (await self.session.execute(statement)).scalar_one_or_none()
+
+    async def list_for_tenant(
+        self,
+        tenant_id: UUID,
+        *,
+        status: str,
+        limit: int,
+    ) -> tuple[Approval, ...]:
+        """Return one bounded, tenant-scoped approval review page."""
+
+        bounded_limit = min(max(limit, 1), 100)
+        statement = (
+            select(Approval)
+            .where(
+                Approval.tenant_id == tenant_id,
+                Approval.status == status,
+            )
+            .order_by(Approval.expires_at, Approval.id)
+            .limit(bounded_limit + 1)
+        )
+        approvals = (await self.session.execute(statement)).scalars().all()
+        return tuple(approvals)
 
     async def get_job_trace_id(self, approval: Approval) -> UUID:
         if approval.job_id is None:
@@ -175,7 +228,17 @@ class ApprovalRepository:
             approvals = (await self.session.execute(statement)).scalars().all()
             observations: list[ExpiredApprovalObservation] = []
             for approval in approvals:
+                job = None
+                if approval.job_id is not None:
+                    job = await self.get_job_for_update(
+                        approval.tenant_id,
+                        approval.job_id,
+                    )
+                    if job is None:
+                        raise ApprovalCreationConflict("approval job is unavailable")
                 self.expire_locked(approval, now=now)
+                if job is not None:
+                    self.finalize_job_for_decision(approval, job, now=now)
                 if approval.job_id is None or approval.created_at is None:
                     continue
                 identity = await self.get_job_observation_identity(approval)
@@ -257,6 +320,70 @@ class ApprovalRepository:
             actor_ref="system_timeout",
             payload={},
         )
+
+    def finalize_job_for_decision(
+        self,
+        approval: Approval,
+        job: AgentJob,
+        *,
+        now: datetime,
+    ) -> None:
+        """Resolve the already-locked parked job exactly once.
+
+        Approval decisions are the durable boundary for parked jobs.  The
+        result intentionally contains only lifecycle metadata and allowlisted
+        identifiers; executor payloads never become a job-readable result.
+        """
+
+        if approval.status == "approved":
+            status = "succeeded"
+            error_code = None
+            business_outcome = "tool_result"
+        elif approval.status == "rejected":
+            status = "succeeded"
+            error_code = None
+            business_outcome = "approval_rejected"
+        elif approval.status == "expired":
+            status = "failed"
+            error_code = "approval_expired"
+            business_outcome = "approval_expired"
+        else:
+            raise ApprovalCreationConflict("approval decision is not final")
+
+        if job.status != "awaiting_approval":
+            # A caller may defensively retry after a committed decision.  Do
+            # not rewrite a terminal job or clear a side-effect marker.
+            if (
+                job.status == status
+                and isinstance(job.result, dict)
+                and job.result.get("approval_id") == str(approval.id)
+                and job.result.get("approval_status") == approval.status
+            ):
+                return
+            raise ApprovalCreationConflict("approval job is not awaiting approval")
+
+        result_reference: dict[str, str] = {}
+        case_id = approval.case_id
+        if case_id is None and isinstance(approval.execution_result, dict):
+            raw_case_id = approval.execution_result.get("case_id")
+            if isinstance(raw_case_id, str):
+                try:
+                    case_id = UUID(raw_case_id)
+                except ValueError:
+                    case_id = None
+        if isinstance(case_id, UUID):
+            result_reference["case_id"] = str(case_id)
+
+        job.status = status
+        job.error_code = error_code
+        job.finished_at = now
+        job.lease_expires_at = None
+        job.result = {
+            "business_outcome": business_outcome,
+            "approval_id": str(approval.id),
+            "approval_status": approval.status,
+            "result_reference": result_reference,
+        }
 
     def add_event(
         self,

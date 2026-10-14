@@ -188,7 +188,20 @@ class DocumentNormalizer:
                     DocumentExtractionError.DOCUMENT_TOO_LARGE,
                     **binding,
                 )
-            extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+            parts: list[str] = []
+            text_chars = 0
+            for page in reader.pages:
+                part = page.extract_text() or ""
+                text_chars += len(part) + (1 if parts else 0)
+                if text_chars > MAX_DOCUMENT_TEXT_CHARS:
+                    return self._error(
+                        value.media_type,
+                        digest,
+                        DocumentExtractionError.DOCUMENT_TEXT_TOO_LARGE,
+                        **binding,
+                    )
+                parts.append(part)
+            extracted = "\n".join(parts)
         except (PdfReadError, OSError, ValueError, KeyError, IndexError):
             return self._error(
                 value.media_type,

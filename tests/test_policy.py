@@ -201,6 +201,7 @@ def evaluate(
     safety_or_legal_risk: bool = False,
     document=None,
     verified_present_fields: frozenset[str] | None = None,
+    invalid_fields: tuple[str, ...] = (),
 ):
     return PolicyEngine().evaluate(
         PolicyInput(
@@ -224,6 +225,7 @@ def evaluate(
                 document=document,
             ),
             verified_present_fields=verified_present_fields,
+            invalid_fields=invalid_fields,
         )
     )
 
@@ -242,7 +244,7 @@ def assert_outcome(
     assert outcome.missing_required_fields == missing
 
 
-def test_trusted_risk_precedes_unknown_intake_type_and_action(
+def test_unknown_intake_type_precedes_trusted_risk_and_action(
     tenant_config: TenantConfig,
 ) -> None:
     outcome = evaluate(
@@ -255,9 +257,9 @@ def test_trusted_risk_precedes_unknown_intake_type_and_action(
 
     assert_outcome(
         outcome,
-        status=RoutingStatus.URGENT,
-        decision=RoutingDecision.NEEDS_APPROVAL,
-        reason="safety_or_legal_risk",
+        status=RoutingStatus.REJECTED,
+        decision=RoutingDecision.DENY,
+        reason="unknown_intake_type",
     )
 
 
@@ -350,7 +352,7 @@ def test_find_customer_can_run_without_complete_required_fields(
     )
 
 
-def test_send_reply_is_unknown_when_not_registered_even_if_yaml_configures_it(
+def test_send_reply_is_non_executable_even_if_yaml_configures_it(
     tenant_config: TenantConfig,
 ) -> None:
     outcome = evaluate(
@@ -366,7 +368,7 @@ def test_send_reply_is_unknown_when_not_registered_even_if_yaml_configures_it(
         outcome,
         status=RoutingStatus.REJECTED,
         decision=RoutingDecision.DENY,
-        reason="action_not_configured",
+        reason="action_not_executable",
     )
 
 
@@ -391,7 +393,7 @@ def test_yaml_disallowed_action_is_denied(
     )
 
 
-def test_requires_approval_action_is_pending_approval(
+def test_policy_only_approval_action_is_denied_before_review(
     tenant_config: TenantConfig,
 ) -> None:
     outcome = evaluate(
@@ -402,9 +404,79 @@ def test_requires_approval_action_is_pending_approval(
 
     assert_outcome(
         outcome,
-        status=RoutingStatus.PENDING_APPROVAL,
+        status=RoutingStatus.REJECTED,
+        decision=RoutingDecision.DENY,
+        reason="action_not_executable",
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_reason"),
+    [
+        ("missing", "missing_required_fields"),
+        ("invalid", "invalid_field_values"),
+        ("unknown_action", "action_not_configured"),
+        ("policy_only", "action_not_executable"),
+        ("disallowed", "action_not_allowed"),
+        ("unregistered", "action_not_configured"),
+    ],
+)
+def test_risk_cannot_bypass_hard_authorization_gates(
+    profile_data: dict[str, object],
+    case: str,
+    expected_reason: str,
+) -> None:
+    config_data = deepcopy(profile_data)
+    action = "create_case"
+    proposal = make_proposal()
+    registered_actions: frozenset[str] | None = None
+    invalid_fields: tuple[str, ...] = ()
+    if case == "missing":
+        proposal = make_proposal(field_names=())
+    elif case == "invalid":
+        invalid_fields = ("summary",)
+    elif case == "unknown_action":
+        action = "not_registered"
+        registered_actions = frozenset()
+    elif case == "policy_only":
+        action = "send_reply"
+    elif case == "disallowed":
+        config_data["action_policy"]["create_case"]["allowed"] = False  # type: ignore[index]
+        config = TenantConfig.model_validate(config_data)
+    elif case == "unregistered":
+        registered_actions = frozenset()
+    else:  # pragma: no cover - guarded by parametrization
+        raise AssertionError(case)
+    config = TenantConfig.model_validate(config_data)
+
+    outcome = evaluate(
+        config,
+        proposal,
+        action=action,
+        registered_actions=registered_actions,
+        safety_or_legal_risk=True,
+        invalid_fields=invalid_fields,
+    )
+
+    assert outcome.decision is RoutingDecision.DENY
+    assert outcome.reason == expected_reason
+
+
+def test_risk_keeps_approval_for_an_allowed_executable_action(
+    tenant_config: TenantConfig,
+) -> None:
+    outcome = evaluate(
+        tenant_config,
+        make_proposal(),
+        action="create_case",
+        safety_or_legal_risk=True,
+    )
+
+    assert_outcome(
+        outcome,
+        status=RoutingStatus.URGENT,
         decision=RoutingDecision.NEEDS_APPROVAL,
-        reason="approval_required",
+        reason="safety_or_legal_risk",
     )
 
 

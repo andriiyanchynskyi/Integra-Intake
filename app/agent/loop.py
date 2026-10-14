@@ -17,6 +17,7 @@ from app.agent.models import (
     ToolData,
     ToolCall,
     ToolExecutionDisposition,
+    ToolExecutionEvidence,
     ToolExecutionResult,
 )
 from app.observability import (
@@ -45,6 +46,8 @@ class ToolExecutor(Protocol):
     def execute(
         self, proposal: AgentProposal, tool_call: ToolCall
     ) -> ToolExecutionResult: ...
+
+    def evaluate_terminal(self, proposal: AgentProposal) -> ToolExecutionResult: ...
 
 
 class AgentLoop:
@@ -100,6 +103,43 @@ class AgentLoop:
             )
 
             if proposal.is_terminal:
+                terminal_evaluator = getattr(self.tools, "evaluate_terminal", None)
+                if callable(terminal_evaluator):
+                    execution = terminal_evaluator(deepcopy(proposal))
+                else:
+                    # Compatibility for provider-free legacy doubles. Production
+                    # executors implement evaluate_terminal and apply policy.
+                    execution = ToolExecutionResult(
+                        data={
+                            "decision": "allow",
+                            "status": "ready",
+                            "reason": "no_action_requested",
+                            "missing_required_fields": [],
+                            "business_outcome": "routing_only",
+                        },
+                        continue_run=False,
+                        final_response="no_action_requested",
+                        evidence=ToolExecutionEvidence(
+                            action_key=None,
+                            action_known=False,
+                            policy_decision="allow",
+                            routing_status="ready",
+                            policy_reason="no_action_requested",
+                        ),
+                    )
+                if execution.evidence is not None:
+                    execution_path.append(
+                        ExecutionPathEntry.from_tool(steps, execution.evidence)
+                    )
+                terminal_response = execution.final_response
+                if (
+                    terminal_response == "no_action_requested"
+                    and len(execution_path) > 1
+                ):
+                    # Keep the model's human-readable closing sentence after
+                    # a prior tool result, while the execution path still
+                    # records the policy-evaluated terminal outcome.
+                    terminal_response = proposal.rationale_short
                 self._emit_step(
                     step=steps,
                     outcome=OutcomeCode.TERMINAL,
@@ -107,13 +147,21 @@ class AgentLoop:
                 )
                 return self._finish_result(
                     AgentRunResult(
-                    status=RunStatus.COMPLETED,
-                    reason=StopReason.FINAL,
-                    messages=tuple(deepcopy(messages)),
-                    steps=steps,
-                    final_response=proposal.rationale_short,
-                    proposal=deepcopy(proposal),
-                    execution_path=tuple(execution_path),
+                        status=(
+                            RunStatus.FAILED
+                            if execution.disposition is ToolExecutionDisposition.FAILED
+                            else RunStatus.COMPLETED
+                        ),
+                        reason=(
+                            StopReason.TOOL_EXECUTION_FAILED
+                            if execution.disposition is ToolExecutionDisposition.FAILED
+                            else StopReason.EXECUTOR_STOPPED
+                        ),
+                        messages=tuple(deepcopy(messages)),
+                        steps=steps,
+                        final_response=terminal_response,
+                        proposal=deepcopy(proposal),
+                        execution_path=tuple(execution_path),
                     )
                 )
 

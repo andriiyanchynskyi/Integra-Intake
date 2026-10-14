@@ -22,7 +22,7 @@ from app.observability import EventName, ObservationContext, OutcomeCode, Record
 
 VALID_PROPOSAL = {
     "intake_type": "freight",
-    "fields": [{"name": "reference", "value": "REF-123"}],
+    "fields": [{"name": "reference", "value": "REF-123", "source": None}],
     "missing_required_fields": ["weight"],
     "priority": "high",
     "contains_injection_or_override_attempt": False,
@@ -124,14 +124,16 @@ def test_valid_structured_proposal_uses_openai_compatible_contract() -> None:
             schema["properties"]["fields"]["items"], schema
         )
         assert set(fields_schema["required"]) == {
-            "name",
-            "value",
-            "source_excerpt",
+        "name",
+        "value",
+        "source",
+        "source_excerpt",
         }
         assert set(fields_schema["properties"]) == {
-            "name",
-            "value",
-            "source_excerpt",
+        "name",
+        "value",
+        "source",
+        "source_excerpt",
         }
         tool_calls_schema = _resolve_schema_ref(
             schema["properties"]["tool_calls"]["items"], schema
@@ -162,7 +164,12 @@ def test_valid_structured_proposal_uses_openai_compatible_contract() -> None:
     assert isinstance(proposal, AgentProposal)
     assert proposal.intake_type == "freight"
     assert proposal.model_dump(mode="json")["fields"] == [
-        {"name": "reference", "value": "REF-123", "source_excerpt": None}
+        {
+            "name": "reference",
+            "value": "REF-123",
+            "source": None,
+            "source_excerpt": None,
+        }
     ]
     assert proposal.missing_required_fields == ["weight"]
     assert proposal.priority is ProposalPriority.HIGH
@@ -170,7 +177,12 @@ def test_valid_structured_proposal_uses_openai_compatible_contract() -> None:
     assert proposal.rationale_short == "The shipment needs a weight before routing."
     assert proposal.tool_calls[0].name == "lookup_customer"
     assert proposal.tool_calls[0].model_dump(mode="json")["arguments"] == [
-        {"name": "customer_id", "value": "cust-1", "source_excerpt": None}
+        {
+            "name": "customer_id",
+            "value": "cust-1",
+            "source": None,
+            "source_excerpt": None,
+        }
     ]
     assert proposal.tool_call is not None
     assert proposal.tool_call.arguments == {"customer_id": "cust-1"}

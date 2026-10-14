@@ -29,6 +29,7 @@ services:
   worker:
     build: .
     command: ["python", "-m", "app.workers"]
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgresql+asyncpg://integra:integra@db:5432/integra
       APP_ENV: docker
@@ -39,6 +40,11 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.workers.healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
 volumes:
   pgdata:

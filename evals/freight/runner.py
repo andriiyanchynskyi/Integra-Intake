@@ -46,6 +46,7 @@ from app.tools.executor import PolicyGatedToolExecutor
 from app.tools.in_memory import InMemoryTenantToolPort
 
 from evals.core import (
+    last_business_outcome,
     RecordingPolicy,
     ScenarioExecutionError,
     ScriptedLLM,
@@ -462,7 +463,7 @@ def _agent_observation(
         extra_mismatches.append(error.code)
 
     first_proposal = llm.returned_proposals[0] if llm.returned_proposals else None
-    outcome = policy.outcomes[-1] if policy.outcomes else None
+    outcome = last_business_outcome(policy)
     missing = (
         tuple(sorted(outcome.missing_required_fields)) if outcome is not None else None
     )

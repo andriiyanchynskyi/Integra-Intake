@@ -636,6 +636,10 @@ class _FailingWorkerRepository:
         del args, kwargs
         raise RuntimeError("synthetic worker persistence failure")
 
+    async def mark_failed(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("synthetic worker persistence failure")
+
 
 @pytest.mark.asyncio
 async def test_worker_persistence_failure_keeps_known_profile_identity(
@@ -681,6 +685,6 @@ async def test_worker_persistence_failure_keeps_known_profile_identity(
         for event in observer.events
         if event.event is EventName.PERSISTENCE_OPERATION_FAILED
     )
-    assert event.persistence_operation is PersistenceOperation.MARK_SUCCEEDED
+    assert event.persistence_operation is PersistenceOperation.MARK_FAILED
     assert event.scenario_key == profile.compiled.scenario_key  # type: ignore[union-attr]
     assert event.profile_fingerprint == profile.sha256
