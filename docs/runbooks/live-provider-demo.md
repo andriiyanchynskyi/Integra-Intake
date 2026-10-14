@@ -144,9 +144,13 @@ python scripts/live_provider_smoke.py --profile freight-broker --base-url http:/
 
 The command submits synthetic body intake through the real API, polls
 `GET /v1/jobs/{job_id}`, and prints a human-readable source-free report. Use
-`--json` for the same allowlisted report as one machine-readable object.
-`succeeded` and `awaiting_approval` are valid live outcomes. Provider output can
-vary, so the report shows the path actually observed and prints
+`--json` for the same allowlisted report as one machine-readable object. Every
+mode prints `Purpose:`, `Expected:`, and `Observed:` before lifecycle details.
+These lines state what the mode checks, which assertions define PASS, and what
+the validated job projection showed. `succeeded` and `awaiting_approval` are
+valid for connectivity-only modes; named cases can impose stricter assertions.
+Provider output can vary, so the report shows the path actually observed and
+prints
 `NOT OBSERVED` when a nullable policy or tool field was not reached.
 
 An `awaiting_approval` job has `finished_at = null` until an operator approves,
@@ -192,8 +196,12 @@ python scripts/live_provider_smoke.py `
 ```
 
 The command signs the exact JSON bytes and sends them to
-`POST /v1/inbound/email/webhook`. A `202` response and matching job trace prove
-that the real signature and tenant boundary accepted the delivery.
+`POST /v1/inbound/email/webhook`. Its synthetic load request omits `contact`.
+PASS requires `status=succeeded`, `routing_status=awaiting_input`,
+`routing_reason=missing_required_fields`,
+`missing_required_fields=["contact"]`, no approval, and no committed side effect.
+A different safe terminal outcome proves connectivity but fails this
+named business scenario; use the default smoke when only connectivity matters.
 
 ### `webhook-document-txt`
 

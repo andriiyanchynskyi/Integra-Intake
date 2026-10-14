@@ -10,6 +10,9 @@ Tenant profiles define supported fields, documents, and actions. A typed agent
 loop proposes work; server-owned policy and approval rules decide whether an
 action may run. Durable results and diagnostic events remain source-free.
 
+Follow the [Live provider demo runbook](docs/runbooks/live-provider-demo.md) to
+start the local stack, run source-free live checks, and record the evidence.
+
 ## Capabilities
 
 - Tenant-scoped direct cases, idempotent queued intake, and safe job-status

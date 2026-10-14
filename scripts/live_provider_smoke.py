@@ -120,11 +120,124 @@ class DemoCase(str, Enum):
     WEBHOOK_CONFLICT = "webhook-conflict"
 
 
+@dataclass(frozen=True, slots=True)
+class SmokeExplanation:
+    purpose: str
+    expected_outcome: str
+
+
 @dataclass(frozen=True)
 class DemoCaseSpec:
     transport: SmokeTransport
     payload: dict[str, str]
     attachment: Path | None = None
+
+
+DEFAULT_EXPLANATION = SmokeExplanation(
+    purpose=(
+        "Verify live intake connectivity through the API, job polling, worker, "
+        "configured provider, and safe terminal handling."
+    ),
+    expected_outcome=(
+        "The request is accepted and the job reaches a safe terminal status. "
+        "No fixed business classification is required."
+    ),
+)
+CUSTOM_EXPLANATION = SmokeExplanation(
+    purpose=(
+        "Verify live connectivity for caller-supplied synthetic input through "
+        "the selected transport."
+    ),
+    expected_outcome=(
+        "The job reaches a safe terminal status without asserting fixed business "
+        "semantics."
+    ),
+)
+DEMO_CASE_EXPLANATIONS: dict[DemoCase, SmokeExplanation] = {
+    DemoCase.BODY_COMPLETE: SmokeExplanation(
+        purpose="Verify complete body intake and expose its governed execution path.",
+        expected_outcome=(
+            "The job reaches a safe terminal status; a pending approval includes "
+            "an approval ID and a needs_approval policy step."
+        ),
+    ),
+    DemoCase.BODY_INCOMPLETE: SmokeExplanation(
+        purpose="Verify policy handling for a load request without contact details.",
+        expected_outcome=(
+            "The job succeeds with awaiting_input, reports only contact as missing, "
+            "and commits no side effect."
+        ),
+    ),
+    DemoCase.WEBHOOK_BODY: SmokeExplanation(
+        purpose=(
+            "Verify signed webhook acceptance and policy handling for a load "
+            "request without contact details."
+        ),
+        expected_outcome=(
+            "The job succeeds with awaiting_input and missing_required_fields, "
+            "reports only missing contact, creates no approval, and commits no "
+            "side effect."
+        ),
+    ),
+    DemoCase.WEBHOOK_DOCUMENT_TXT: SmokeExplanation(
+        purpose=(
+            "Verify signed text attachment transport, document normalization, "
+            "worker execution, and the configured provider boundary."
+        ),
+        expected_outcome=(
+            "The attachment is accepted and the job reaches a safe terminal status; "
+            "no fixed semantic classification is required."
+        ),
+    ),
+    DemoCase.WEBHOOK_DOCUMENT_PDF: SmokeExplanation(
+        purpose=(
+            "Verify signed PDF attachment transport, document normalization, "
+            "worker execution, and the configured provider boundary."
+        ),
+        expected_outcome=(
+            "The attachment is accepted and the job reaches a safe terminal status; "
+            "no fixed semantic classification is required."
+        ),
+    ),
+    DemoCase.WEBHOOK_DOCUMENT_MALFORMED: SmokeExplanation(
+        purpose="Verify deterministic preflight for an unreadable PDF attachment.",
+        expected_outcome=(
+            "The job succeeds with awaiting_input and document_unreadable before "
+            "provider, tool, or approval execution."
+        ),
+    ),
+    DemoCase.WEBHOOK_DUPLICATE: SmokeExplanation(
+        purpose="Verify idempotent handling of a repeated signed webhook delivery.",
+        expected_outcome=(
+            "The second delivery reuses the original job ID and root trace ID."
+        ),
+    ),
+    DemoCase.WEBHOOK_CONFLICT: SmokeExplanation(
+        purpose=(
+            "Verify conflict handling when one provider delivery ID is reused with "
+            "a changed payload."
+        ),
+        expected_outcome=(
+            "The changed delivery is rejected with conflict and the original job "
+            "remains the authoritative result."
+        ),
+    ),
+}
+
+
+def _with_expected_path(
+    explanation: SmokeExplanation,
+    expect_path: str | None,
+) -> SmokeExplanation:
+    if expect_path is None:
+        return explanation
+    return replace(
+        explanation,
+        expected_outcome=(
+            f"{explanation.expected_outcome} The execution path must include "
+            f"{expect_path}."
+        ),
+    )
 
 
 class SmokeInput(BaseModel):
@@ -185,8 +298,11 @@ DEMO_CASE_SPECS: dict[DemoCase, DemoCaseSpec] = {
     DemoCase.WEBHOOK_BODY: DemoCaseSpec(
         transport=SmokeTransport.WEBHOOK,
         payload={
-            "subject": "Synthetic freight webhook",
-            "body": "Synthetic freight webhook body",
+            "subject": "Synthetic incomplete freight webhook",
+            "body": (
+                "Origin: Chicago; destination: Detroit; equipment: dry_van; "
+                "pickup_window: 2026-10-01T09:00:00Z; commodity: appliances"
+            ),
         },
     ),
     DemoCase.WEBHOOK_DOCUMENT_TXT: DemoCaseSpec(
@@ -964,6 +1080,57 @@ def _check(name: str, expected: object, actual: object) -> dict[str, object]:
     }
 
 
+def _observed_outcome(
+    *,
+    acceptance_status: object,
+    job: Mapping[str, object],
+    duplicate_reused: bool | None,
+    conflict_rejected: bool | None,
+    error_code: str | None,
+) -> str:
+    observations: list[str] = []
+    if acceptance_status is not None:
+        observations.append(f"HTTP acceptance={acceptance_status}")
+    if job.get("status") is not None:
+        observations.append(f"job status={job['status']}")
+    if job.get("routing_status") is not None:
+        observations.append(f"routing status={job['routing_status']}")
+    if job.get("routing_reason") is not None:
+        observations.append(f"routing reason={job['routing_reason']}")
+    missing = job.get("missing_required_fields")
+    if isinstance(missing, list):
+        observations.append(
+            "missing fields=" + (",".join(str(item) for item in missing) or "none")
+        )
+    if "approval" in job:
+        approval = job.get("approval")
+        observations.append(
+            "approval="
+            + (
+                str(approval.get("status"))
+                if isinstance(approval, Mapping)
+                else "none"
+            )
+        )
+    path = job.get("execution_path")
+    if isinstance(path, list):
+        committed = any(
+            item.get("side_effect_committed") is True
+            for item in path
+            if isinstance(item, Mapping)
+        )
+        observations.append(f"committed side effect={'yes' if committed else 'no'}")
+    if duplicate_reused is not None:
+        observations.append(f"duplicate reused={'yes' if duplicate_reused else 'no'}")
+    if conflict_rejected is not None:
+        observations.append(f"conflict rejected={'yes' if conflict_rejected else 'no'}")
+    if error_code is not None:
+        observations.append(f"smoke error={error_code}")
+    if not observations:
+        return "No validated outcome was observed."
+    return "; ".join(observations) + "."
+
+
 def _report(
     *,
     demo_case: str | None,
@@ -973,6 +1140,7 @@ def _report(
     input_kind: str,
     job: Mapping[str, object],
     checks: list[dict[str, object]],
+    explanation: SmokeExplanation,
     duplicate_reused: bool | None = None,
     conflict_rejected: bool | None = None,
 ) -> dict[str, object]:
@@ -983,6 +1151,15 @@ def _report(
         "transport": transport.value,
         "endpoint": endpoint,
         "input_kind": input_kind,
+        "purpose": explanation.purpose,
+        "expected_outcome": explanation.expected_outcome,
+        "observed_outcome": _observed_outcome(
+            acceptance_status=202,
+            job=job,
+            duplicate_reused=duplicate_reused,
+            conflict_rejected=conflict_rejected,
+            error_code=None,
+        ),
         "acceptance_status": 202,
         "duplicate_reused": duplicate_reused,
         "conflict_rejected": conflict_rejected,
@@ -1051,6 +1228,33 @@ def _case_checks(
                 _check("status", "succeeded", job.get("status")),
                 _check("routing_status", "awaiting_input", job.get("routing_status")),
                 _check("missing_required_fields", ["contact"], job.get("missing_required_fields")),
+                _check(
+                    "no_side_effect",
+                    True,
+                    not any(
+                        item.get("side_effect_committed")
+                        for item in job.get("execution_path", [])
+                        if isinstance(item, dict)
+                    ),
+                ),
+            ]
+        )
+    elif case is DemoCase.WEBHOOK_BODY:
+        checks.extend(
+            [
+                _check("status", "succeeded", job.get("status")),
+                _check("routing_status", "awaiting_input", job.get("routing_status")),
+                _check(
+                    "routing_reason",
+                    "missing_required_fields",
+                    job.get("routing_reason"),
+                ),
+                _check(
+                    "missing_required_fields",
+                    ["contact"],
+                    job.get("missing_required_fields"),
+                ),
+                _check("approval", None, job.get("approval")),
                 _check(
                     "no_side_effect",
                     True,
@@ -1199,6 +1403,7 @@ def run_demo_case(
         input_kind=input_kind,
         job=job,
         checks=checks,
+        explanation=DEMO_CASE_EXPLANATIONS[selected],
         duplicate_reused=duplicate_reused,
         conflict_rejected=conflict_rejected,
     )
@@ -1280,6 +1485,7 @@ def run_custom_input(
         input_kind=input_kind,
         job=job,
         checks=checks,
+        explanation=_with_expected_path(CUSTOM_EXPLANATION, expect_path),
     )
 
 
@@ -1305,6 +1511,9 @@ def render_human(report: Mapping[str, object]) -> str:
         f"Transport:        {_display(report.get('transport'))}",
         f"Endpoint:         {_display(report.get('endpoint'))}",
         f"Input:            {_display(report.get('input_kind'))}",
+        f"Purpose:          {_display(report.get('purpose'))}",
+        f"Expected:         {_display(report.get('expected_outcome'))}",
+        f"Observed:         {_display(report.get('observed_outcome'))}",
         f"HTTP accepted:    {_display(report.get('acceptance_status'))}",
         f"Job ID:           {_display(safe_job.get('job_id'))}",
         f"Trace ID:         {_display(safe_job.get('trace_id'))}",
@@ -1443,6 +1652,7 @@ def _report_for_single_job(
         input_kind=input_kind,
         job=job,
         checks=checks,
+        explanation=_with_expected_path(DEFAULT_EXPLANATION, expect_path),
     )
 
 
@@ -1568,37 +1778,85 @@ def run_live_report(
     )
 
 
+def _failure_explanation(arguments: argparse.Namespace) -> SmokeExplanation:
+    expect_path = getattr(arguments, "expect_path", None)
+    if arguments.demo_case is not None:
+        try:
+            selected = DemoCase(arguments.demo_case)
+        except ValueError:
+            return DEFAULT_EXPLANATION
+        return DEMO_CASE_EXPLANATIONS[selected]
+    if arguments.input_file is not None:
+        return _with_expected_path(CUSTOM_EXPLANATION, expect_path)
+    return _with_expected_path(DEFAULT_EXPLANATION, expect_path)
+
+
 def _failure_report(arguments: argparse.Namespace, error: SmokeFailure) -> dict[str, object]:
-    selected_transport = arguments.transport or (
-        SmokeTransport.WEBHOOK.value if arguments.attachment else SmokeTransport.INTAKE.value
+    if arguments.demo_case is not None:
+        try:
+            selected_case = DemoCase(arguments.demo_case)
+        except ValueError:
+            selected_case = None
+        case_transport = (
+            DEMO_CASE_SPECS[selected_case].transport.value
+            if selected_case is not None
+            else None
+        )
+    else:
+        selected_case = None
+        case_transport = None
+    selected_transport = arguments.transport or case_transport or (
+        SmokeTransport.WEBHOOK.value
+        if arguments.attachment
+        else SmokeTransport.INTAKE.value
     )
     endpoint = (
         "/v1/inbound/email/webhook"
         if selected_transport == SmokeTransport.WEBHOOK.value
         else "/v1/intake"
     )
-    input_kind = (
-        "custom input"
-        if arguments.input_file is not None
-        else "attachment"
-        if arguments.attachment is not None
-        else "webhook body"
-        if selected_transport == SmokeTransport.WEBHOOK.value
-        else "body"
-    )
+    if selected_case is DemoCase.WEBHOOK_DOCUMENT_TXT:
+        input_kind = "text attachment"
+    elif selected_case in {
+        DemoCase.WEBHOOK_DOCUMENT_PDF,
+        DemoCase.WEBHOOK_DOCUMENT_MALFORMED,
+    }:
+        input_kind = "PDF attachment"
+    elif selected_case in {
+        DemoCase.WEBHOOK_BODY,
+        DemoCase.WEBHOOK_DUPLICATE,
+    }:
+        input_kind = "webhook body"
+    elif selected_case is DemoCase.WEBHOOK_CONFLICT:
+        input_kind = "webhook conflict"
+    elif selected_case in {DemoCase.BODY_COMPLETE, DemoCase.BODY_INCOMPLETE}:
+        input_kind = "body"
+    else:
+        input_kind = (
+            "custom input"
+            if arguments.input_file is not None
+            else "attachment"
+            if arguments.attachment is not None
+            else "webhook body"
+            if selected_transport == SmokeTransport.WEBHOOK.value
+            else "body"
+        )
     progress = error.progress
     job = deepcopy(progress.last_state or {})
     if progress.job_id is not None:
         job.setdefault("job_id", progress.job_id)
     if progress.trace_id is not None:
         job.setdefault("trace_id", progress.trace_id)
-    return {
+    explanation = _failure_explanation(arguments)
+    report = {
         "result": "FAIL",
         "demo_case": arguments.demo_case,
         "profile": arguments.profile,
         "transport": selected_transport,
         "endpoint": endpoint,
         "input_kind": input_kind,
+        "purpose": explanation.purpose,
+        "expected_outcome": explanation.expected_outcome,
         "acceptance_status": progress.acceptance_status,
         "duplicate_reused": progress.duplicate_reused,
         "conflict_rejected": progress.conflict_rejected,
@@ -1606,6 +1864,14 @@ def _failure_report(arguments: argparse.Namespace, error: SmokeFailure) -> dict[
         "job": job,
         "error_code": error.code,
     }
+    report["observed_outcome"] = _observed_outcome(
+        acceptance_status=progress.acceptance_status,
+        job=job,
+        duplicate_reused=progress.duplicate_reused,
+        conflict_rejected=progress.conflict_rejected,
+        error_code=error.code,
+    )
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -259,6 +259,9 @@ def test_product_docs_describe_safe_live_demo_entrypoints() -> None:
     assert "--profile" in readme
     assert "live_provider_smoke.py" in readme
     assert "docs/runbooks/live-provider-demo.md" in readme
+    runbook_link = "[Live provider demo runbook](docs/runbooks/live-provider-demo.md)"
+    assert runbook_link in readme
+    assert readme.index(runbook_link) < readme.index("## Capabilities")
     assert "worker" in readme.lower() and "optional" in readme.lower()
     for phrase in (
         "Service keys cannot act as operators",
@@ -294,6 +297,16 @@ def test_product_docs_describe_safe_live_demo_entrypoints() -> None:
     assert "001_initial_schema (head)" in text
     assert "002_job_artifacts" not in text
     assert "Result references:" in text
+    for explanation_label in ("Purpose:", "Expected:", "Observed:"):
+        assert explanation_label in text
+    for strict_webhook_phrase in (
+        "routing_status=awaiting_input",
+        "routing_reason=missing_required_fields",
+        'missing_required_fields=["contact"]',
+        "no approval",
+        "no committed side effect",
+    ):
+        assert strict_webhook_phrase in text
     for phrase in (
         "unsafe_job_response",
         "schema drift",

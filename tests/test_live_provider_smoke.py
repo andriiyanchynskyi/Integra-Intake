@@ -87,6 +87,30 @@ def _job_payload(
     ).model_dump(mode="json")
 
 
+def _missing_contact_job_payload() -> dict[str, object]:
+    payload = _job_payload("succeeded")
+    payload.update(
+        routing_status="awaiting_input",
+        routing_reason="missing_required_fields",
+        missing_required_fields=["contact"],
+        approval=None,
+        execution_path=[
+            {
+                "step": 1,
+                "action_key": "create_case",
+                "action_known": True,
+                "policy_decision": "deny",
+                "routing_status": "awaiting_input",
+                "policy_reason": "missing_required_fields",
+                "missing_required_fields": ["contact"],
+                "tool_outcome": None,
+                "side_effect_committed": False,
+            }
+        ],
+    )
+    return payload
+
+
 def _job(
     status: str,
     *,
@@ -606,6 +630,81 @@ def test_named_body_demo_case_returns_safe_report() -> None:
     assert report["endpoint"] == "/v1/intake"
 
 
+def test_every_named_demo_case_has_bounded_explanation_metadata() -> None:
+    assert set(smoke.DEMO_CASE_EXPLANATIONS) == set(smoke.DemoCase)
+    for explanation in smoke.DEMO_CASE_EXPLANATIONS.values():
+        assert explanation.purpose.strip()
+        assert explanation.expected_outcome.strip()
+        assert len(explanation.purpose) <= 300
+        assert len(explanation.expected_outcome) <= 500
+
+
+def test_named_demo_report_contains_source_free_explanations() -> None:
+    transport = SequenceTransport([_accepted(), _job("succeeded")])
+    client = httpx.Client(transport=httpx.MockTransport(transport))
+    try:
+        report = run_demo_case(
+            case="body-complete",
+            profile="freight-broker",
+            base_url="http://testserver",
+            api_key=RAW_TENANT_KEY,
+            client=client,
+            timeout_seconds=5,
+            poll_interval_seconds=0,
+            clock=lambda: 1.0,
+            sleep=lambda _: None,
+        )
+    finally:
+        client.close()
+
+    assert report["purpose"] == smoke.DEMO_CASE_EXPLANATIONS[
+        smoke.DemoCase.BODY_COMPLETE
+    ].purpose
+    assert report["expected_outcome"] == smoke.DEMO_CASE_EXPLANATIONS[
+        smoke.DemoCase.BODY_COMPLETE
+    ].expected_outcome
+    assert "job status=succeeded" in report["observed_outcome"]
+    assert "SOURCE_SECRET" not in json.dumps(report)
+
+
+def test_default_and_custom_modes_describe_connectivity_not_fixed_semantics(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    job = smoke._safe_job_response(_job_payload("succeeded"))
+    monkeypatch.setattr(smoke, "run_smoke", lambda **_: job)
+
+    default_report = smoke.run_live_report(
+        profile="freight-broker",
+        base_url="http://testserver",
+        api_key=RAW_TENANT_KEY,
+    )
+
+    input_file = tmp_path / "custom.json"
+    input_file.write_text(
+        json.dumps(
+            {
+                "transport": "intake",
+                "channel": "email",
+                "subject": "Synthetic custom request",
+                "body": "Synthetic custom body",
+            }
+        ),
+        encoding="utf-8",
+    )
+    custom_report = smoke.run_live_report(
+        profile="freight-broker",
+        base_url="http://testserver",
+        api_key=RAW_TENANT_KEY,
+        input_file=input_file,
+    )
+
+    assert "connectivity" in default_report["purpose"].lower()
+    assert "safe terminal" in default_report["expected_outcome"].lower()
+    assert "caller-supplied synthetic input" in custom_report["purpose"]
+    assert "fixed business semantics" in custom_report["expected_outcome"]
+
+
 def test_body_complete_awaiting_approval_requires_policy_path() -> None:
     pending_payload = _job("awaiting_approval").json()
     pending_payload["approval"] = {
@@ -651,6 +750,103 @@ def test_body_complete_awaiting_approval_requires_policy_path() -> None:
     assert report["job"]["status"] == "awaiting_approval"
 
 
+def test_webhook_body_requires_exact_missing_contact_business_outcome() -> None:
+    transport = SequenceTransport(
+        [_accepted(), httpx.Response(200, json=_missing_contact_job_payload())]
+    )
+    client = httpx.Client(transport=httpx.MockTransport(transport))
+    try:
+        report = run_demo_case(
+            case="webhook-body",
+            profile="freight-broker",
+            base_url="http://testserver",
+            api_key=RAW_TENANT_KEY,
+            client=client,
+            timeout_seconds=5,
+            poll_interval_seconds=0,
+            clock=lambda: 1.0,
+            sleep=lambda _: None,
+        )
+    finally:
+        client.close()
+
+    assert report["result"] == "PASS"
+    assert {check["name"] for check in report["checks"]} >= {
+        "status",
+        "routing_status",
+        "routing_reason",
+        "missing_required_fields",
+        "approval",
+        "no_side_effect",
+    }
+    sent = json.loads(transport.requests[0].content)
+    assert "contact:" not in sent["body"].lower()
+    assert "origin:" in sent["body"].lower()
+    assert "destination:" in sent["body"].lower()
+
+
+def test_webhook_body_rejects_unrelated_safe_terminal_outcome() -> None:
+    transport = SequenceTransport([_accepted(), _job("succeeded")])
+    client = httpx.Client(transport=httpx.MockTransport(transport))
+    try:
+        with pytest.raises(SmokeFailure, match="expectation_failed"):
+            run_demo_case(
+                case="webhook-body",
+                profile="freight-broker",
+                base_url="http://testserver",
+                api_key=RAW_TENANT_KEY,
+                client=client,
+                timeout_seconds=5,
+                poll_interval_seconds=0,
+                clock=lambda: 1.0,
+                sleep=lambda _: None,
+            )
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "failed_check"),
+    [
+        (
+            "approval",
+            {"approval_id": str(UUID(int=10)), "status": "pending"},
+            "approval",
+        ),
+        (
+            "execution_path",
+            [
+                {
+                    "step": 1,
+                    "action_key": "create_case",
+                    "action_known": True,
+                    "policy_decision": "deny",
+                    "routing_status": "awaiting_input",
+                    "policy_reason": "missing_required_fields",
+                    "missing_required_fields": ["contact"],
+                    "tool_outcome": "executed",
+                    "side_effect_committed": True,
+                }
+            ],
+            "no_side_effect",
+        ),
+    ],
+)
+def test_webhook_body_requires_no_approval_or_committed_side_effect(
+    field: str,
+    value: object,
+    failed_check: str,
+) -> None:
+    job = _missing_contact_job_payload()
+    job[field] = value
+
+    checks = smoke._case_checks(smoke.DemoCase.WEBHOOK_BODY, job)
+
+    assert next(check for check in checks if check["name"] == failed_check)[
+        "passed"
+    ] is False
+
+
 def test_human_renderer_shows_safe_lifecycle_and_path_without_source() -> None:
     report = {
         "result": "PASS",
@@ -659,6 +855,13 @@ def test_human_renderer_shows_safe_lifecycle_and_path_without_source() -> None:
         "transport": "webhook",
         "endpoint": "/v1/inbound/email/webhook",
         "input_kind": "text attachment",
+        "purpose": "Verify signed text document intake.",
+        "expected_outcome": "The job reaches a safe terminal status.",
+        "observed_outcome": (
+            "HTTP acceptance=202; job status=succeeded; routing status=ready; "
+            "routing reason=action_allowed; missing fields=none; approval=none; "
+            "committed side effect=yes."
+        ),
         "acceptance_status": 202,
         "duplicate_reused": None,
         "conflict_rejected": None,
@@ -703,6 +906,10 @@ def test_human_renderer_shows_safe_lifecycle_and_path_without_source() -> None:
     rendered = render_human(report)
 
     assert "LIVE INTAKE SMOKE: PASS" in rendered
+    assert rendered.index("Purpose:") < rendered.index("Job ID:")
+    assert "Purpose:          Verify signed text document intake." in rendered
+    assert "Expected:         The job reaches a safe terminal status." in rendered
+    assert "Observed:         HTTP acceptance=202; job status=succeeded" in rendered
     assert "Trace ID:" in rendered
     assert "Execution path:" in rendered
     assert "Created at:       2026-10-14T12:00:00Z" in rendered
@@ -717,6 +924,53 @@ def test_human_renderer_shows_safe_lifecycle_and_path_without_source() -> None:
     assert "NOT OBSERVED" in rendered
     assert "SOURCE_SECRET" not in rendered
     assert RAW_TENANT_KEY not in rendered
+
+
+def test_failure_report_keeps_mode_explanation_and_safe_progress() -> None:
+    arguments = argparse.Namespace(
+        transport=None,
+        attachment=None,
+        input_file=None,
+        demo_case="webhook-body",
+        profile="freight-broker",
+        expect_path=None,
+    )
+    failure = SmokeFailure(
+        "expectation_failed",
+        progress=smoke.SmokeProgress.from_job(
+            smoke._safe_job_response(_job_payload("succeeded"))
+        ),
+    )
+
+    report = smoke._failure_report(arguments, failure)
+
+    assert report["transport"] == "webhook"
+    assert report["endpoint"] == "/v1/inbound/email/webhook"
+    assert report["purpose"] == smoke.DEMO_CASE_EXPLANATIONS[
+        smoke.DemoCase.WEBHOOK_BODY
+    ].purpose
+    assert "missing contact" in report["expected_outcome"].lower()
+    assert "smoke error=expectation_failed" in report["observed_outcome"]
+    assert "job status=succeeded" in report["observed_outcome"]
+
+
+def test_json_cli_preserves_explanation_fields(monkeypatch, capsys) -> None:
+    report = {
+        "result": "PASS",
+        "purpose": "Verify synthetic connectivity.",
+        "expected_outcome": "The job reaches a safe terminal status.",
+        "observed_outcome": "HTTP acceptance=202; job status=succeeded.",
+        "job": _job_payload("succeeded"),
+    }
+    monkeypatch.setenv("INTEGRA_DEMO_API_KEY", RAW_TENANT_KEY)
+    monkeypatch.setattr(smoke, "run_live_report", lambda **_: report)
+
+    assert smoke.main(["--json"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["purpose"] == report["purpose"]
+    assert output["expected_outcome"] == report["expected_outcome"]
+    assert output["observed_outcome"] == report["observed_outcome"]
 
 
 def test_human_renderer_distinguishes_empty_and_unobserved_result_references() -> None:
