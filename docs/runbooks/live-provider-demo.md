@@ -66,10 +66,9 @@ docker compose run --rm api alembic current
 docker compose run --rm api alembic heads
 ```
 
-The current and head revisions must report `002_job_artifacts`. The migration
-chain is append-only: `001_initial_schema` creates the core tables and
-`002_job_artifacts` adds durable reply-draft and review-flag results. Treat
-applied revisions as immutable; future schema changes add a new revision.
+The current and head revisions must report `001_initial_schema`. The complete
+release schema, including `job_artifacts`, is created by this single baseline
+revision. API and worker startup do not apply migrations.
 
 ## 5. Start and verify the API
 
@@ -328,7 +327,7 @@ Use the evidence below to explain each step to another operator:
 
 | Check | Evidence to capture | Why the check matters |
 | --- | --- | --- |
-| Clean release state | `alembic current` reports `002_job_artifacts (head)` after a fresh database reset. | The demo cannot rely on retained tables, old revisions, or manual schema changes. |
+| Clean release state | `alembic current` reports `001_initial_schema (head)` after a fresh database reset. | The demo cannot rely on retained tables, old revisions, or manual schema changes. |
 | API readiness | `/health` responds after the migration completes. | The API connects to the database that received the release schema. |
 | Tenant and profile identity | The seed command uses the selected profile, and the job result reports its expected `scenario_key`. | The server derives tenant access from the API key and applies the checked-in profile rather than request-supplied ownership. |
 | Worker ownership | One selected worker claims the job and emits source-free lifecycle events for the same trace. | Provider access, leases, and result persistence remain in the worker boundary. |
@@ -347,6 +346,11 @@ routing outcome, approval ID when present, typed result-reference IDs when
 present, and stable error code when present.
 Those fields let another person repeat the run and compare outcomes. Do not
 record the request body, document text, credentials, or provider response.
+
+The human report prints safe references under `Result references:`. Each entry
+contains only `kind=<case|reply_draft|review_flag>` and a UUID. `NONE` means a
+validated job produced no reference; `NOT OBSERVED` means no job projection
+was validated. Retrieve artifact content only through its tenant-scoped API.
 
 The live commands prove the real HTTP, PostgreSQL, worker, configured provider,
 and observed policy/tool path. The deterministic freight gate proves all 50
@@ -495,6 +499,18 @@ worker, or provider; treat it as deterministic behavioral evidence.
 
 ## 15. Troubleshooting
 
+- `unsafe_job_response` after `HTTP accepted: 202` indicates schema drift
+  between the public job response and the smoke's closed safe projection. The
+  accepted job and trace IDs remain valid evidence; update the parser and its
+  contract test before accepting the new response field.
+- A failed job can show `Scenario: NOT OBSERVED` when `scenario_key` enrichment
+  is unavailable because its persisted profile cannot be reconstructed. Use
+  the stable job error code and trace ID; do not treat a missing scenario as a
+  successful profile match.
+- Acceptance evidence comes from the validated `202` response. Lifecycle,
+  routing, approval, and result fields come only from the latest validated poll
+  response. A rejected or malformed poll never replaces previously validated
+  evidence.
 - A missing key, invalid key, unavailable model, or unreachable base URL follows
   the stable provider error path. The worker may schedule bounded retries. Do
   not put the key into a command, log, or report.

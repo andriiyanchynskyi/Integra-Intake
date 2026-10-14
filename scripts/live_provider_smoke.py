@@ -11,18 +11,22 @@ import re
 import sys
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Literal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from app.auth import sign_inbound_webhook
 from app.documents import MAX_DOCUMENT_BYTES
+from app.domain.jobs import JobRead
+from app.observability.events import PolicyReason, WorkerErrorCode
+from app.tenants.config import RoutingStatus
 from app.tenants.identifiers import SAFE_IDENTIFIER_PATTERN
 
 
@@ -79,6 +83,7 @@ SAFE_JOB_RESPONSE_KEYS = frozenset(
         "routing_reason",
         "missing_required_fields",
         "approval",
+        "result_references",
         "error_code",
         "created_at",
         "started_at",
@@ -86,6 +91,12 @@ SAFE_JOB_RESPONSE_KEYS = frozenset(
     }
 )
 MAX_EXECUTION_STEPS = 8
+MAX_RESULT_REFERENCES = 3
+RESULT_REFERENCE_KINDS = frozenset({"case", "reply_draft", "review_flag"})
+APPROVAL_STATUSES = frozenset({"pending", "approved", "rejected", "expired"})
+ROUTING_STATUSES = frozenset(item.value for item in RoutingStatus)
+ROUTING_REASONS = frozenset({"complete", *(item.value for item in PolicyReason)})
+WORKER_ERROR_CODES = frozenset(item.value for item in WorkerErrorCode)
 WEBHOOK_DOCUMENT_MEDIA_TYPES = {
     ".txt": "text/plain",
     ".pdf": "application/pdf",
@@ -221,13 +232,66 @@ DEMO_CASE_SPECS: dict[DemoCase, DemoCaseSpec] = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class SmokeProgress:
+    """Validated source-free evidence collected before a smoke failure."""
+
+    acceptance_status: int | None = None
+    job_id: str | None = None
+    trace_id: str | None = None
+    last_state: dict[str, object] | None = None
+    duplicate_reused: bool | None = None
+    conflict_rejected: bool | None = None
+
+    @classmethod
+    def accepted(cls, job_id: str, trace_id: str) -> "SmokeProgress":
+        return cls(acceptance_status=202, job_id=job_id, trace_id=trace_id)
+
+    @classmethod
+    def from_job(
+        cls,
+        job: Mapping[str, object],
+        *,
+        duplicate_reused: bool | None = None,
+        conflict_rejected: bool | None = None,
+    ) -> "SmokeProgress":
+        safe_job = deepcopy(dict(job))
+        return cls(
+            acceptance_status=202,
+            job_id=str(safe_job["job_id"]),
+            trace_id=str(safe_job["trace_id"]),
+            last_state=safe_job,
+            duplicate_reused=duplicate_reused,
+            conflict_rejected=conflict_rejected,
+        )
+
+    def with_job(self, job: Mapping[str, object]) -> "SmokeProgress":
+        return replace(self, last_state=deepcopy(dict(job)))
+
+
 class SmokeFailure(RuntimeError):
     """Stable, source-free failure for the local smoke command."""
 
-    def __init__(self, code: str, *, last_state: Mapping[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        progress: SmokeProgress | None = None,
+        last_state: Mapping[str, object] | None = None,
+    ) -> None:
         super().__init__(code)
+        if progress is not None and last_state is not None:
+            raise TypeError("progress and last_state are mutually exclusive")
         self.code = code
-        self.last_state = dict(last_state) if last_state is not None else None
+        self.progress = (
+            SmokeProgress.from_job(last_state)
+            if last_state is not None
+            else progress or SmokeProgress()
+        )
+
+    @property
+    def last_state(self) -> dict[str, object] | None:
+        return self.progress.last_state
 
 
 def _safe_execution_path(value: object) -> list[dict[str, object]]:
@@ -250,10 +314,13 @@ def _safe_execution_path(value: object) -> list[dict[str, object]]:
         "safety_or_legal_risk",
         "unknown_intake_type",
         "missing_required_fields",
+        "invalid_field_values",
         "action_not_configured",
+        "action_not_executable",
         "action_not_allowed",
         "approval_required",
         "action_allowed",
+        "no_action_requested",
         "document_unreadable",
     }
     outcomes = {
@@ -316,26 +383,65 @@ def _safe_execution_path(value: object) -> list[dict[str, object]]:
     return safe
 
 
+def _safe_result_references(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list) or len(value) > MAX_RESULT_REFERENCES:
+        raise SmokeFailure("malformed_job_response")
+    safe: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"kind", "id"}:
+            raise SmokeFailure("unsafe_job_response")
+        kind = item.get("kind")
+        identifier = item.get("id")
+        if (
+            not isinstance(kind, str)
+            or kind not in RESULT_REFERENCE_KINDS
+            or kind in seen
+            or not isinstance(identifier, str)
+        ):
+            raise SmokeFailure("malformed_job_response")
+        try:
+            normalized_id = str(UUID(identifier))
+        except ValueError as error:
+            raise SmokeFailure("malformed_job_response") from error
+        seen.add(kind)
+        safe.append({"kind": kind, "id": normalized_id})
+    return sorted(safe, key=lambda item: (item["kind"], item["id"]))
+
+
 def _safe_job_response(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or not set(value).issubset(SAFE_JOB_RESPONSE_KEYS):
         raise SmokeFailure("unsafe_job_response")
     required = {"job_id", "trace_id", "scenario_key", "status", "attempt_count"}
     if not required.issubset(value):
         raise SmokeFailure("malformed_job_response")
-    if not all(isinstance(value[key], str) for key in ("job_id", "trace_id", "scenario_key", "status")):
+    raw = deepcopy(value)
+    if (
+        not isinstance(raw["job_id"], str)
+        or not isinstance(raw["trace_id"], str)
+        or (
+            raw["scenario_key"] is not None
+            and not isinstance(raw["scenario_key"], str)
+        )
+        or not isinstance(raw["status"], str)
+    ):
         raise SmokeFailure("malformed_job_response")
-    if value["status"] not in {"queued", "running", *TERMINAL_STATUSES}:
+    if raw["status"] not in {"queued", "running", *TERMINAL_STATUSES}:
         raise SmokeFailure("malformed_job_response")
-    if not isinstance(value["attempt_count"], int) or isinstance(value["attempt_count"], bool):
+    if (
+        not isinstance(raw["attempt_count"], int)
+        or isinstance(raw["attempt_count"], bool)
+        or raw["attempt_count"] < 0
+    ):
         raise SmokeFailure("malformed_job_response")
-    agent_steps = value.get("agent_steps")
+    agent_steps = raw.get("agent_steps")
     if agent_steps is not None and (
         not isinstance(agent_steps, int)
         or isinstance(agent_steps, bool)
         or not 0 <= agent_steps <= MAX_EXECUTION_STEPS
     ):
         raise SmokeFailure("malformed_job_response")
-    stop_reason = value.get("stop_reason")
+    stop_reason = raw.get("stop_reason")
     if stop_reason is not None and stop_reason not in {
         "final",
         "invalid_proposal",
@@ -345,27 +451,72 @@ def _safe_job_response(value: object) -> dict[str, object]:
         "tool_execution_failed",
     }:
         raise SmokeFailure("malformed_job_response")
-    if "execution_path" in value:
-        value["execution_path"] = _safe_execution_path(value["execution_path"])
-    missing = value.get("missing_required_fields", [])
-    if not isinstance(missing, list) or not all(isinstance(item, str) for item in missing):
-        raise SmokeFailure("malformed_job_response")
-    approval = value.get("approval")
-    if approval is not None and (
-        not isinstance(approval, dict)
-        or not set(approval).issubset({"approval_id", "status"})
-        or not isinstance(approval.get("approval_id"), str)
-        or not isinstance(approval.get("status"), str)
+    if "execution_path" in raw:
+        raw["execution_path"] = _safe_execution_path(raw["execution_path"])
+    missing = raw.get("missing_required_fields", [])
+    if not isinstance(missing, list) or not all(
+        isinstance(item, str) and SAFE_IDENTIFIER_RE.fullmatch(item) is not None
+        for item in missing
     ):
-        raise SmokeFailure("unsafe_job_response")
-    return dict(value)
+        raise SmokeFailure("malformed_job_response")
+    approval = raw.get("approval")
+    if approval is not None:
+        if not isinstance(approval, dict) or set(approval) != {
+            "approval_id",
+            "status",
+        }:
+            raise SmokeFailure("unsafe_job_response")
+        if (
+            not isinstance(approval.get("approval_id"), str)
+            or not isinstance(approval.get("status"), str)
+            or approval["status"] not in APPROVAL_STATUSES
+        ):
+            raise SmokeFailure("malformed_job_response")
+    raw["result_references"] = _safe_result_references(
+        raw.get("result_references", [])
+    )
+    routing_status = raw.get("routing_status")
+    if routing_status is not None and routing_status not in ROUTING_STATUSES:
+        raise SmokeFailure("malformed_job_response")
+    routing_reason = raw.get("routing_reason")
+    if routing_reason is not None and routing_reason not in ROUTING_REASONS:
+        raise SmokeFailure("malformed_job_response")
+    error_code = raw.get("error_code")
+    if error_code is not None and error_code not in WORKER_ERROR_CODES:
+        raise SmokeFailure("malformed_job_response")
+    for name in ("created_at", "started_at", "finished_at"):
+        timestamp = raw.get(name)
+        if timestamp is not None and not isinstance(timestamp, str):
+            raise SmokeFailure("malformed_job_response")
+    try:
+        parsed = JobRead.model_validate_json(
+            json.dumps(
+                raw,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+    except ValidationError as error:
+        code = (
+            "unsafe_job_response"
+            if any(item["type"] == "extra_forbidden" for item in error.errors())
+            else "malformed_job_response"
+        )
+        raise SmokeFailure(code) from error
+    except (TypeError, ValueError) as error:
+        raise SmokeFailure("malformed_job_response") from error
+    for timestamp in (parsed.created_at, parsed.started_at, parsed.finished_at):
+        if timestamp is not None and timestamp.utcoffset() is None:
+            raise SmokeFailure("malformed_job_response")
+    return parsed.model_dump(mode="json")
 
 
-def _json_response(response: httpx.Response) -> object:
+def _json_response(response: httpx.Response, *, error_code: str) -> object:
     try:
         return response.json()
     except ValueError as error:
-        raise SmokeFailure("malformed_provider_response") from error
+        raise SmokeFailure(error_code) from error
 
 
 def _read_attachment(path: Path) -> tuple[str, str]:
@@ -427,13 +578,20 @@ def _webhook_request(
     }
 
 
-def _accepted_identity(response: httpx.Response, *, error_prefix: str) -> tuple[str, str]:
+def _accepted_identity(
+    response: httpx.Response,
+    *,
+    error_prefix: str,
+) -> SmokeProgress:
     if response.status_code != 202:
         if response.status_code == 401:
             raise SmokeFailure(f"{error_prefix}_unauthorized")
         raise SmokeFailure(f"{error_prefix}_http_{response.status_code}")
-    payload = _json_response(response)
-    if not isinstance(payload, dict):
+    payload = _json_response(
+        response,
+        error_code=f"malformed_{error_prefix}_response",
+    )
+    if not isinstance(payload, dict) or set(payload) != {"job_id", "status"}:
         raise SmokeFailure(f"malformed_{error_prefix}_response")
     job_id = payload.get("job_id")
     if not isinstance(job_id, str) or payload.get("status") != "queued":
@@ -441,7 +599,12 @@ def _accepted_identity(response: httpx.Response, *, error_prefix: str) -> tuple[
     trace_id = response.headers.get("X-Trace-ID")
     if not trace_id:
         raise SmokeFailure("trace_id_missing")
-    return job_id, trace_id
+    try:
+        normalized_job_id = str(UUID(job_id))
+        normalized_trace_id = str(UUID(trace_id))
+    except ValueError as error:
+        raise SmokeFailure(f"malformed_{error_prefix}_response") from error
+    return SmokeProgress.accepted(normalized_job_id, normalized_trace_id)
 
 
 def _poll_job(
@@ -449,8 +612,7 @@ def _poll_job(
     http_client: httpx.Client,
     base_url: str,
     api_key: str,
-    job_id: str,
-    trace_id: str,
+    progress: SmokeProgress,
     expected_scenario: str,
     timeout_seconds: float,
     poll_interval_seconds: float,
@@ -464,28 +626,45 @@ def _poll_job(
     while clock() < deadline and poll_count < max_polls:
         try:
             response = http_client.get(
-                f"{base_url.rstrip('/')}/v1/jobs/{job_id}",
+                f"{base_url.rstrip('/')}/v1/jobs/{progress.job_id}",
                 headers={"X-API-Key": api_key},
             )
         except httpx.RequestError as error:
-            raise SmokeFailure("job_network_error") from error
+            raise SmokeFailure("job_network_error", progress=progress) from error
         if response.status_code == 401:
-            raise SmokeFailure("job_unauthorized")
+            raise SmokeFailure("job_unauthorized", progress=progress)
         if response.status_code != 200:
-            raise SmokeFailure(f"job_http_{response.status_code}")
-        job = _safe_job_response(_json_response(response))
+            raise SmokeFailure(
+                f"job_http_{response.status_code}", progress=progress
+            )
+        try:
+            payload = _json_response(
+                response,
+                error_code="malformed_job_response",
+            )
+            job = _safe_job_response(payload)
+        except SmokeFailure as error:
+            raise SmokeFailure(error.code, progress=progress) from error
         last_state = job
-        if job["job_id"] != job_id or job["trace_id"] != trace_id:
-            raise SmokeFailure("trace_id_mismatch", last_state=job)
-        if job["scenario_key"] != expected_scenario:
-            raise SmokeFailure("scenario_mismatch", last_state=job)
-        if job["status"] in TERMINAL_STATUSES:
-            if job["status"] in {"succeeded", "awaiting_approval"}:
-                return job
-            raise SmokeFailure(f"job_{job['status']}", last_state=job)
+        progress = progress.with_job(job)
+        if job["job_id"] != progress.job_id or job["trace_id"] != progress.trace_id:
+            raise SmokeFailure("trace_id_mismatch", progress=progress)
+        status = job["status"]
+        scenario_key = job["scenario_key"]
+        if scenario_key is not None and scenario_key != expected_scenario:
+            raise SmokeFailure("scenario_mismatch", progress=progress)
+        if status not in {"failed", "failed_uncertain"} and scenario_key is None:
+            raise SmokeFailure("scenario_mismatch", progress=progress)
+        if status in {"failed", "failed_uncertain"}:
+            raise SmokeFailure(f"job_{status}", progress=progress)
+        if status in {"succeeded", "awaiting_approval"}:
+            return job
         poll_count += 1
         sleep(poll_interval_seconds)
-    raise SmokeFailure("poll_timeout", last_state=last_state)
+    raise SmokeFailure(
+        "poll_timeout",
+        progress=(progress.with_job(last_state) if last_state is not None else progress),
+    )
 
 
 def run_smoke(
@@ -536,49 +715,18 @@ def run_smoke(
             )
         except httpx.RequestError as error:
             raise SmokeFailure("intake_network_error") from error
-        if accepted.status_code != 202:
-            if accepted.status_code == 401:
-                raise SmokeFailure("intake_unauthorized")
-            raise SmokeFailure(f"intake_http_{accepted.status_code}")
-        accepted_payload = _json_response(accepted)
-        if not isinstance(accepted_payload, dict):
-            raise SmokeFailure("malformed_intake_response")
-        job_id = accepted_payload.get("job_id")
-        if not isinstance(job_id, str) or accepted_payload.get("status") != "queued":
-            raise SmokeFailure("malformed_intake_response")
-        trace_id = accepted.headers.get("X-Trace-ID")
-        if not trace_id:
-            raise SmokeFailure("trace_id_missing")
-
-        deadline = clock() + timeout_seconds
-        poll_count = 0
-        max_polls = max(1, min(10_000, int(timeout_seconds * 1_000) + 1))
-        last_state: dict[str, object] | None = None
-        while clock() < deadline and poll_count < max_polls:
-            try:
-                response = http_client.get(
-                    f"{base_url.rstrip('/')}/v1/jobs/{job_id}",
-                    headers={"X-API-Key": api_key},
-                )
-            except httpx.RequestError as error:
-                raise SmokeFailure("job_network_error") from error
-            if response.status_code == 401:
-                raise SmokeFailure("job_unauthorized")
-            if response.status_code != 200:
-                raise SmokeFailure(f"job_http_{response.status_code}")
-            job = _safe_job_response(_json_response(response))
-            last_state = job
-            if job["job_id"] != job_id or job["trace_id"] != trace_id:
-                raise SmokeFailure("trace_id_mismatch")
-            if job["scenario_key"] != expected_scenario:
-                raise SmokeFailure("scenario_mismatch")
-            if job["status"] in TERMINAL_STATUSES:
-                if job["status"] in {"succeeded", "awaiting_approval"}:
-                    return job
-                raise SmokeFailure(f"job_{job['status']}", last_state=job)
-            poll_count += 1
-            sleep(poll_interval_seconds)
-        raise SmokeFailure("poll_timeout", last_state=last_state)
+        progress = _accepted_identity(accepted, error_prefix="intake")
+        return _poll_job(
+            http_client=http_client,
+            base_url=base_url,
+            api_key=api_key,
+            progress=progress,
+            expected_scenario=expected_scenario,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            clock=clock,
+            sleep=sleep,
+        )
     finally:
         if owned_client:
             http_client.close()
@@ -639,13 +787,12 @@ def run_webhook_smoke(
             )
         except httpx.RequestError as error:
             raise SmokeFailure("webhook_network_error") from error
-        job_id, trace_id = _accepted_identity(accepted, error_prefix="webhook")
+        progress = _accepted_identity(accepted, error_prefix="webhook")
         return _poll_job(
             http_client=http_client,
             base_url=base_url,
             api_key=api_key,
-            job_id=job_id,
-            trace_id=trace_id,
+            progress=progress,
             expected_scenario=expected_scenario,
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
@@ -711,7 +858,7 @@ def run_webhook_idempotency(
             )
         except httpx.RequestError as error:
             raise SmokeFailure("webhook_network_error") from error
-        first_job_id, first_trace_id = _accepted_identity(
+        progress = _accepted_identity(
             first,
             error_prefix="webhook",
         )
@@ -732,27 +879,43 @@ def run_webhook_idempotency(
                 content=second_raw,
             )
         except httpx.RequestError as error:
-            raise SmokeFailure("webhook_network_error") from error
+            raise SmokeFailure("webhook_network_error", progress=progress) from error
         if conflict:
             if second.status_code != 409:
-                raise SmokeFailure("expected_conflict_not_returned")
+                raise SmokeFailure(
+                    "expected_conflict_not_returned",
+                    progress=progress,
+                )
             conflict_rejected = True
             duplicate_reused = False
         else:
-            second_job_id, second_trace_id = _accepted_identity(
-                second,
-                error_prefix="webhook",
-            )
-            if (second_job_id, second_trace_id) != (first_job_id, first_trace_id):
-                raise SmokeFailure("duplicate_identity_mismatch")
+            try:
+                duplicate_progress = _accepted_identity(
+                    second,
+                    error_prefix="webhook",
+                )
+            except SmokeFailure as error:
+                raise SmokeFailure(error.code, progress=progress) from error
+            if (
+                duplicate_progress.job_id,
+                duplicate_progress.trace_id,
+            ) != (progress.job_id, progress.trace_id):
+                raise SmokeFailure(
+                    "duplicate_identity_mismatch",
+                    progress=progress,
+                )
             duplicate_reused = True
             conflict_rejected = False
+        progress = replace(
+            progress,
+            duplicate_reused=duplicate_reused,
+            conflict_rejected=conflict_rejected,
+        )
         job = _poll_job(
             http_client=http_client,
             base_url=base_url,
             api_key=api_key,
-            job_id=first_job_id,
-            trace_id=first_trace_id,
+            progress=progress,
             expected_scenario=expected_scenario,
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
@@ -1015,10 +1178,15 @@ def run_demo_case(
     path_check = _check_execution_path(job, expect_path)
     if path_check is not None:
         checks.append(path_check)
+    progress = SmokeProgress.from_job(
+        job,
+        duplicate_reused=duplicate_reused,
+        conflict_rejected=conflict_rejected,
+    )
     if path_check is not None and not path_check["passed"]:
-        raise SmokeFailure("expected_path_not_observed", last_state=job)
+        raise SmokeFailure("expected_path_not_observed", progress=progress)
     if not all(check["passed"] for check in checks):
-        raise SmokeFailure("expectation_failed", last_state=job)
+        raise SmokeFailure("expectation_failed", progress=progress)
     return _report(
         demo_case=selected.value,
         profile=profile,
@@ -1175,6 +1343,8 @@ def render_human(report: Mapping[str, object]) -> str:
                 )
     else:
         lines.append("  NONE")
+    lines.append("Result references:")
+    lines.extend(_result_references_text(safe_job.get("result_references")))
     lines.extend(
         [
             f"Duplicate reused: {_display(report.get('duplicate_reused'))}",
@@ -1203,6 +1373,18 @@ def _list_text(value: object) -> str:
     if not isinstance(value, list) or not value:
         return "NONE"
     return ", ".join(str(item) for item in value)
+
+
+def _result_references_text(value: object) -> list[str]:
+    if value is None:
+        return ["  NOT OBSERVED"]
+    if not isinstance(value, list) or not value:
+        return ["  NONE"]
+    return [
+        f"  kind={item['kind']} id={item['id']}"
+        for item in value
+        if isinstance(item, Mapping)
+    ]
 
 
 def _display(value: object) -> object:
@@ -1404,6 +1586,12 @@ def _failure_report(arguments: argparse.Namespace, error: SmokeFailure) -> dict[
         if selected_transport == SmokeTransport.WEBHOOK.value
         else "body"
     )
+    progress = error.progress
+    job = deepcopy(progress.last_state or {})
+    if progress.job_id is not None:
+        job.setdefault("job_id", progress.job_id)
+    if progress.trace_id is not None:
+        job.setdefault("trace_id", progress.trace_id)
     return {
         "result": "FAIL",
         "demo_case": arguments.demo_case,
@@ -1411,11 +1599,11 @@ def _failure_report(arguments: argparse.Namespace, error: SmokeFailure) -> dict[
         "transport": selected_transport,
         "endpoint": endpoint,
         "input_kind": input_kind,
-        "acceptance_status": None,
-        "duplicate_reused": None,
-        "conflict_rejected": None,
+        "acceptance_status": progress.acceptance_status,
+        "duplicate_reused": progress.duplicate_reused,
+        "conflict_rejected": progress.conflict_rejected,
         "checks": [],
-        "job": error.last_state or {},
+        "job": job,
         "error_code": error.code,
     }
 

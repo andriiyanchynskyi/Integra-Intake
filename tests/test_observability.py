@@ -291,6 +291,17 @@ def test_product_docs_describe_safe_live_demo_entrypoints() -> None:
     assert "--json" in text
     assert "pytest evals/test_freight.py -q" in text
     assert "NOT OBSERVED" in text
+    assert "001_initial_schema (head)" in text
+    assert "002_job_artifacts" not in text
+    assert "Result references:" in text
+    for phrase in (
+        "unsafe_job_response",
+        "schema drift",
+        "scenario_key",
+        "acceptance evidence",
+        "validated poll",
+    ):
+        assert phrase.lower() in text.lower(), phrase
     for required in (
         "docker compose down -v",
         "docker compose up -d db",
