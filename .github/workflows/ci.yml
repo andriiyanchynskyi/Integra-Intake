@@ -42,10 +42,28 @@ jobs:
           cache: pip
       - name: Install package
         run: python -m pip install -e ".[dev]"
+      - name: Reset ephemeral PostgreSQL schema
+        run: |
+          python - <<'PY'
+          import asyncio
+          import os
+
+          from sqlalchemy.ext.asyncio import create_async_engine
+
+          async def reset_schema() -> None:
+              engine = create_async_engine(os.environ["DATABASE_URL"])
+              async with engine.begin() as connection:
+                  await connection.exec_driver_sql("DROP SCHEMA IF EXISTS public CASCADE")
+                  await connection.exec_driver_sql("CREATE SCHEMA public")
+              await engine.dispose()
+
+          asyncio.run(reset_schema())
+          PY
       - name: Verify release migration round trip
         run: |
           python -m alembic upgrade head
           python -m alembic current
+          python -m alembic heads
           python -m alembic downgrade base
           python -m alembic upgrade head
       - name: Check whitespace

@@ -94,8 +94,8 @@ docker compose up -d api worker
 
 Wait until `docker compose ps db` reports the database as healthy, then apply
 the migration. Check `http://localhost:8000/health` after the stack starts.
-The release applies the append-only `002_job_artifacts` revision after
-`001_initial_schema`. API and worker startup never applies migrations.
+The complete release schema is applied by the single `001_initial_schema`
+revision. API and worker startup never applies migrations.
 
 ### 3. Create a demo service key
 

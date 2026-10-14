@@ -484,7 +484,7 @@ async def test_postgres_approval_approve_create_case_is_atomic_and_idempotent(
     action = PendingAction(
         name="create_case",
         arguments={"customer_id": None},
-        known_fields={"summary": "Approved case"},
+        known_fields={"commodity": "Approved case"},
     )
 
     async with postgres_session_factory() as session:

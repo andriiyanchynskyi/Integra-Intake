@@ -47,14 +47,14 @@ JSONB_COLUMNS = {
 TIMESTAMPED_TABLES = FINAL_SCHEMA_TABLES - {"case_events", "approval_events"}
 
 
-def test_release_uses_append_only_schema_revisions() -> None:
+def test_release_uses_single_initial_schema_revision() -> None:
     revision_files = sorted(
         path.name
         for path in VERSIONS_DIRECTORY.glob("*.py")
         if path.name != "__init__.py"
     )
 
-    assert revision_files == ["001_initial_schema.py", "002_job_artifacts.py"]
+    assert revision_files == ["001_initial_schema.py"]
     source = INITIAL_SCHEMA_MIGRATION_PATH.read_text(encoding="utf-8")
     assert 'revision: str = "001_initial_schema"' in source
     assert "down_revision: Union[str, None] = None" in source
@@ -62,13 +62,6 @@ def test_release_uses_append_only_schema_revisions() -> None:
     assert source.count('"ck_approvals_status"') == 1
     assert source.count('"ck_approvals_payload_complete"') == 1
     assert "ck_approvals_phase8_payload_complete" not in source
-    artifact_source = (VERSIONS_DIRECTORY / "002_job_artifacts.py").read_text(
-        encoding="utf-8"
-    )
-    assert 'revision: str = "002_job_artifacts"' in artifact_source
-    assert 'down_revision: Union[str, None] = "001_initial_schema"' in artifact_source
-
-
 def test_orm_metadata_declares_tenant_isolation_contract() -> None:
     """ORM metadata preserves the database defaults and tenant-scoped relationships."""
     tenants = Base.metadata.tables["tenants"]
