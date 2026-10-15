@@ -160,7 +160,12 @@ class ApprovalDecisionService:
             approval = await self.repository.get_for_tenant_for_update(
                 approval_id, operator.tenant_id
             )
-            if approval is None:
+            if approval is None or approval.status not in {
+                "pending",
+                "approved",
+                "rejected",
+                "expired",
+            }:
                 raise ApprovalNotFound
             if (
                 approval.job_id is None
@@ -500,7 +505,12 @@ class ApprovalReviewService:
         tenant_id: UUID,
     ) -> ApprovalReviewRead | None:
         approval = await self.repository.get_for_tenant(approval_id, tenant_id)
-        if approval is None:
+        if approval is None or approval.status not in {
+            "pending",
+            "approved",
+            "rejected",
+            "expired",
+        }:
             return None
         return await self._project(approval)
 
@@ -517,9 +527,14 @@ class ApprovalReviewService:
             status=status,
             limit=bounded_limit,
         )
-        has_more = len(rows) > bounded_limit
+        public_rows = [
+            approval
+            for approval in rows
+            if approval.status in {"pending", "approved", "rejected", "expired"}
+        ]
+        has_more = len(public_rows) > bounded_limit
         projected: list[ApprovalReviewRead] = []
-        for approval in rows[:bounded_limit]:
+        for approval in public_rows[:bounded_limit]:
             projected.append(await self._project(approval))
         return ApprovalReviewPage(
             items=tuple(projected),

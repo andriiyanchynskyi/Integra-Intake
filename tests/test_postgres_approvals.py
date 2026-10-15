@@ -24,6 +24,7 @@ from app.db.models import (
 )
 from app.domain.approval_repository import ApprovalCreationConflict, ApprovalRepository
 from app.domain.approvals import ApprovalDecisionRequest, ApprovalDecisionService
+from app.domain.job_repository import JobRepository
 from app.runtime.profiles import TenantProfileResolver
 from app.tools.models import PendingAction
 from app.tools.postgres import PostgresApprovalActionExecutor
@@ -51,6 +52,30 @@ class _Transaction(AbstractAsyncContextManager["_Transaction"]):
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
         return None
+
+
+class _EmptyQueryResult:
+    def scalar_one_or_none(self) -> None:
+        return None
+
+    def scalars(self) -> "_EmptyQueryResult":
+        return self
+
+    def all(self) -> list[object]:
+        return []
+
+
+class _QueryCaptureSession:
+    def __init__(self) -> None:
+        self.queries: list[tuple[str, dict[str, object]]] = []
+
+    def begin(self) -> _Transaction:
+        return _Transaction()
+
+    async def execute(self, statement: object) -> _EmptyQueryResult:
+        compiled = statement.compile(dialect=postgresql.dialect())
+        self.queries.append((str(compiled), compiled.params))
+        return _EmptyQueryResult()
 
 
 class _ApprovalSession:
@@ -148,6 +173,31 @@ def _action() -> PendingAction:
     )
 
 
+def _approval_result() -> dict[str, object]:
+    return {
+        "status": "completed",
+        "reason": "executor_stopped",
+        "steps": 1,
+        "routing_status": "urgent",
+        "routing_reason": "approval_required",
+        "missing_required_fields": [],
+        "business_outcome": "approval_requested",
+        "execution_path": [
+            {
+                "step": 1,
+                "action_key": "create_case",
+                "action_known": True,
+                "policy_decision": "needs_approval",
+                "routing_status": "urgent",
+                "policy_reason": "approval_required",
+                "missing_required_fields": [],
+                "tool_outcome": None,
+                "side_effect_committed": False,
+            }
+        ],
+    }
+
+
 def _approval_for_job(
     job: AgentJob,
     action: PendingAction,
@@ -168,6 +218,46 @@ def _approval_for_job(
         expires_at=DECISION_TIME + timedelta(hours=1),
         execution_result=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_public_approval_queries_require_consistent_job_lifecycle() -> None:
+    session = _QueryCaptureSession()
+    repository = ApprovalRepository(session)  # type: ignore[arg-type]
+    approval_id = uuid4()
+
+    await repository.get_for_tenant(approval_id, TENANT_A)
+    await repository.list_for_tenant(TENANT_A, status="pending", limit=10)
+    await repository.get_for_tenant_for_update(approval_id, TENANT_A)
+    await repository.expire_due(now=DECISION_TIME)
+
+    assert len(session.queries) == 4
+    for index, (query, params) in enumerate(session.queries):
+        assert "LEFT OUTER JOIN agent_jobs" in query
+        assert "agent_jobs.id = approvals.job_id" in query
+        assert "agent_jobs.tenant_id = approvals.tenant_id" in query
+        flattened_values = {
+            item
+            for value in params.values()
+            for item in (value if isinstance(value, (list, tuple, set)) else (value,))
+        }
+        if index < 3:
+            assert {
+                "pending",
+                "approved",
+                "rejected",
+                "expired",
+                "awaiting_approval",
+                "succeeded",
+                "failed",
+            }.issubset(flattened_values)
+        else:
+            assert {"pending", "awaiting_approval"}.issubset(flattened_values)
+
+    decision_query = session.queries[2][0].upper()
+    expiry_query = session.queries[3][0].upper()
+    assert "FOR UPDATE OF APPROVALS" in decision_query
+    assert "FOR UPDATE OF APPROVALS SKIP LOCKED" in expiry_query
 
 
 def _document_snapshot(
@@ -297,7 +387,7 @@ async def test_approval_arguments_are_validated_by_registry_descriptor_before_si
 
 
 @pytest.mark.asyncio
-async def test_create_for_running_job_locks_tenant_attempt_and_parks_job() -> None:
+async def test_create_for_running_job_leaves_job_running_until_result_is_recorded() -> None:
     now = datetime(2026, 9, 23, 13, tzinfo=timezone.utc)
     job = _job()
     session = _ApprovalSession([job])
@@ -312,18 +402,14 @@ async def test_create_for_running_job_locks_tenant_attempt_and_parks_job() -> No
         now=now,
     )
 
-    assert job.status == "awaiting_approval"
+    assert job.status == "running"
     assert job.finished_at is None
-    assert job.lease_expires_at is None
     assert job.error_code is None
-    assert job.result == {
-        "status": "awaiting_approval",
-        "approval_id": str(requested.id),
-        "policy_reason": "approval_required",
-    }
+    assert job.result is None
     assert len(session.approvals) == 1
     approval = session.approvals[0]
     assert approval.id == requested.id
+    assert approval.status == "staged"
     assert approval.tenant_id == TENANT_A
     assert approval.job_id == job.id
     assert approval.pending_action == _action().model_dump(mode="json")
@@ -340,6 +426,17 @@ async def test_create_for_running_job_locks_tenant_attempt_and_parks_job() -> No
     }
     assert len(session.queries) == 2
     assert all("FOR UPDATE" in query.upper() for query in session.queries)
+
+    await JobRepository(session).record_awaiting_approval_result(
+        job.id,
+        _approval_result(),
+        tenant_id=TENANT_A,
+        attempt_count=job.attempt_count,
+    )
+
+    assert job.status == "awaiting_approval"
+    assert job.result == _approval_result()
+    assert approval.status == "pending"
 
 
 @pytest.mark.asyncio
@@ -369,8 +466,7 @@ async def test_create_for_running_job_rejects_wrong_tenant_or_attempt(
     assert job.status == "running"
     assert session.approvals == []
     assert session.events == []
-    expected_queries = 1 if tenant_id != TENANT_A else 2
-    assert len(session.queries) == expected_queries
+    assert len(session.queries) == 1
     assert all("FOR UPDATE" in query.upper() for query in session.queries)
 
 
@@ -406,6 +502,7 @@ async def test_create_for_running_job_rejects_legacy_approval_without_phase8_com
 
 @pytest.mark.asyncio
 async def test_duplicate_job_approval_returns_existing_command_without_new_event() -> None:
+    now = datetime(2026, 9, 23, 13, tzinfo=timezone.utc)
     job = _job()
     existing = Approval(
         id=uuid4(),
@@ -413,12 +510,12 @@ async def test_duplicate_job_approval_returns_existing_command_without_new_event
         job_id=job.id,
         case_id=None,
         action="create_case",
-        status="pending",
+        status="staged",
         decision={},
         policy_reason="approval_required",
         pending_action=_action().model_dump(mode="json"),
         tenant_config_sha256=job.tenant_config_sha256,
-        expires_at=datetime(2026, 9, 24, 13, tzinfo=timezone.utc),
+        expires_at=now + timedelta(hours=1),
     )
     event = ApprovalEvent(
         id=uuid4(),
@@ -437,14 +534,82 @@ async def test_duplicate_job_approval_returns_existing_command_without_new_event
         action=_action(),
         policy_reason="approval_required",
         expires_in=timedelta(hours=24),
-        now=datetime(2026, 9, 23, 13, tzinfo=timezone.utc),
+        now=now,
     )
 
     assert requested.id == existing.id
-    assert requested.expires_at == existing.expires_at
+    assert requested.expires_at == now + timedelta(hours=24)
+    assert existing.expires_at == now + timedelta(hours=24)
     assert session.approvals == [existing]
     assert session.events == [event]
     assert job.status == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed_field",
+    ["action", "payload", "reason", "profile"],
+)
+async def test_duplicate_staged_approval_replaces_changed_hidden_command(
+    changed_field: str,
+) -> None:
+    now = datetime(2026, 9, 23, 13, tzinfo=timezone.utc)
+    job = _job()
+    original_action = _action()
+    existing = Approval(
+        id=uuid4(),
+        tenant_id=TENANT_A,
+        job_id=job.id,
+        case_id=None,
+        action=original_action.name,
+        status="staged",
+        decision={},
+        policy_reason="approval_required",
+        pending_action=original_action.model_dump(mode="json"),
+        tenant_config_sha256=job.tenant_config_sha256,
+        expires_at=now + timedelta(hours=1),
+    )
+    action = original_action
+    policy_reason = "approval_required"
+    if changed_field == "action":
+        action = PendingAction(
+            name="create_reply_draft",
+            arguments={},
+            known_fields={"summary": "Draft a reply"},
+        )
+    elif changed_field == "payload":
+        action = original_action.model_copy(
+            update={"known_fields": {"summary": "Replacement case"}}
+        )
+    elif changed_field == "reason":
+        policy_reason = "safety_or_legal_risk"
+    else:
+        job.tenant_config_sha256 = "b" * 64
+    session = _ApprovalSession([job], [existing])
+
+    requested = await ApprovalRepository(session).create_for_running_job(
+        TENANT_A,
+        job.id,
+        attempt_count=job.attempt_count,
+        action=action,
+        policy_reason=policy_reason,
+        expires_in=timedelta(hours=24),
+        now=now,
+    )
+
+    assert requested.id == existing.id
+    assert requested.expires_at == now + timedelta(hours=24)
+    assert existing.status == "staged"
+    assert existing.action == action.name
+    assert existing.pending_action == action.model_dump(mode="json")
+    assert existing.policy_reason == policy_reason
+    assert existing.tenant_config_sha256 == job.tenant_config_sha256
+    assert len(session.events) == 1
+    assert session.events[0].event_type == "approval_replaced"
+    assert session.events[0].payload == {
+        "action": action.name,
+        "policy_reason": policy_reason,
+    }
 
 
 @pytest.mark.asyncio
@@ -503,6 +668,12 @@ async def test_postgres_approval_approve_create_case_is_atomic_and_idempotent(
             expires_in=timedelta(hours=24),
             now=DECISION_TIME,
         )
+        await JobRepository(session).record_awaiting_approval_result(
+            job.id,
+            _approval_result(),
+            tenant_id=tenant.id,
+            attempt_count=job.attempt_count,
+        )
 
     operator = AuthenticatedOperator(
         tenant_id=tenant.id,
@@ -557,6 +728,12 @@ async def test_postgres_approval_approve_create_case_is_atomic_and_idempotent(
     assert persisted_job.finished_at == first_clock
     assert persisted_job.error_code is None
     assert persisted_job.result == {
+        "steps": 1,
+        "reason": "executor_stopped",
+        "execution_path": _approval_result()["execution_path"],
+        "routing_status": "urgent",
+        "routing_reason": "approval_required",
+        "missing_required_fields": [],
         "business_outcome": "tool_result",
         "approval_id": str(requested.id),
         "approval_status": "approved",

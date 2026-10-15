@@ -749,14 +749,23 @@ class AgentWorker:
             repository = JobRepository(session)
             if result.status == RunStatus.COMPLETED:
                 summary = self._result_summary(result)
+                approval_requested = self._approval_was_requested(result)
                 try:
-                    await repository.mark_succeeded(
-                        claimed.id,
-                        summary,
-                        now=now,
-                        tenant_id=claimed.tenant_id,
-                        attempt_count=claimed.attempt_count,
-                    )
+                    if approval_requested:
+                        await repository.record_awaiting_approval_result(
+                            claimed.id,
+                            summary,
+                            tenant_id=claimed.tenant_id,
+                            attempt_count=claimed.attempt_count,
+                        )
+                    else:
+                        await repository.mark_succeeded(
+                            claimed.id,
+                            summary,
+                            now=now,
+                            tenant_id=claimed.tenant_id,
+                            attempt_count=claimed.attempt_count,
+                        )
                 except JobLeaseLostError:
                     raise
                 except Exception:
@@ -764,12 +773,20 @@ class AgentWorker:
                         trace_id=claimed.trace_id,
                         tenant_id=claimed.tenant_id,
                         job_id=claimed.id,
-                        operation=PersistenceOperation.MARK_SUCCEEDED,
+                        operation=(
+                            PersistenceOperation.RECORD_AWAITING_APPROVAL
+                            if approval_requested
+                            else PersistenceOperation.MARK_SUCCEEDED
+                        ),
                         tenant_config_snapshot=claimed.tenant_config_snapshot,
                         tenant_config_sha256=claimed.tenant_config_sha256,
                     )
                     raise
-                return OutcomeCode.SUCCEEDED
+                return (
+                    OutcomeCode.NEEDS_APPROVAL
+                    if approval_requested
+                    else OutcomeCode.SUCCEEDED
+                )
             else:
                 try:
                     error_code = (
@@ -1172,6 +1189,13 @@ class AgentWorker:
         return max(0, (self._monotonic_clock() - started_ns) // 1_000_000)
 
     @staticmethod
+    def _approval_was_requested(result: AgentRunResult) -> bool:
+        return result.final_response == "approval_requested" and any(
+            item.action_known and item.policy_decision == "needs_approval"
+            for item in result.execution_path
+        )
+
+    @staticmethod
     def _result_summary(result: AgentRunResult) -> dict[str, object]:
         execution_path = [
             {
@@ -1215,7 +1239,7 @@ class AgentWorker:
                 if terminal["tool_outcome"] is not None
                 else (
                     "approval_requested"
-                    if terminal["routing_status"] == "pending_approval"
+                    if AgentWorker._approval_was_requested(result)
                     else "routing_only"
                 )
             )

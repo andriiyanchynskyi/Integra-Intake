@@ -13,7 +13,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent import ResultReference
-from app.db.models import AgentJob, Approval, IdempotencyRecord, JobArtifact
+from app.db.models import (
+    AgentJob,
+    Approval,
+    ApprovalEvent,
+    IdempotencyRecord,
+    JobArtifact,
+)
 from app.domain.jobs import PersistedJobRead
 from app.policy.models import TrustedSource
 from app.runtime.profiles import ResolvedTenantProfile
@@ -124,7 +130,8 @@ class JobRepository:
             .outerjoin(
                 Approval,
                 (Approval.job_id == AgentJob.id)
-                & (Approval.tenant_id == AgentJob.tenant_id),
+                & (Approval.tenant_id == AgentJob.tenant_id)
+                & Approval.status.in_(("pending", "approved", "rejected", "expired")),
             )
             .where(AgentJob.id == job_id, AgentJob.tenant_id == tenant_id)
         )
@@ -254,6 +261,7 @@ class JobRepository:
             for job in jobs:
                 job.lease_expires_at = None
                 if job.side_effect_committed_at is not None:
+                    await self._cancel_staged_approval(job.id, job.tenant_id)
                     job.status = "failed_uncertain"
                     job.error_code = "lease_expired_after_side_effect"
                     job.finished_at = now
@@ -262,6 +270,7 @@ class JobRepository:
                     job.available_at = now + retry_delay
                     job.error_code = "lease_expired"
                 else:
+                    await self._cancel_staged_approval(job.id, job.tenant_id)
                     job.status = "failed"
                     job.error_code = "retry_exhausted"
                     job.finished_at = now
@@ -365,6 +374,49 @@ class JobRepository:
             result=result,
             error_code=None,
         )
+
+    async def record_awaiting_approval_result(
+        self,
+        job_id: UUID,
+        result: dict[str, object],
+        *,
+        tenant_id: UUID,
+        attempt_count: int,
+    ) -> None:
+        """Atomically park an owned running attempt with safe agent evidence."""
+
+        async with self.session.begin():
+            job = await self._get_job(
+                job_id,
+                tenant_id,
+                for_update=True,
+                attempt_count=attempt_count,
+            )
+            if job is None or job.status != "running":
+                raise JobLeaseLostError(
+                    "job approval ownership changed before result persistence"
+                )
+            approval_statement = (
+                select(Approval)
+                .where(
+                    Approval.job_id == job_id,
+                    Approval.tenant_id == tenant_id,
+                )
+                .with_for_update()
+            )
+            approval = (
+                await self.session.execute(approval_statement)
+            ).scalar_one_or_none()
+            if approval is None or approval.status != "staged":
+                raise JobLeaseLostError(
+                    "job approval changed before result persistence"
+                )
+            approval.status = "pending"
+            job.status = "awaiting_approval"
+            job.finished_at = None
+            job.lease_expires_at = None
+            job.result = deepcopy(result)
+            job.error_code = None
 
     async def mark_failed(
         self,
@@ -478,11 +530,40 @@ class JobRepository:
                 raise JobLeaseLostError(
                     "job lease ownership changed before terminal transition"
                 )
+            await self._cancel_staged_approval(job_id, tenant_id)
             job.status = status
             job.finished_at = now
             job.lease_expires_at = None
             job.result = deepcopy(result) if result is not None else None
             job.error_code = error_code
+
+    async def _cancel_staged_approval(
+        self,
+        job_id: UUID,
+        tenant_id: UUID,
+    ) -> None:
+        statement = (
+            select(Approval)
+            .where(
+                Approval.job_id == job_id,
+                Approval.tenant_id == tenant_id,
+                Approval.status == "staged",
+            )
+            .with_for_update()
+        )
+        approval = (await self.session.execute(statement)).scalar_one_or_none()
+        if approval is None:
+            return
+        approval.status = "cancelled"
+        self.session.add(
+            ApprovalEvent(
+                tenant_id=tenant_id,
+                approval_id=approval.id,
+                event_type="approval_cancelled",
+                actor_ref=None,
+                payload={},
+            )
+        )
 
     async def _get_job(
         self,

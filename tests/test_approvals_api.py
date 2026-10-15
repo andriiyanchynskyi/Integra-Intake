@@ -17,6 +17,7 @@ from sqlalchemy.dialects import postgresql
 from app.auth import generate_api_key
 from app.db.models import AgentJob, ApiKey, Approval, ApprovalEvent, Tenant
 from app.db.session import get_db_session
+from app.domain.approval_repository import ApprovalRepository
 from app.main import app
 from app.tools.models import PendingAction
 from app.runtime.profiles import canonical_json_bytes
@@ -114,6 +115,7 @@ class _Database:
         stored_action: str | None = None,
         action_version: int = 1,
         arguments: dict[str, object] | None = None,
+        with_job: bool = True,
     ) -> Approval:
         action = PendingAction(
             name=action_name,
@@ -121,11 +123,12 @@ class _Database:
             arguments=arguments or {"customer_id": None},
             known_fields={"customer_name": "Create a case"},
         )
+        job_id = uuid4() if with_job else None
         approval = Approval(
             id=uuid4(),
             tenant_id=tenant_id,
             case_id=None,
-            job_id=uuid4(),
+            job_id=job_id,
             action=stored_action or action.name,
             status="pending",
             decision={},
@@ -135,20 +138,25 @@ class _Database:
             expires_at=expires_at,
             execution_result=None,
         )
-        self.jobs.append(
-            AgentJob(
-                id=approval.job_id,
-                tenant_id=tenant_id,
-                trace_id=TRACE_ID,
-                status="awaiting_approval",
-                source_snapshot={"channel": "email", "subject": "Approval", "body": "Approval body"},
-                tenant_config_snapshot=deepcopy(REPAIR_PROFILE_SNAPSHOT),
-                tenant_config_sha256=REPAIR_PROFILE_SHA256,
-                risk_signals={},
-                attempt_count=1,
-                available_at=NOW,
+        if job_id is not None:
+            self.jobs.append(
+                AgentJob(
+                    id=job_id,
+                    tenant_id=tenant_id,
+                    trace_id=TRACE_ID,
+                    status="awaiting_approval",
+                    source_snapshot={
+                        "channel": "email",
+                        "subject": "Approval",
+                        "body": "Approval body",
+                    },
+                    tenant_config_snapshot=deepcopy(REPAIR_PROFILE_SNAPSHOT),
+                    tenant_config_sha256=REPAIR_PROFILE_SHA256,
+                    risk_signals={},
+                    attempt_count=1,
+                    available_at=NOW,
+                )
             )
-        )
         self.approvals.append(approval)
         return approval
 
@@ -162,6 +170,27 @@ class _Session:
 
     def add(self, value: ApprovalEvent) -> None:
         self.database.events.append(value)
+
+    def _has_published_lifecycle(self, approval: Approval) -> bool:
+        if approval.job_id is None:
+            return approval.status in {"pending", "approved", "rejected", "expired"}
+        job = next(
+            (
+                candidate
+                for candidate in self.database.jobs
+                if candidate.id == approval.job_id
+                and candidate.tenant_id == approval.tenant_id
+            ),
+            None,
+        )
+        if job is None:
+            return False
+        return (
+            approval.status == "pending" and job.status == "awaiting_approval"
+        ) or (
+            approval.status in {"approved", "rejected"}
+            and job.status == "succeeded"
+        ) or (approval.status == "expired" and job.status == "failed")
 
     async def execute(self, statement: object) -> _Result:
         compiled = statement.compile(dialect=postgresql.dialect())
@@ -219,16 +248,27 @@ class _Session:
             return _Result(TRACE_ID)
 
         assert "FROM approvals" in query
-        tenant_id = params["tenant_id_1"]
-        if "status_1" in params:
+        if "status_1" in params and "id_1" not in params:
+            tenant_id = params.get("tenant_id_1")
+            cutoff = next(
+                (
+                    value
+                    for value in params.values()
+                    if isinstance(value, datetime)
+                ),
+                None,
+            )
             rows = [
                 candidate
                 for candidate in self.database.approvals
-                if candidate.tenant_id == tenant_id
+                if (tenant_id is None or candidate.tenant_id == tenant_id)
                 and candidate.status == params["status_1"]
+                and self._has_published_lifecycle(candidate)
+                and (cutoff is None or candidate.expires_at <= cutoff)
             ]
             rows.sort(key=lambda candidate: (candidate.expires_at, candidate.id))
             return _Result(rows)
+        tenant_id = params["tenant_id_1"]
         approval_id = params["id_1"]
         return _Result(
             next(
@@ -236,6 +276,7 @@ class _Session:
                     approval
                     for approval in self.database.approvals
                     if approval.id == approval_id and approval.tenant_id == tenant_id
+                    and self._has_published_lifecycle(approval)
                 ),
                 None,
             )
@@ -512,6 +553,85 @@ def test_cross_tenant_approval_detail_is_not_found(
     )
 
     assert response.status_code == 404
+
+
+@pytest.mark.parametrize("internal_status", ["staged", "cancelled"])
+def test_internal_approval_is_hidden_from_public_read_list_and_decision(
+    client: TestClient,
+    database: _Database,
+    operator_key: str,
+    internal_status: str,
+) -> None:
+    approval = database.add_approval(TENANT_A)
+    approval.status = internal_status
+    headers = {"X-API-Key": operator_key}
+
+    detail = client.get(f"/v1/approvals/{approval.id}", headers=headers)
+    listing = client.get(
+        "/v1/approvals",
+        headers=headers,
+        params={"status": "pending"},
+    )
+    decision = client.post(
+        f"/v1/approvals/{approval.id}/decide",
+        headers=headers,
+        json={"decision": "reject", "reason": "Not yet published"},
+    )
+
+    assert detail.status_code == 404
+    assert listing.status_code == 200
+    assert listing.json()["items"] == []
+    assert decision.status_code == 404
+    assert approval.status == internal_status
+
+
+def test_legacy_approval_is_visible_but_not_executable(
+    client: TestClient,
+    database: _Database,
+    operator_key: str,
+) -> None:
+    approval = database.add_approval(TENANT_A, with_job=False)
+    headers = {"X-API-Key": operator_key}
+
+    detail = client.get(f"/v1/approvals/{approval.id}", headers=headers)
+    listing = client.get(
+        "/v1/approvals",
+        headers=headers,
+        params={"status": "pending"},
+    )
+    decision = client.post(
+        f"/v1/approvals/{approval.id}/decide",
+        headers=headers,
+        json={"decision": "approve", "reason": "Legacy review"},
+    )
+
+    assert detail.status_code == 200
+    assert detail.json()["job_id"] is None
+    assert detail.json()["executable"] is False
+    assert listing.status_code == 200
+    assert [item["approval_id"] for item in listing.json()["items"]] == [
+        str(approval.id)
+    ]
+    assert decision.status_code == 409
+    assert approval.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_legacy_pending_approval_can_expire() -> None:
+    database = _Database()
+    database.add_tenant(TENANT_A)
+    approval = database.add_approval(
+        TENANT_A,
+        with_job=False,
+        expires_at=NOW - timedelta(seconds=1),
+    )
+
+    observations = await ApprovalRepository(_Session(database)).expire_due(now=NOW)
+
+    assert observations == ()
+    assert approval.status == "expired"
+    assert approval.decided_by_actor_ref == "system_timeout"
+    assert [event.event_type for event in database.events] == ["approval_expired"]
 
 
 def test_approval_list_is_tenant_scoped_ordered_and_bounded(

@@ -160,6 +160,7 @@ class PersistenceOperation(str, Enum):
     RECOVER_LEASE = "recover_lease"
     RENEW_LEASE = "renew_lease"
     SCHEDULE_RETRY = "schedule_retry"
+    RECORD_AWAITING_APPROVAL = "record_awaiting_approval"
     MARK_SUCCEEDED = "mark_succeeded"
     MARK_FAILED = "mark_failed"
     MARK_FAILED_UNCERTAIN = "mark_failed_uncertain"

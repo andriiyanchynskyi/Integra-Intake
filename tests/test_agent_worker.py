@@ -160,6 +160,11 @@ class _FakeRepository:
             return
         self.calls.append(("mark_succeeded", (args, kwargs)))
 
+    async def record_awaiting_approval_result(
+        self, *args: object, **kwargs: object
+    ) -> None:
+        self.calls.append(("record_awaiting_approval_result", (args, kwargs)))
+
     async def mark_failed(self, *args: object, **kwargs: object) -> None:
         if self.claimed is not None and self.claimed.status != "running":
             return
@@ -342,6 +347,32 @@ def test_result_summary_does_not_reuse_routing_data_before_none_tool_result() ->
         "steps": 2,
         "execution_path": [],
     }
+
+
+def test_result_summary_classifies_urgent_approval_as_approval_requested() -> None:
+    result = AgentRunResult(
+        status=RunStatus.COMPLETED,
+        reason=StopReason.EXECUTOR_STOPPED,
+        messages=(),
+        steps=1,
+        final_response="approval_requested",
+        execution_path=(
+            ExecutionPathEntry(
+                step=1,
+                action_key="create_reply_draft",
+                action_known=True,
+                policy_decision="needs_approval",
+                routing_status="urgent",
+                policy_reason="approval_required",
+                tool_outcome=None,
+                side_effect_committed=False,
+            ),
+        ),
+    )
+
+    summary = AgentWorker._result_summary(result)
+
+    assert summary["business_outcome"] == "approval_requested"
 
 
 @pytest.mark.asyncio
@@ -812,25 +843,87 @@ async def test_persist_result_keeps_awaiting_approval_job_terminal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_repository(monkeypatch)
-    claimed = replace(_claimed(), status="awaiting_approval")
+    claimed = _claimed()
     _FakeRepository.next_claimed = claimed
     worker = AgentWorker(_SessionFactory(), settings=_settings())
-
-    async def no_side_effect(_: ClaimedJob) -> bool:
-        return False
-
-    monkeypatch.setattr(worker, "_has_side_effect", no_side_effect)
-    await worker._persist_result(
-        claimed,
-        _result(
-            status=RunStatus.COMPLETED,
-            reason=StopReason.FINAL,
-            final_response="approval requested",
+    result = AgentRunResult(
+        status=RunStatus.COMPLETED,
+        reason=StopReason.EXECUTOR_STOPPED,
+        messages=(),
+        steps=1,
+        final_response="approval_requested",
+        execution_path=(
+            ExecutionPathEntry(
+                step=1,
+                action_key="create_reply_draft",
+                action_known=True,
+                policy_decision="needs_approval",
+                routing_status="urgent",
+                policy_reason="approval_required",
+                tool_outcome=None,
+                side_effect_committed=False,
+            ),
         ),
     )
 
+    outcome = await worker._persist_result(
+        claimed,
+        result,
+    )
+
+    assert outcome is OutcomeCode.NEEDS_APPROVAL
     repository = _FakeRepository.instances[-1]
-    assert [name for name, _ in repository.calls] == []
+    assert [name for name, _ in repository.calls] == [
+        "record_awaiting_approval_result"
+    ]
+    args, kwargs = repository.calls[0][1]  # type: ignore[misc]
+    assert args == (claimed.id, AgentWorker._result_summary(result))
+    assert kwargs == {
+        "tenant_id": claimed.tenant_id,
+        "attempt_count": claimed.attempt_count,
+    }
+    assert not [name for name, _ in repository.calls if name == "mark_succeeded"]
+
+
+@pytest.mark.asyncio
+async def test_persist_result_does_not_park_no_tool_review_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_repository(monkeypatch)
+    claimed = _claimed()
+    _FakeRepository.next_claimed = claimed
+    worker = AgentWorker(_SessionFactory(), settings=_settings())
+    result = AgentRunResult(
+        status=RunStatus.COMPLETED,
+        reason=StopReason.FINAL,
+        messages=(),
+        steps=1,
+        final_response="review_required",
+        execution_path=(
+            ExecutionPathEntry(
+                step=1,
+                action_key=None,
+                action_known=False,
+                policy_decision="needs_approval",
+                routing_status="urgent",
+                policy_reason="safety_or_legal_risk",
+                tool_outcome=None,
+                side_effect_committed=False,
+            ),
+        ),
+    )
+
+    assert AgentWorker._result_summary(result)["business_outcome"] == "routing_only"
+
+    await worker._persist_result(claimed, result)
+
+    repository = _FakeRepository.instances[-1]
+    assert [name for name, _ in repository.calls] == ["mark_succeeded"]
+    assert not [
+        name
+        for name, _ in repository.calls
+        if name == "record_awaiting_approval_result"
+    ]
 
 
 @pytest.mark.asyncio

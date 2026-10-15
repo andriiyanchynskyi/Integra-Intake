@@ -52,6 +52,29 @@ CURRENT_PROFILE_SHA256 = hashlib.sha256(
 ).hexdigest()
 
 
+def _agent_evidence() -> dict[str, object]:
+    return {
+        "steps": 1,
+        "reason": "executor_stopped",
+        "execution_path": [
+            {
+                "step": 1,
+                "action_key": "create_case",
+                "action_known": True,
+                "policy_decision": "needs_approval",
+                "routing_status": "urgent",
+                "policy_reason": "approval_required",
+                "missing_required_fields": [],
+                "tool_outcome": None,
+                "side_effect_committed": False,
+            }
+        ],
+        "routing_status": "urgent",
+        "routing_reason": "approval_required",
+        "missing_required_fields": [],
+    }
+
+
 class _ScalarResult:
     def __init__(self, value: object) -> None:
         self.value = value
@@ -111,6 +134,11 @@ class _ApprovalSession:
                 risk_signals={},
                 attempt_count=1,
                 available_at=DECISION_TIME,
+                result={
+                    "status": "completed",
+                    "business_outcome": "approval_requested",
+                    **_agent_evidence(),
+                },
             )
             for approval in self.approvals
             if approval.job_id is not None
@@ -343,6 +371,7 @@ async def test_reject_records_decision_without_invoking_action_executor() -> Non
     assert job.finished_at == DECISION_TIME
     assert job.error_code is None
     assert job.result == {
+        **_agent_evidence(),
         "business_outcome": "approval_rejected",
         "approval_id": str(APPROVAL_ID),
         "approval_status": "rejected",
@@ -376,6 +405,7 @@ async def test_approve_executes_create_case_once_and_retries_are_idempotent() ->
     assert job.status == "succeeded"
     assert job.finished_at == DECISION_TIME
     assert job.result == {
+        **_agent_evidence(),
         "business_outcome": "tool_result",
         "approval_id": str(APPROVAL_ID),
         "approval_status": "approved",
@@ -521,6 +551,13 @@ async def test_expired_reject_is_terminal_and_never_executes_action() -> None:
     assert session.jobs[0].status == "failed"
     assert session.jobs[0].finished_at == DECISION_TIME
     assert session.jobs[0].error_code == "approval_expired"
+    assert session.jobs[0].result == {
+        **_agent_evidence(),
+        "business_outcome": "approval_expired",
+        "approval_id": str(APPROVAL_ID),
+        "approval_status": "expired",
+        "result_reference": {},
+    }
     assert [event.event_type for event in session.events] == ["approval_expired"]
 
 
@@ -541,6 +578,13 @@ async def test_expired_approve_transitions_to_expired_and_never_executes_action(
     assert approval.decided_by_actor_ref == "system_timeout"
     assert session.jobs[0].status == "failed"
     assert session.jobs[0].error_code == "approval_expired"
+    assert session.jobs[0].result == {
+        **_agent_evidence(),
+        "business_outcome": "approval_expired",
+        "approval_id": str(APPROVAL_ID),
+        "approval_status": "expired",
+        "result_reference": {},
+    }
     assert executor.calls == 0
     assert [event.event_type for event in session.events] == ["approval_expired"]
 

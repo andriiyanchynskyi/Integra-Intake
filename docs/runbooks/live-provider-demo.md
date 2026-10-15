@@ -280,14 +280,21 @@ requires `409` and polls the original job separately.
 Create a synthetic JSON input file and send it through the body endpoint:
 
 ```powershell
-@'
+$json = @'
 {
   "transport": "intake",
   "channel": "email",
   "subject": "Custom freight request",
   "body": "Origin: Kyiv; destination: Lviv; equipment: dry_van; contact: ops@example.test"
 }
-'@ | Set-Content -LiteralPath .\custom-body.json -Encoding utf8
+'@
+
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText(
+  (Join-Path (Get-Location) 'custom-body.json'),
+  $json,
+  $utf8NoBom
+)
 
 python scripts/live_provider_smoke.py `
   --profile freight-broker `
@@ -296,6 +303,19 @@ python scripts/live_provider_smoke.py `
 ```
 
 The input file is read locally and its body is never printed by the smoke.
+Windows PowerShell 5.1 writes a UTF-8 BOM when
+`Set-Content -Encoding utf8` is used. The custom-input loader rejects that BOM
+and reports `error_code=input_file_invalid` before sending an HTTP request; in
+that failure, `acceptance_status` is `null` and `job` is empty. Use the
+`WriteAllText` form above to create UTF-8 without BOM. To repair an existing
+file, run:
+
+```powershell
+$path = (Resolve-Path .\custom-body.json).Path
+$content = [System.IO.File]::ReadAllText($path).TrimStart([char]0xFEFF)
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($path, $content, $utf8NoBom)
+```
 
 ### Custom webhook input with a file
 
@@ -303,7 +323,7 @@ The attachment remains a local sender-side file. The server receives it only
 through the signed webhook request:
 
 ```powershell
-@'
+$json = @'
 {
   "transport": "webhook",
   "provider_id": "custom-live-message-1",
@@ -312,7 +332,14 @@ through the signed webhook request:
   "body": "Attached synthetic confirmation",
   "attachment_path": "evals/fixtures/docs/01-complete-en.txt"
 }
-'@ | Set-Content -LiteralPath .\custom-webhook.json -Encoding utf8
+'@
+
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText(
+  (Join-Path (Get-Location) 'custom-webhook.json'),
+  $json,
+  $utf8NoBom
+)
 
 python scripts/live_provider_smoke.py `
   --profile freight-broker `

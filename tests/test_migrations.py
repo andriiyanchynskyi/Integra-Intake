@@ -62,6 +62,17 @@ def test_release_uses_single_initial_schema_revision() -> None:
     assert source.count('"ck_approvals_status"') == 1
     assert source.count('"ck_approvals_payload_complete"') == 1
     assert "ck_approvals_phase8_payload_complete" not in source
+    for approval_status in (
+        "staged",
+        "cancelled",
+        "pending",
+        "approved",
+        "rejected",
+        "expired",
+    ):
+        assert f"'{approval_status}'" in source
+
+
 def test_orm_metadata_declares_tenant_isolation_contract() -> None:
     """ORM metadata preserves the database defaults and tenant-scoped relationships."""
     tenants = Base.metadata.tables["tenants"]
@@ -464,6 +475,8 @@ async def query_schema_contract(connection: AsyncConnection) -> None:
     assert "UNIQUE (trace_id)" in constraint_map["uq_agent_jobs_trace_id"]
     assert "ck_approvals_payload_complete" in constraint_map
     assert "ck_approvals_status" in constraint_map
+    assert "staged" in constraint_map["ck_approvals_status"]
+    assert "cancelled" in constraint_map["ck_approvals_status"]
     for constraint_name in (
         "ck_tenants_status",
         "ck_api_keys_principal_type",

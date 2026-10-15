@@ -10,8 +10,10 @@ Tenant profiles define supported fields, documents, and actions. A typed agent
 loop proposes work; server-owned policy and approval rules decide whether an
 action may run. Durable results and diagnostic events remain source-free.
 
+[Watch the demo video](demo/demo_vid.mkv)
+
 Follow the [Live provider demo runbook](docs/runbooks/live-provider-demo.md) to
-start the local stack, run source-free live checks, and record the evidence.
+start the local stack and run source-free live checks.
 
 ## Capabilities
 
@@ -97,7 +99,7 @@ docker compose up -d api worker
 
 Wait until `docker compose ps db` reports the database as healthy, then apply
 the migration. Check `http://localhost:8000/health` after the stack starts.
-The complete release schema is applied by the single `001_initial_schema`
+The complete development schema is applied by the single `001_initial_schema`
 revision. API and worker startup never applies migrations.
 
 ### 3. Create a demo service key

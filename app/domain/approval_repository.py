@@ -7,8 +7,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.db.models import AgentJob, Approval, ApprovalEvent
 from app.tools.models import ApprovalRequested, PendingAction
@@ -56,7 +57,7 @@ class ApprovalRepository:
         expires_in: timedelta,
         now: datetime,
     ) -> ApprovalRequested:
-        """Create one approval and park its running job atomically."""
+        """Create one approval for the worker-owned running attempt."""
 
         async with self.session.begin():
             job_statement = (
@@ -70,6 +71,9 @@ class ApprovalRepository:
             job = (await self.session.execute(job_statement)).scalar_one_or_none()
             if job is None:
                 raise ApprovalCreationConflict("job is unavailable")
+
+            if job.status != "running" or job.attempt_count != attempt_count:
+                raise ApprovalCreationConflict("job is not running")
 
             existing_statement = (
                 select(Approval)
@@ -87,13 +91,35 @@ class ApprovalRepository:
                     raise ApprovalCreationConflict("legacy approval cannot be reused")
                 if existing.expires_at is None:
                     raise ApprovalCreationConflict("approval expiry is unavailable")
+                if existing.status != "staged":
+                    raise ApprovalCreationConflict("approval is already published")
+                pending_action = action.model_dump(mode="json")
+                refreshed_expires_at = now + expires_in
+                if (
+                    existing.action != action.name
+                    or existing.pending_action != pending_action
+                    or existing.policy_reason != policy_reason
+                    or existing.tenant_config_sha256 != job.tenant_config_sha256
+                ):
+                    existing.action = action.name
+                    existing.policy_reason = policy_reason
+                    existing.pending_action = pending_action
+                    existing.tenant_config_sha256 = job.tenant_config_sha256
+                    self._add_event(
+                        tenant_id,
+                        existing.id,
+                        event_type="approval_replaced",
+                        actor_ref=None,
+                        payload={
+                            "action": action.name,
+                            "policy_reason": policy_reason,
+                        },
+                    )
+                existing.expires_at = refreshed_expires_at
                 return ApprovalRequested(
                     id=existing.id,
                     expires_at=existing.expires_at,
                 )
-
-            if job.status != "running" or job.attempt_count != attempt_count:
-                raise ApprovalCreationConflict("job is not running")
 
             expires_at = now + expires_in
             approval = Approval(
@@ -101,7 +127,7 @@ class ApprovalRepository:
                 job_id=job_id,
                 case_id=None,
                 action=action.name,
-                status="pending",
+                status="staged",
                 decision={},
                 policy_reason=policy_reason,
                 pending_action=action.model_dump(mode="json"),
@@ -121,18 +147,6 @@ class ApprovalRepository:
                     "policy_reason": policy_reason,
                 },
             )
-            job.status = "awaiting_approval"
-            # Parking for a human decision is not a terminal processing state.
-            # The job is finalized by the same transaction that resolves the
-            # approval, so its completion timestamp must remain unset here.
-            job.finished_at = None
-            job.lease_expires_at = None
-            job.result = {
-                "status": "awaiting_approval",
-                "approval_id": str(approval.id),
-                "policy_reason": policy_reason,
-            }
-            job.error_code = None
             return ApprovalRequested(id=approval.id, expires_at=expires_at)
 
     async def get_job_for_update(
@@ -157,11 +171,17 @@ class ApprovalRepository:
     ) -> Approval | None:
         statement = (
             select(Approval)
+            .outerjoin(
+                AgentJob,
+                (AgentJob.id == Approval.job_id)
+                & (AgentJob.tenant_id == Approval.tenant_id),
+            )
             .where(
                 Approval.id == approval_id,
                 Approval.tenant_id == tenant_id,
+                self._published_lifecycle_predicate(),
             )
-            .with_for_update()
+            .with_for_update(of=Approval)
         )
         return (await self.session.execute(statement)).scalar_one_or_none()
 
@@ -170,9 +190,18 @@ class ApprovalRepository:
     ) -> Approval | None:
         """Read one approval through the authenticated tenant predicate."""
 
-        statement = select(Approval).where(
-            Approval.id == approval_id,
-            Approval.tenant_id == tenant_id,
+        statement = (
+            select(Approval)
+            .outerjoin(
+                AgentJob,
+                (AgentJob.id == Approval.job_id)
+                & (AgentJob.tenant_id == Approval.tenant_id),
+            )
+            .where(
+                Approval.id == approval_id,
+                Approval.tenant_id == tenant_id,
+                self._published_lifecycle_predicate(),
+            )
         )
         return (await self.session.execute(statement)).scalar_one_or_none()
 
@@ -188,15 +217,36 @@ class ApprovalRepository:
         bounded_limit = min(max(limit, 1), 100)
         statement = (
             select(Approval)
+            .outerjoin(
+                AgentJob,
+                (AgentJob.id == Approval.job_id)
+                & (AgentJob.tenant_id == Approval.tenant_id),
+            )
             .where(
                 Approval.tenant_id == tenant_id,
                 Approval.status == status,
+                self._published_lifecycle_predicate(),
             )
             .order_by(Approval.expires_at, Approval.id)
             .limit(bounded_limit + 1)
         )
         approvals = (await self.session.execute(statement)).scalars().all()
         return tuple(approvals)
+
+    @staticmethod
+    def _published_lifecycle_predicate() -> ColumnElement[bool]:
+        return or_(
+            and_(
+                Approval.job_id.is_(None),
+                Approval.status.in_(("pending", "approved", "rejected", "expired")),
+            ),
+            and_(Approval.status == "pending", AgentJob.status == "awaiting_approval"),
+            and_(
+                Approval.status.in_(("approved", "rejected")),
+                AgentJob.status == "succeeded",
+            ),
+            and_(Approval.status == "expired", AgentJob.status == "failed"),
+        )
 
     async def get_job_trace_id(self, approval: Approval) -> UUID:
         if approval.job_id is None:
@@ -216,14 +266,23 @@ class ApprovalRepository:
         async with self.session.begin():
             statement = (
                 select(Approval)
+                .outerjoin(
+                    AgentJob,
+                    (AgentJob.id == Approval.job_id)
+                    & (AgentJob.tenant_id == Approval.tenant_id),
+                )
                 .where(
                     Approval.status == "pending",
+                    or_(
+                        Approval.job_id.is_(None),
+                        AgentJob.status == "awaiting_approval",
+                    ),
                     Approval.expires_at.is_not(None),
                     Approval.expires_at <= now,
                 )
                 .order_by(Approval.expires_at, Approval.id)
                 .limit(limit)
-                .with_for_update(skip_locked=True)
+                .with_for_update(of=Approval, skip_locked=True)
             )
             approvals = (await self.session.execute(statement)).scalars().all()
             observations: list[ExpiredApprovalObservation] = []
@@ -374,11 +433,25 @@ class ApprovalRepository:
         if isinstance(case_id, UUID):
             result_reference["case_id"] = str(case_id)
 
+        preserved_result: dict[str, object] = {}
+        if isinstance(job.result, dict):
+            for key in (
+                "reason",
+                "steps",
+                "execution_path",
+                "routing_status",
+                "routing_reason",
+                "missing_required_fields",
+            ):
+                if key in job.result:
+                    preserved_result[key] = deepcopy(job.result[key])
+
         job.status = status
         job.error_code = error_code
         job.finished_at = now
         job.lease_expires_at = None
         job.result = {
+            **preserved_result,
             "business_outcome": business_outcome,
             "approval_id": str(approval.id),
             "approval_status": approval.status,

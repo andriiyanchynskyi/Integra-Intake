@@ -242,7 +242,12 @@ def project_job_read(row: PersistedJobRead) -> JobRead:
         registered_actions,
     )
     approval = None
-    if row.approval_id is not None and isinstance(row.approval_status, str):
+    approval_state_matches = (
+        row.approval_status == "pending" and row.status == "awaiting_approval"
+    ) or (
+        row.approval_status in {"approved", "rejected"} and row.status == "succeeded"
+    ) or (row.approval_status == "expired" and row.status == "failed")
+    if row.approval_id is not None and approval_state_matches:
         approval = ApprovalRead(
             approval_id=row.approval_id,
             status=row.approval_status,

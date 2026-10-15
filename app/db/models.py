@@ -250,7 +250,8 @@ class Approval(TimestampedModel, Base):
             name="ck_approvals_payload_complete",
         ),
         CheckConstraint(
-            "status IN ('pending', 'approved', 'rejected', 'expired')",
+            "status IN ('staged', 'cancelled', 'pending', 'approved', 'rejected', "
+            "'expired')",
             name="ck_approvals_status",
         ),
         Index(

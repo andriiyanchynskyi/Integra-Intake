@@ -186,6 +186,40 @@ def test_project_job_read_includes_only_joined_approval_identity(freight_profile
     assert safe.approval.status == "pending"
 
 
+@pytest.mark.parametrize(
+    ("job_status", "approval_status", "visible"),
+    [
+        ("queued", "pending", False),
+        ("running", "pending", False),
+        ("awaiting_approval", "pending", True),
+        ("succeeded", "approved", True),
+        ("succeeded", "rejected", True),
+        ("failed", "expired", True),
+        ("succeeded", "pending", False),
+        ("awaiting_approval", "approved", False),
+        ("failed", "rejected", False),
+    ],
+)
+def test_project_job_read_exposes_only_consistent_approval_lifecycle_pairs(
+    freight_profile,
+    job_status: str,
+    approval_status: str,
+    visible: bool,
+) -> None:
+    from app.domain.jobs import project_job_read
+
+    safe = project_job_read(
+        _row(
+            freight_profile,
+            status=job_status,
+            approval_id=uuid4(),
+            approval_status=approval_status,
+        )
+    )
+
+    assert (safe.approval is not None) is visible
+
+
 def test_project_job_read_rejects_unknown_status(freight_profile) -> None:
     from app.domain.jobs import project_job_read
 

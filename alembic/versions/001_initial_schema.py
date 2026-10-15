@@ -376,7 +376,8 @@ def upgrade() -> None:
             name="ck_approvals_payload_complete",
         ),
         sa.CheckConstraint(
-            "status IN ('pending', 'approved', 'rejected', 'expired')",
+            "status IN ('staged', 'cancelled', 'pending', 'approved', 'rejected', "
+            "'expired')",
             name="ck_approvals_status",
         ),
     )
